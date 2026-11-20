@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: moving average (window 100) over 5M samples — written with NumPy (cumulative sum differences)."""
+import time
+import numpy as np
+
+
+if __name__ == "__main__":
+    n = 5_000_000
+    w = 100
+    x = (np.arange(n) % 1000) / 1000.0
+    t0 = time.perf_counter()
+    c = np.cumsum(x)
+    window_sums = c[w:] - c[:-w]
+    total = (c[w - 1] + window_sums.sum()) / w
+    elapsed = time.perf_counter() - t0
+    print(f"movavg: {total:.6e}")
+    print(f"TIME movavg {elapsed * 1000:.1f} ms")

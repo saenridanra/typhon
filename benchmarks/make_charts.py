@@ -1,0 +1,227 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Renders benchmarks/img/*.png from benchmarks/RESULTS.md (written by run.ps1).
+
+    .venv/Scripts/python benchmarks/make_charts.py      (needs: pip install matplotlib)
+
+Chart 1 (speedup.png):  Typhon's speed-up over CPython per benchmark, log scale, centred on 1x (parity);
+                        bars right of 1x = Typhon faster (orange), left = CPython/NumPy faster (blue).
+Chart 2 (problems.png): the same problem written as plain loops and with NumPy; hot-section time on a log scale
+                        for CPython loops (gray context), CPython + NumPy (blue) and Typhon loops (orange).
+"""
+import re
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullFormatter
+from matplotlib.transforms import blended_transform_factory
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "img"
+
+# Palette: brand orange accent + blue (validated as a categorical pair, see dataviz validator), gray = context only.
+SURFACE = "#fcfcfb"
+INK = "#0b0b0b"
+INK_2 = "#52514e"
+MUTED = "#898781"
+GRID = "#e1e0d9"
+AXIS = "#c3c2b7"
+TYPHON = "#FA9400"
+PYTHON = "#2a78d6"
+CONTEXT = "#898781"
+
+plt.rcParams.update({
+    "font.family": ["Segoe UI", "DejaVu Sans"],
+    "font.size": 11,
+    "text.color": INK,
+    "axes.labelcolor": INK_2,
+    "xtick.color": MUTED,
+    "ytick.color": INK,
+    "axes.edgecolor": AXIS,
+    "figure.facecolor": SURFACE,
+    "axes.facecolor": SURFACE,
+    "savefig.facecolor": SURFACE,
+})
+
+LABELS = {
+    "nbody": "N-body simulation",
+    "spectralnorm": "Spectral norm",
+    "mandelbrot": "Mandelbrot",
+    "fib": "Recursive fib(32)",
+    "binarytrees": "Binary trees (allocation)",
+    "fannkuch": "Fannkuch (int lists)",
+    "primes": "Prime sieve",
+    "wordcount": "Word count (str + dict)",
+    "sort": "sorted() ints + strings",
+    "nbody_untyped": "N-body without type hints (dynamic)",
+    "np_loop": "Element loop over an ndarray",
+    "np_broadcast": "Broadcasting (pairwise distances)",
+    "np_reduce": "Reductions along axes",
+    "np_ufuncs": "ufuncs (sqrt, exp, sin)",
+    "np_matmul": "Matmul 1000 x 1000",
+    "np_linalg": "linalg solve + inv 300 x 300",
+}
+PROBLEM_LABELS = {
+    "dot": "Dot product, 10M floats",
+    "movavg": "Moving average, 5M samples",
+    "pairwise": "Pairwise distances, 1500 points",
+    "mandelbrot": "Mandelbrot, 400 x 400",
+    "matmul": "Matrix multiply 200 x 200",
+    "pi": "Estimate pi, 5M points",
+}
+
+
+def parse_tables(md: str) -> dict[str, list[dict[str, str]]]:
+    """Markdown tables keyed by the '## ' heading above them."""
+    tables: dict[str, list[dict[str, str]]] = {}
+    heading = ""
+    header: list[str] = []
+    for line in md.splitlines():
+        if line.startswith("#"):
+            heading, header = line.lstrip("#").strip(), []
+        elif line.startswith("|") and heading:
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if not header:
+                header = cells
+            elif not set("".join(cells)) <= set("-: "):
+                tables.setdefault(heading, []).append(dict(zip(header, cells)))
+    return tables
+
+
+def ms(cell: str) -> float:
+    m = re.match(r"([\d,\.]+)", cell)
+    return float(m.group(1).replace(",", "")) if m else float("nan")
+
+
+def table(tables: dict, prefix: str) -> list[dict[str, str]]:
+    return next(rows for name, rows in tables.items() if name.startswith(prefix))
+
+
+def fmt_factor(f: float) -> str:
+    return f"{f:.0f}x" if f >= 10 else f"{f:.1f}x"
+
+
+def style_log_x(ax, lo: float, hi: float, ticks: list[float], fmt) -> None:
+    ax.set_xscale("log")
+    ax.set_xlim(lo, hi)
+    ax.xaxis.set_major_locator(FixedLocator(ticks))
+    ax.xaxis.set_major_formatter(FuncFormatter(fmt))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.grid(axis="x", which="major", color=GRID, linewidth=0.8)
+    ax.grid(axis="y", visible=False)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(AXIS)
+    ax.tick_params(axis="y", length=0, pad=8)
+    ax.tick_params(axis="x", length=0, pad=6, labelsize=10)
+
+
+def speedup_chart(tables: dict) -> Path:
+    basic = table(tables, "Pure Python")
+    numpy_rows = table(tables, "numpy")
+
+    rows: list[tuple[str, float]] = []
+    pure = sorted(((r["Benchmark"], ms(r["CPython"]) / ms(r["Typhon"])) for r in basic), key=lambda x: x[1])
+    nump = sorted(
+        ((r["Benchmark"], min(ms(r["NumPy"]), ms(r["NumPy 1 BLAS thread"])) / min(ms(r["Typhon"]), ms(r["Typhon 1 thread"])))
+         for r in numpy_rows),
+        key=lambda x: x[1],
+    )
+
+    # layout: numpy group at the bottom, pure-Python group at the top (largest first, reading down)
+    y = 0.0
+    ys, names, values, headers = [], [], [], []
+    for title, group in (("NumPy programs: Typhon.NumPy vs NumPy", nump),
+                         ("Pure Python programs: Typhon vs CPython", pure)):
+        for name, f in group:
+            ys.append(y); names.append(LABELS.get(name, name)); values.append(f)
+            y += 1
+        headers.append((y + 0.15, title))
+        y += 1.6
+
+    fig, ax = plt.subplots(figsize=(10, 8.4), dpi=180)
+    fig.subplots_adjust(left=0.30, right=0.97, top=0.83, bottom=0.115)
+    bar_h = 0.56
+    for yy, f in zip(ys, values):
+        color = TYPHON if f >= 1 else PYTHON
+        left, width = (1, f - 1) if f >= 1 else (f, 1 - f)
+        ax.barh(yy, width, left=left, height=bar_h, color=color, linewidth=0)
+        if f >= 1:
+            ax.text(f * 1.08, yy, fmt_factor(f), va="center", ha="left", fontsize=10.5, color=INK, fontweight="bold")
+        else:
+            # the bar is wide enough to carry its label inside (white on blue clears 4.5:1)
+            ax.text(f * 1.12, yy, f"NumPy {fmt_factor(1 / f)} faster", va="center", ha="left", fontsize=10, color="#ffffff", fontweight="bold")
+    ax.axvline(1, color=INK_2, linewidth=1.2, zorder=3)
+    ax.set_yticks(ys, names)
+    header_tf = blended_transform_factory(fig.transFigure, ax.transData)
+    for hy, title in headers:
+        ax.text(0.03, hy, title, transform=header_tf, ha="left", va="bottom", fontsize=10.5, color=INK_2, fontweight="bold")
+    ax.set_ylim(-0.8, y - 1.1)
+    style_log_x(ax, 0.04, 250, [0.1, 0.3, 1, 3, 10, 30, 100], lambda v, _: f"{v:g}x")
+    ax.set_xlabel("Speed-up of Typhon (hot section, median of 5 runs, log scale)", fontsize=10, color=INK_2, labelpad=8)
+
+    fig.text(0.03, 0.955, "Same Python source, compiled to .NET IL", fontsize=19, fontweight="bold", color=INK)
+    fig.text(0.03, 0.918, "Typhon (.NET 11) vs CPython 3.15 and NumPy 2.5: every file runs unchanged on both, with identical output",
+             fontsize=11, color=INK_2)
+    fig.legend(handles=[Patch(color=TYPHON, label="Typhon faster"), Patch(color=PYTHON, label="CPython / NumPy faster")],
+               loc="upper left", bbox_to_anchor=(0.025, 0.905), ncol=2, frameon=False, fontsize=10.5, handlelength=1.2)
+    fig.text(0.03, 0.014, "Intel Core Ultra 9 285HX, Windows 11. Typhon programs are compiled before the run (compile time not included);\n"
+             "NumPy rows use each side's faster thread setting. github.com/saenridanra/typhon", fontsize=8.5, color=MUTED)
+    out = OUT / "speedup.png"
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def problems_chart(tables: dict) -> Path:
+    rows = table(tables, "Problems")
+    rows = sorted(rows, key=lambda r: ms(r["CPython + NumPy"]) / ms(r["Typhon loops"]))
+
+    fig, ax = plt.subplots(figsize=(10, 6.4), dpi=180)
+    fig.subplots_adjust(left=0.27, right=0.80, top=0.78, bottom=0.13)
+    series = [("CPython, plain loops", "CPython loops", CONTEXT, "o"),
+              ("CPython + NumPy (vectorized)", "CPython + NumPy", PYTHON, "s"),
+              ("Typhon, plain loops", "Typhon loops", TYPHON, "D")]
+    for i, r in enumerate(rows):
+        vals = [ms(r[col]) for _, col, _, _ in series]
+        ax.plot([min(vals), max(vals)], [i, i], color=AXIS, linewidth=1.2, zorder=1, solid_capstyle="butt")
+        for (_, col, color, marker), v in zip(series, vals):
+            ax.plot(v, i, marker=marker, markersize=10 if marker != "D" else 9.5, color=color,
+                    markeredgecolor=SURFACE, markeredgewidth=2, zorder=3, linestyle="none")
+        f = ms(r["CPython + NumPy"]) / ms(r["Typhon loops"])
+        verdict = f"{fmt_factor(f)} faster" if f >= 1 else f"{fmt_factor(1 / f)} slower"
+        ax.text(1.02, i, verdict, transform=ax.get_yaxis_transform(), va="center", ha="left",
+                fontsize=11, color=INK, fontweight="bold")
+    ax.text(1.02, len(rows) - 0.35, "Typhon loops\nvs NumPy", transform=ax.get_yaxis_transform(), va="bottom", ha="left",
+            fontsize=9.5, color=INK_2)
+    ax.set_yticks(range(len(rows)), [PROBLEM_LABELS.get(r["Problem"], r["Problem"]) for r in rows])
+    ax.set_ylim(-0.6, len(rows) - 0.4)
+    style_log_x(ax, 0.6, 5000, [1, 3, 10, 30, 100, 300, 1000, 3000], lambda v, _: f"{v:g} ms")
+    ax.set_xlabel("Time of the hot section (median of 5 runs, log scale, lower is better)", fontsize=10, color=INK_2, labelpad=8)
+
+    fig.text(0.03, 0.94, "Do you still need NumPy?", fontsize=19, fontweight="bold", color=INK)
+    fig.text(0.03, 0.895, "The same problem written as plain loops and with NumPy. Plain loops compiled by Typhon vs the vectorized "
+             "code\nPython developers write for speed.", fontsize=11, color=INK_2, va="top")
+    fig.legend(handles=[Line2D([], [], marker=m, color=c, linestyle="none", markersize=9, markeredgecolor=SURFACE,
+                               markeredgewidth=1.5, label=lab) for lab, _, c, m in series],
+               loc="upper left", bbox_to_anchor=(0.025, 0.835), ncol=3, frameon=False, fontsize=10.5, handletextpad=0.3)
+    fig.text(0.03, 0.03, "Intel Core Ultra 9 285HX, Windows 11, CPython 3.15.2, NumPy 2.5.5 (faster of default / 1 BLAS thread), "
+             ".NET 11. github.com/saenridanra/typhon", fontsize=8.5, color=MUTED)
+    out = OUT / "problems.png"
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+if __name__ == "__main__":
+    OUT.mkdir(exist_ok=True)
+    tables = parse_tables((HERE / "RESULTS.md").read_text(encoding="utf-8-sig"))
+    for path in (speedup_chart(tables), problems_chart(tables)):
+        print("written:", path.relative_to(HERE.parent))

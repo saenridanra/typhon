@@ -1,0 +1,30 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Mandelbrot set: tight floating point loops."""
+import time
+
+
+def mandelbrot(size: int, max_iter: int) -> int:
+    inside = 0
+    for y in range(size):
+        ci = 2.0 * y / size - 1.0
+        for x in range(size):
+            cr = 2.0 * x / size - 1.5
+            zr = 0.0
+            zi = 0.0
+            i = 0
+            while i < max_iter and zr * zr + zi * zi <= 4.0:
+                zr, zi = zr * zr - zi * zi + cr, 2.0 * zr * zi + ci
+                i += 1
+            if i == max_iter:
+                inside += 1
+    return inside
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    count = mandelbrot(600, 200)
+    elapsed = time.perf_counter() - t0
+    print(f"mandelbrot: {count} points inside")
+    print(f"TIME mandelbrot {elapsed * 1000:.1f} ms")

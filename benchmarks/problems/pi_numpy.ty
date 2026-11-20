@@ -1,0 +1,22 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: estimate pi from 5M quasi-random points (golden-ratio sequence, deterministic) — written with NumPy."""
+import time
+import numpy as np
+
+
+def estimate_pi(n: int) -> float:
+    i = np.arange(n)
+    x = (i * 0.6180339887498949) % 1.0
+    y = (i * 0.7548776662466927) % 1.0
+    inside = int(((x * x + y * y) <= 1.0).sum())
+    return 4.0 * inside / n
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    pi = estimate_pi(5_000_000)
+    elapsed = time.perf_counter() - t0
+    print(f"pi: {pi:.7f}")
+    print(f"TIME pi {elapsed * 1000:.1f} ms")

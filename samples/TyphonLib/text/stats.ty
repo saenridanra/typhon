@@ -1,0 +1,31 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Text statistics. Lives in text/stats.ty → C# namespace TyphonLib.text, class stats."""
+
+
+def words(text: str) -> list[str]:
+    cleaned = "".join(c.lower() if c.isalnum() else " " for c in text)
+    return cleaned.split()
+
+
+def word_frequencies(text: str) -> dict[str, int]:
+    freq: dict[str, int] = {}
+    for w in words(text):
+        freq[w] = freq.get(w, 0) + 1
+    return freq
+
+
+def top_words(text: str, n: int = 3) -> list[tuple[str, int]]:
+    pairs = [(count, word) for word, count in word_frequencies(text).items()]
+    pairs.sort(reverse=True)
+    return [(word, count) for count, word in pairs[:n]]
+
+
+def is_palindrome(s: str) -> bool:
+    cleaned = "".join(c.lower() for c in s if c.isalnum())
+    return cleaned == cleaned[::-1]
+
+
+def reading_time_minutes(text: str, words_per_minute: int = 200) -> float:
+    return round(len(words(text)) / words_per_minute, 1)

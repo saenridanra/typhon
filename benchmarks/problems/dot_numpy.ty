@@ -1,0 +1,16 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: sum of squares (dot product) of 10M floats — written with NumPy."""
+import time
+import numpy as np
+
+
+if __name__ == "__main__":
+    n = 10_000_000
+    x = np.arange(n) / n
+    t0 = time.perf_counter()
+    r = np.dot(x, x)
+    elapsed = time.perf_counter() - t0
+    print(f"dot: {r:.6e}")
+    print(f"TIME dot {elapsed * 1000:.1f} ms")

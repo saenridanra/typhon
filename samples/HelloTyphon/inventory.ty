@@ -1,0 +1,57 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Inventory domain model, written in Typhon."""
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterator
+
+
+class Category(Enum):
+    FOOD = 1
+    TOOLS = 2
+    ELECTRONICS = 3
+
+
+@dataclass
+class Item:
+    name: str
+    category: Category
+    unit_price: float
+    quantity: int = 0
+
+    def value(self) -> float:
+        return self.unit_price * self.quantity
+
+
+class Inventory:
+    """A collection of items. Iterable, so it works with for-loops, comprehensions and LINQ."""
+
+    def __init__(self) -> None:
+        self.items: list[Item] = []
+
+    def add(self, item: Item) -> None:
+        if item.quantity < 0:
+            raise ValueError(f"negative quantity for {item.name}")
+        self.items.append(item)
+
+    @property
+    def total_value(self) -> float:
+        return sum(i.value() for i in self.items)
+
+    def sorted_by_value(self) -> list[Item]:
+        return sorted(self.items, key=lambda i: i.value(), reverse=True)
+
+    def by_category(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for item in self.items:
+            key = str(item.category)
+            result[key] = result.get(key, 0) + item.quantity
+        return result
+
+    def __iter__(self) -> Iterator[Item]:
+        for item in self.items:
+            yield item
+
+    def __len__(self) -> int:
+        return len(self.items)

@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A class library written in Typhon, consumed from C# like any other .NET assembly. -->
+  <PropertyGroup>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TyphonTypeMode>strict</TyphonTypeMode>
+  </PropertyGroup>
+
+</Project>

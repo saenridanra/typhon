@@ -1,0 +1,16 @@
+<Project>
+  <PropertyGroup>
+    <!-- Single switch for the target framework of all Typhon projects. -->
+    <TyphonTargetFramework>net11.0</TyphonTargetFramework>
+    <TyphonRepoRoot>$(MSBuildThisFileDirectory)</TyphonRepoRoot>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Licensing: MIT, like .NET itself. -->
+    <Authors>The Typhon contributors</Authors>
+    <Copyright>Copyright (c) 2026 The Typhon contributors</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/saenridanra/typhon</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/saenridanra/typhon</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+</Project>

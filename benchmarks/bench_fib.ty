@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Naive recursive Fibonacci: function call overhead."""
+import time
+
+
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    result = fib(32)
+    elapsed = time.perf_counter() - t0
+    print(f"fib: fib(32) = {result}")
+    print(f"TIME fib {elapsed * 1000:.1f} ms")

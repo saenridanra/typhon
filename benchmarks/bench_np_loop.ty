@@ -1,0 +1,24 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""numpy: an explicit Python loop over array elements — the pattern NumPy users are told to avoid, because on
+CPython every a[i] creates a boxed numpy.float64. On Typhon it is a JIT-compiled loop (annotate v to stay static)."""
+import time
+import numpy as np
+
+
+def loop(n: int) -> float:
+    a = np.linspace(0.0, 1.0, n)
+    total = 0.0
+    for i in range(n):
+        v: float = a[i]
+        total += v * v - 0.5 * v
+    return total
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    r = loop(2_000_000)
+    elapsed = time.perf_counter() - t0
+    print(f"np_loop: {r:.6e}")
+    print(f"TIME np_loop {elapsed * 1000:.1f} ms")

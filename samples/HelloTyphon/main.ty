@@ -1,0 +1,54 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Entry point of a pure Typhon console app (built with `dotnet build`, run with `dotnet run`)."""
+from System import Environment, DateTime
+from System.IO import File, Path
+from inventory import Inventory, Item, Category
+import asyncio
+
+
+async def load_prices(names: list[str]) -> dict[str, float]:
+    """Pretend to fetch prices asynchronously — Typhon async/await is .NET Task-based."""
+    prices: dict[str, float] = {}
+    for name in names:
+        await asyncio.sleep(0.01)
+        prices[name] = len(name) * 1.25
+    return prices
+
+
+def report(inv: Inventory) -> str:
+    lines: list[str] = []
+    for item in inv.sorted_by_value():
+        lines.append(f"{item.name:<8} {str(item.category):<12} x{item.quantity:>4} {item.value():>9.2f}")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    print(f"Hello from Typhon on .NET {Environment.Version} — {DateTime.Now:yyyy-MM-dd}")
+
+    inv = Inventory()
+    inv.add(Item("apple", Category.FOOD, 0.5, 120))
+    inv.add(Item("hammer", Category.TOOLS, 12.0, 4))
+    inv.add(Item("laptop", Category.ELECTRONICS, 899.0, 2))
+    inv.add(Item("banana", Category.FOOD, 0.25, 200))
+
+    print(report(inv))
+    print(f"{len(inv)} items, total value {inv.total_value:,.2f}")
+    print("by category:", inv.by_category())
+    print("cheap:", [i.name for i in inv if i.unit_price < 1.0])
+
+    # .NET LINQ works directly on Typhon objects (Inventory implements IEnumerable<Item>)
+    print("LINQ:", inv.Where(lambda i: i.category == Category.FOOD).Select(lambda i: i.name.upper()).ToList())
+
+    try:
+        inv.add(Item("ghost", Category.TOOLS, 1.0, -1))
+    except ValueError as e:
+        print("rejected:", e)
+
+    path = Path.Combine(Path.GetTempPath(), "typhon-inventory.txt")
+    File.WriteAllText(path, report(inv))
+    print(f"wrote {len(File.ReadAllLines(path))} lines to {Path.GetFileName(path)}")
+
+    prices = await load_prices(["tea", "coffee"])
+    print("prices:", prices)

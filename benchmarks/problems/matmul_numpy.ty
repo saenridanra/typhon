@@ -1,0 +1,18 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: 200x200 matrix multiply — written with NumPy (a @ b, delegated to BLAS)."""
+import time
+import numpy as np
+
+
+if __name__ == "__main__":
+    n = 200
+    a = np.arange(n * n).reshape(n, n) / (n * n)
+    b = np.ones((n, n)) * 0.5
+    t0 = time.perf_counter()
+    c = a @ b
+    total = c.sum()
+    elapsed = time.perf_counter() - t0
+    print(f"matmul: {total:.6e}")
+    print(f"TIME matmul {elapsed * 1000:.1f} ms")

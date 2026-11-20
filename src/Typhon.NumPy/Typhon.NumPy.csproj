@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Typhon.NumPy: numpy-compatible runtime library for Typhon.
+    `import numpy as np` is emitted as `using np = global::Typhon.Stdlib.numpy;`.
+    Storage is float64-only, contiguous row-major; element-wise work is SIMD-vectorized
+    through System.Numerics.Tensors.TensorPrimitives.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Typhon.Stdlib</RootNamespace>
+    <AssemblyName>Typhon.NumPy</AssemblyName>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- CS8981: lowercase type names (numpy, ndarray, random, linalg) are intentional: they mirror Python names. -->
+    <NoWarn>$(NoWarn);CS8981</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

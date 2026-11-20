@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The Typhon compiler: lexer, parser, Typhon → C# lowering, and a Roslyn incremental source generator.
+    Roslyn analyzers/generators must target netstandard2.0 and reference a Roslyn version <= the host compiler.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <RootNamespace>Typhon.Compiler</RootNamespace>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IsRoslynComponent>true</IsRoslynComponent>
+    <NoWarn>$(NoWarn);RS2008;NU5128</NoWarn>
+
+    <!-- NuGet packaging: `dotnet pack` produces a package that adds Typhon support to any C# project -->
+    <PackageId>Typhon</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Typhon: Python syntax, compiled to .NET IL. Add *.ty files to any C# project.</Description>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.12.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The runtime is C# source that gets compiled into each Typhon assembly, not into the compiler -->
+    <Compile Remove="Runtime/**" />
+    <EmbeddedResource Include="Runtime/Builtins.cs" LogicalName="Typhon.Compiler.Runtime.Builtins.cs" />
+    <None Include="Runtime/**" />
+
+    <None Include="build/**" Pack="true" PackagePath="build/" />
+    <None Include="$(OutputPath)$(AssemblyName).dll" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+  </ItemGroup>
+
+</Project>

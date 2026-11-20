@@ -1,0 +1,35 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: Mandelbrot set, 400x400 grid, 100 iterations — written with NumPy (whole-grid steps with masks;
+vectorized code cannot stop early per point, so every point does all 100 iterations)."""
+import time
+import numpy as np
+
+
+def mandelbrot(size: int, max_iter: int) -> int:
+    xs = np.arange(size) * 2.0 / size - 1.5
+    ys = np.arange(size) * 2.0 / size - 1.0
+    cr = xs.reshape(1, size) + np.zeros((size, 1))
+    ci = ys.reshape(size, 1) + np.zeros((1, size))
+    zr = np.zeros((size, size))
+    zi = np.zeros((size, size))
+    alive = np.ones((size, size))
+    for _ in range(max_iter):
+        zr2 = zr * zr
+        zi2 = zi * zi
+        inside = (zr2 + zi2) <= 4.0
+        new_zi = 2.0 * zr * zi + ci
+        new_zr = zr2 - zi2 + cr
+        zr = np.where(inside, new_zr, zr)
+        zi = np.where(inside, new_zi, zi)
+        alive = alive * inside
+    return int(alive.sum())
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    count = mandelbrot(400, 100)
+    elapsed = time.perf_counter() - t0
+    print(f"mandelbrot: {count} points inside")
+    print(f"TIME mandelbrot {elapsed * 1000:.1f} ms")

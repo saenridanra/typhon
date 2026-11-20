@@ -1,0 +1,26 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Sorting ints and strings with sorted(): CPython's Timsort is implemented in C, so this is its home turf."""
+import time
+
+
+def make_data(n: int) -> list[int]:
+    xs: list[int] = []
+    seed = 42
+    for _ in range(n):
+        seed = (seed * 75 + 74) % 65537
+        xs.append(seed * 7919 % 1000003)
+    return xs
+
+
+if __name__ == "__main__":
+    xs = make_data(1_000_000)
+    words = [str(x) for x in xs[:300_000]]
+    t0 = time.perf_counter()
+    ys = sorted(xs)
+    ws = sorted(words)
+    rs = sorted(xs, reverse=True)
+    elapsed = time.perf_counter() - t0
+    print(f"sort: median {ys[len(ys) // 2]}, first word {ws[0]}, max {rs[0]}")
+    print(f"TIME sort {elapsed * 1000:.1f} ms")

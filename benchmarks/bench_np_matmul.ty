@@ -1,0 +1,18 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""numpy: two dense 1000x1000 matrix multiplies (NumPy delegates to its bundled multi-threaded BLAS)."""
+import time
+import numpy as np
+
+
+if __name__ == "__main__":
+    n = 1000
+    a = np.arange(n * n).reshape(n, n) / float(n * n)
+    b = np.ones((n, n)) * 0.5
+    t0 = time.perf_counter()
+    c = a @ b
+    c = c @ a
+    elapsed = time.perf_counter() - t0
+    print(f"np_matmul: {c.sum():.6e}")
+    print(f"TIME np_matmul {elapsed * 1000:.1f} ms")

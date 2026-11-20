@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Typhon.Compiler/Typhon.Compiler.csproj" />
+    <Project Path="src/Typhon.Cli/Typhon.Cli.csproj" />
+    <Project Path="src/Typhon.NumPy/Typhon.NumPy.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/HelloTyphon/HelloTyphon.csproj" />
+    <Project Path="samples/TyphonLib/TyphonLib.csproj" />
+    <Project Path="samples/CSharpApp/CSharpApp.csproj" />
+  </Folder>
+  <Folder Name="/benchmarks/">
+    <File Path="benchmarks/run.ps1" />
+  </Folder>
+</Solution>

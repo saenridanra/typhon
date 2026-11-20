@@ -1,0 +1,47 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Pricing rules written in Typhon, compiled into the same assembly as the C# code it uses."""
+from CSharpApp import TaxRules, IDiscount
+from dataclasses import dataclass
+
+
+class StudentDiscount(IDiscount):
+    """Implements a C# interface."""
+
+    @property
+    def Name(self) -> str:
+        return "student -10%"
+
+    def Apply(self, amount: decimal) -> decimal:
+        return amount - amount / 10
+
+
+@dataclass
+class LineItem:
+    name: str
+    price: decimal
+    qty: int = 1
+
+
+class Cart:
+    def __init__(self, country: str) -> None:
+        self.country = country
+        self.lines: list[LineItem] = []
+        self.discounts: list[IDiscount] = []
+
+    def add(self, name: str, price: decimal, qty: int = 1) -> "Cart":
+        self.lines.append(LineItem(name, price, qty))
+        return self
+
+    def subtotal(self) -> decimal:
+        total: decimal = 0
+        for line in self.lines:
+            total += line.price * line.qty
+        return total
+
+    def total(self) -> decimal:
+        amount = self.subtotal()
+        for d in self.discounts:
+            amount = d.Apply(amount)
+        return amount * (1 + TaxRules.RateFor(self.country))

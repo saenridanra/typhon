@@ -1,0 +1,29 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: moving average (window 100) over 5M samples — written as a plain Python loop (running sum)."""
+import time
+
+
+def moving_average(xs: list[float], w: int) -> list[float]:
+    out = [0.0] * (len(xs) - w + 1)
+    s = 0.0
+    for i in range(w):
+        s += xs[i]
+    out[0] = s / w
+    for i in range(w, len(xs)):
+        s += xs[i] - xs[i - w]
+        out[i - w + 1] = s / w
+    return out
+
+
+if __name__ == "__main__":
+    n = 5_000_000
+    w = 100
+    xs = [(i % 1000) / 1000.0 for i in range(n)]
+    t0 = time.perf_counter()
+    avg = moving_average(xs, w)
+    total = sum(avg)
+    elapsed = time.perf_counter() - t0
+    print(f"movavg: {total:.6e}")
+    print(f"TIME movavg {elapsed * 1000:.1f} ms")

@@ -1,0 +1,143 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Feature coverage script: every line prints something checkable against CPython."""
+from typing import Protocol, Callable, Optional
+from enum import Enum
+from System.IO import StringWriter
+
+counter = 0
+
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+
+class Greeter(Protocol):
+    def greet(self, name: str) -> str: ...
+
+
+class Polite:
+    def greet(self, name: str) -> str:
+        return f"Good day, {name}."
+
+
+class Stack[T]:
+    def __init__(self) -> None:
+        self._items: list[T] = []
+
+    def push(self, item: T) -> None:
+        self._items.append(item)
+
+    def pop(self) -> T:
+        return self._items.pop()
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    @staticmethod
+    def of(a: T, b: T) -> "Stack[T]":
+        s = Stack[T]()
+        s.push(a)
+        s.push(b)
+        return s
+
+
+def make_counter() -> Callable[[], int]:
+    count = 0
+
+    def inc() -> int:
+        nonlocal count
+        count += 1
+        return count
+
+    return inc
+
+
+def bump() -> None:
+    global counter
+    counter += 10
+
+
+def find(xs: list[int], target: int) -> Optional[int]:
+    for i, x in enumerate(xs):
+        if x == target:
+            return i
+    return None
+
+
+def apply(f: Callable[[int], int], v: int) -> int:
+    return f(v)
+
+
+s = Stack[int]()
+s.push(1)
+s.push(2)
+print("stack:", s.pop(), len(s), Stack[str].of("a", "b").pop())
+
+g: Greeter = Polite()
+print(g.greet("Ada"), isinstance(g, Polite))
+print("enum:", Color.GREEN, Color.RED == Color.RED)
+
+c = make_counter()
+c()
+c()
+print("closure:", c())
+bump()
+bump()
+print("global:", counter)
+
+print("find:", find([5, 6, 7], 7), find([5, 6, 7], 9) is None)
+print("lambda:", apply(lambda v: v * v + 1, 6))
+
+squares = {n: n * n for n in range(5)}
+evens = {n for n in range(10) if n % 2 == 0}
+pairs = [(a, b) for a in range(3) for b in range(3) if a < b]
+print("comprehensions:", squares, sorted(evens), pairs)
+
+d = {"x": 1, "y": 2}
+for k, v in d.items():
+    print(k, "=", v, sep="", end="; ")
+print()
+print("dict ops:", "x" in d, d.get("z", -1), list(d.keys()), sum(d.values()))
+
+xs = [3, 1, 2]
+xs.append(5)
+xs.insert(0, 9)
+xs.sort()
+print("list ops:", xs, xs.pop(), xs[-1], xs[1:-1], len(xs), 2 in xs)
+print("zip:", list(zip([1, 2, 3], ["a", "b", "c"])))
+print("chained:", 1 < 2 < 3, 3 < 2 < 1, 1 if 0 else 2, not [])
+print("math:", divmod(17, 5), 2 ** 0.5, abs(-3), round(2.5), round(3.14159, 2), max(3, 7), min([4, 2, 8]))
+print("strings:", "a,b,,c".split(","), "  pad  ".strip(), "Hello".lower(), "x".join(["1", "2"]), "abc".upper().startswith("AB"))
+print("format:", f"{3.14159:.3f}|{42:05d}|{'hi':>5}|{1234567:,}|{0.25:.0%}|{255:x}", "{} + {} = {}".format(1, 2, 3))
+
+try:
+    v = [1, 2, 3][10]
+except IndexError:
+    print("index error caught")
+else:
+    print("not reached")
+
+try:
+    r = 10 // 2
+except ZeroDivisionError:
+    print("not reached")
+else:
+    print("try/else:", r)
+finally:
+    print("finally")
+
+with StringWriter() as w:
+    w.Write("written via a .NET IDisposable")
+    print("with:", w.ToString())
+
+i = 0
+while True:
+    i += 1
+    if i == 3:
+        continue
+    if i > 5:
+        break
+print("loop end:", i)

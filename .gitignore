@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+*.user
+artifacts/
+BenchmarkDotNet.Artifacts/
+__pycache__/
+
+# local screenshot, never commit
+__usage_in_claude.png
+
+# local Python environment for the CPython benchmark comparison
+.venv/

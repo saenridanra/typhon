@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: sum of all pairwise distances between 1500 points (2.25M pairs) — written with NumPy broadcasting."""
+import time
+import numpy as np
+
+
+if __name__ == "__main__":
+    n = 1500
+    xs = np.arange(n) / n
+    ys = np.sin(xs * 10.0)
+    t0 = time.perf_counter()
+    dx = xs.reshape(n, 1) - xs.reshape(1, n)
+    dy = ys.reshape(n, 1) - ys.reshape(1, n)
+    r = np.sqrt(dx * dx + dy * dy).sum()
+    elapsed = time.perf_counter() - t0
+    print(f"pairwise: {r:.6e}")
+    print(f"TIME pairwise {elapsed * 1000:.1f} ms")

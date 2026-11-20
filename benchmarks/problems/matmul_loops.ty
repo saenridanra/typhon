@@ -1,0 +1,30 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Problem: 200x200 matrix multiply — written as plain Python loops over lists of lists (i-k-j order)."""
+import time
+
+
+def matmul(a: list[list[float]], b: list[list[float]], n: int) -> list[list[float]]:
+    c = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        ai = a[i]
+        ci = c[i]
+        for k in range(n):
+            aik = ai[k]
+            bk = b[k]
+            for j in range(n):
+                ci[j] += aik * bk[j]
+    return c
+
+
+if __name__ == "__main__":
+    n = 200
+    a = [[(i * n + j) / (n * n) for j in range(n)] for i in range(n)]
+    b = [[0.5] * n for _ in range(n)]
+    t0 = time.perf_counter()
+    c = matmul(a, b, n)
+    total = sum(sum(row) for row in c)
+    elapsed = time.perf_counter() - t0
+    print(f"matmul: {total:.6e}")
+    print(f"TIME matmul {elapsed * 1000:.1f} ms")

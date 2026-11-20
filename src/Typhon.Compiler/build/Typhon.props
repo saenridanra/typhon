@@ -1,0 +1,19 @@
+<Project>
+  <!-- Imported automatically when a project references the Typhon package. -->
+  <PropertyGroup>
+    <!-- strict | warn | permissive : what happens when the compiler has to fall back to 'dynamic' -->
+    <TyphonTypeMode Condition="'$(TyphonTypeMode)' == ''">warn</TyphonTypeMode>
+    <!-- Include **/*.ty automatically (like **/*.cs). Set to false and add <TyphonCompile Include="..."/> items yourself. -->
+    <EnableDefaultTyphonItems Condition="'$(EnableDefaultTyphonItems)' == ''">true</EnableDefaultTyphonItems>
+    <!-- Properties reach the generator through a generated .editorconfig where '#' and ';' start comments.
+         MSBuild decodes %XX escapes before writing it, so use sentinels instead. -->
+    <TyphonProjectDir>$(MSBuildProjectDirectory.Replace('#', '[[hash]]').Replace(';', '[[semi]]'))</TyphonProjectDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <CompilerVisibleProperty Include="RootNamespace" />
+    <CompilerVisibleProperty Include="TyphonProjectDir" />
+    <CompilerVisibleProperty Include="TyphonTypeMode" />
+    <CompilerVisibleProperty Include="TyphonMainModule" />
+  </ItemGroup>
+</Project>

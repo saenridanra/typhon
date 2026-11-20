@@ -1,0 +1,113 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Geometry primitives written in Typhon, consumed from C# as a normal .NET library."""
+from abc import ABC, abstractmethod
+import math
+
+
+class Vector2:
+    """An immutable 2D vector with Python operators that become .NET operators."""
+
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+
+    def __add__(self, other: "Vector2") -> "Vector2":
+        return Vector2(self.x + other.x, self.y + other.y)
+
+    def __sub__(self, other: "Vector2") -> "Vector2":
+        return Vector2(self.x - other.x, self.y - other.y)
+
+    def __mul__(self, k: float) -> "Vector2":
+        return Vector2(self.x * k, self.y * k)
+
+    def __eq__(self, other: "Vector2") -> bool:
+        return self.x == other.x and self.y == other.y
+
+    def __hash__(self) -> int:
+        return hash((self.x, self.y))
+
+    def __repr__(self) -> str:
+        return f"({self.x:g}, {self.y:g})"
+
+    @property
+    def length(self) -> float:
+        return math.hypot(self.x, self.y)
+
+    def dot(self, other: "Vector2") -> float:
+        return self.x * other.x + self.y * other.y
+
+    def cross(self, other: "Vector2") -> float:
+        return self.x * other.y - self.y * other.x
+
+
+class Shape(ABC):
+    """Abstract base class → a C# abstract class that C# code can subclass."""
+
+    @abstractmethod
+    def area(self) -> float: ...
+
+    @abstractmethod
+    def perimeter(self) -> float: ...
+
+    def describe(self) -> str:
+        return f"{type(self).Name}: area={self.area():.2f}, perimeter={self.perimeter():.2f}"
+
+
+class Circle(Shape):
+    def __init__(self, center: Vector2, radius: float) -> None:
+        if radius <= 0:
+            raise ValueError("radius must be positive")
+        self.center = center
+        self.radius = radius
+
+    def area(self) -> float:
+        return math.pi * self.radius ** 2
+
+    def perimeter(self) -> float:
+        return 2 * math.pi * self.radius
+
+
+class Polygon(Shape):
+    def __init__(self, points: list[Vector2]) -> None:
+        if len(points) < 3:
+            raise ValueError("a polygon needs at least 3 points")
+        self.points = points
+
+    def edges(self) -> Iterator[tuple[Vector2, Vector2]]:
+        for i in range(len(self.points)):
+            yield self.points[i], self.points[(i + 1) % len(self.points)]
+
+    def area(self) -> float:
+        return abs(sum(a.cross(b) for a, b in self.edges())) / 2
+
+    def perimeter(self) -> float:
+        return sum((b - a).length for a, b in self.edges())
+
+
+def centroid(points: list[Vector2]) -> Vector2:
+    n = len(points)
+    return Vector2(sum(p.x for p in points) / n, sum(p.y for p in points) / n)
+
+
+def convex_hull(points: list[Vector2]) -> list[Vector2]:
+    """Andrew's monotone chain algorithm."""
+    pts = sorted(points, key=lambda p: (p.x, p.y))
+    if len(pts) <= 2:
+        return pts
+
+    def build(seq: list[Vector2]) -> list[Vector2]:
+        chain: list[Vector2] = []
+        for p in seq:
+            while len(chain) >= 2 and (chain[-1] - chain[-2]).cross(p - chain[-2]) <= 0:
+                chain.pop()
+            chain.append(p)
+        return chain
+
+    lower = build(pts)
+    upper = build(list(reversed(pts)))
+    return lower[:-1] + upper[:-1]
+
+
+from typing import Iterator

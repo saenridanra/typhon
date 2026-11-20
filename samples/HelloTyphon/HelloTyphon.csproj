@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- A pure Typhon console app: a normal .csproj whose sources are *.ty files. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <TyphonTypeMode>strict</TyphonTypeMode>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,22 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""String building and dict updates: a typical 'scripting' workload where CPython is relatively strong."""
+import time
+
+
+def word_count(n: int) -> int:
+    words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    counts: dict[str, int] = {}
+    for i in range(n):
+        w = words[(i * 7) % len(words)] + str(i % 1000)
+        counts[w] = counts.get(w, 0) + 1
+    return len(counts)
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    distinct = word_count(3_000_000)
+    elapsed = time.perf_counter() - t0
+    print(f"wordcount: {distinct} distinct keys")
+    print(f"TIME wordcount {elapsed * 1000:.1f} ms")

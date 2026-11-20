@@ -1,0 +1,45 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Binary trees (Computer Language Benchmarks Game): millions of small object allocations and recursion.
+CPython frees them by reference counting, .NET with its generational GC."""
+import time
+from typing import Optional
+
+
+class Node:
+    def __init__(self, left: Optional["Node"], right: Optional["Node"]) -> None:
+        self.left = left
+        self.right = right
+
+
+def make(depth: int) -> Node:
+    if depth == 0:
+        return Node(None, None)
+    return Node(make(depth - 1), make(depth - 1))
+
+
+def check(node: Node) -> int:
+    if node.left is None:
+        return 1
+    return 1 + check(node.left) + check(node.right)
+
+
+def binary_trees(max_depth: int) -> int:
+    total = 0
+    long_lived = make(max_depth)
+    depth = 4
+    while depth <= max_depth:
+        iterations = 2 ** (max_depth - depth + 4)
+        for _ in range(iterations):
+            total += check(make(depth))
+        depth += 2
+    return total + check(long_lived)
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    nodes = binary_trees(15)
+    elapsed = time.perf_counter() - t0
+    print(f"binarytrees: {nodes} nodes checked")
+    print(f"TIME binarytrees {elapsed * 1000:.1f} ms")

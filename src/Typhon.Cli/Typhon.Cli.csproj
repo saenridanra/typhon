@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>typhon</AssemblyName>
+    <RootNamespace>Typhon.Cli</RootNamespace>
+    <!-- `dotnet tool install` support -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>typhon</ToolCommandName>
+    <PackageId>Typhon.Cli</PackageId>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Typhon.Compiler\Typhon.Compiler.csproj" />
+    <!-- Typhon standard modules shipped with the CLI: `import numpy as np` in scripts run by `typhon run` -->
+    <ProjectReference Include="..\Typhon.NumPy\Typhon.NumPy.csproj" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" />
+  </ItemGroup>
+
+</Project>

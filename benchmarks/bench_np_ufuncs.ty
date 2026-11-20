@@ -1,0 +1,23 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""numpy: whole-array arithmetic and transcendental ufuncs on 1M floats (temporaries allocated on both sides)."""
+import time
+import numpy as np
+
+
+def ufuncs(n: int, reps: int) -> float:
+    x = np.linspace(0.0, 1.0, n)
+    total = 0.0
+    for _ in range(reps):
+        y = np.sqrt(x) * 2.0 - x / 3.0 + np.exp(-x) * np.sin(x)
+        total += y.sum()
+    return total
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    r = ufuncs(1_000_000, 50)
+    elapsed = time.perf_counter() - t0
+    print(f"np_ufuncs: {r:.6e}")
+    print(f"TIME np_ufuncs {elapsed * 1000:.1f} ms")

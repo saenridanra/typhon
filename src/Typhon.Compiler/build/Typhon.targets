@@ -1,0 +1,11 @@
+<Project>
+  <!-- Typhon source files are handed to the Typhon source generator as AdditionalFiles. -->
+  <ItemGroup Condition="'$(EnableDefaultTyphonItems)' == 'true'">
+    <TyphonCompile Include="**/*.ty" Exclude="$(DefaultItemExcludes);$(DefaultExcludesInProjectFolder);@(TyphonCompile)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AdditionalFiles Include="@(TyphonCompile)" />
+    <None Remove="@(TyphonCompile)" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,6 @@
+{
+  // Typhon is Python syntax: reuse the Python grammar for highlighting (and basic Pylance checks).
+  "files.associations": {
+    "*.ty": "python"
+  }
+}
