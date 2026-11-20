@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export fannkuch(int)
 def fannkuch(n: int) -> tuple[int, int]:
     perm1 = list(range(n))
     count = [0] * n

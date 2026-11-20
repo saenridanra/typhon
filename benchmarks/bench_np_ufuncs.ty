@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 
+#pythran export ufuncs(int, int)
 def ufuncs(n: int, reps: int) -> float:
     x = np.linspace(0.0, 1.0, n)
     total = 0.0

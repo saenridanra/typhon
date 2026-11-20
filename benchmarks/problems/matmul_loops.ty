@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export matmul(float list list, float list list, int)
 def matmul(a: list[list[float]], b: list[list[float]], n: int) -> list[list[float]]:
     c = [[0.0] * n for _ in range(n)]
     for i in range(n):

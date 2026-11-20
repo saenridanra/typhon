@@ -1,0 +1,15 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Startup: a tiny program. What matters here is not the hot section but how long the whole process takes to
+start, run and exit, and how much memory it needs to do so."""
+import time
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    words = "the same file runs on CPython and on Typhon".split()
+    message = " ".join(w.upper() for w in words)
+    elapsed = time.perf_counter() - t0
+    print(f"startup: {message}")
+    print(f"TIME startup {elapsed * 1000:.1f} ms")

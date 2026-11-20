@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export moving_average(float list, int)
 def moving_average(xs: list[float], w: int) -> list[float]:
     out = [0.0] * (len(xs) - w + 1)
     s = 0.0

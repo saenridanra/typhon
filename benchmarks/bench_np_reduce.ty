@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 
+#pythran export reduce(int)
 def reduce(reps: int) -> float:
     a = np.arange(4_000_000).reshape(2000, 2000) / 4_000_000.0
     total = 0.0

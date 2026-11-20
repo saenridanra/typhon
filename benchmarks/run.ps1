@@ -28,6 +28,7 @@ param(
     [int]$Repeat = 3,
     [string]$Filter = "",
     [ValidateSet("all", "programs", "problems")][string]$Section = "all",
+    [switch]$NoAot,
     [switch]$SkipBuild
 )
 $ErrorActionPreference = "Stop"
@@ -159,7 +160,7 @@ function Ratio($a, $b) {
 function MinOf($a, $b) { if ($null -eq $a) { $b } elseif ($null -eq $b) { $a } else { [math]::Min($a, $b) } }
 
 # ── measurement of one program on both runtimes ──────────────────────────────────────
-$compileMs = @()
+$compileMs = @(); $aotCompileMs = @()
 
 # Builds the program once with Typhon, then runs it on Typhon and CPython. Programs that use numpy are also run
 # single-threaded on both sides (TYPHON_NUMPY_THREADS=1 / OPENBLAS_NUM_THREADS=1); "best" picks the faster config.
@@ -180,36 +181,80 @@ function Measure-Program([IO.FileInfo]$file) {
         $ty1 = Run-Series "dotnet" @($dll) @{ TYPHON_NUMPY_THREADS = "1" }
         $cp1 = if ($pyExe) { Run-Series $pyExe @($file.FullName) ($pyEnv + @{ OPENBLAS_NUM_THREADS = "1" }) } else { $null }
     }
-    [pscustomobject]@{ Ty = $ty; Ty1 = $ty1; Cp = $cp; Cp1 = $cp1; UsesNumpy = $usesNumpy }
+
+    # Native AOT: same program as a self-contained native executable (no JIT). Programs that use dynamic values are
+    # rejected by `typhon build --aot` (TY2001) and reported as n/a.
+    $aot = $null; $aotStatus = "skipped"; $aotSizeMB = $null
+    if (-not $NoAot) {
+        $aotDir = Join-Path $buildRoot ("aot_" + $file.Directory.Name + "_" + $file.BaseName)
+        $ab = Invoke-Measured $typhon @("build", $file.FullName, $mode, "--aot", "-o", $aotDir) @{}
+        if ($ab.Ok) {
+            $script:aotCompileMs += $ab.WallMs
+            $exe = Get-ChildItem $aotDir -Filter "typhon_*.exe" | Select-Object -First 1
+            $aotSizeMB = $exe.Length / 1MB
+            $aot = Run-Series $exe.FullName @()
+            $aotStatus = if ($aot) { "ok" } else { "failed" }
+        } elseif ($ab.Output -match "TY2001") { $aotStatus = "dynamic" }
+        else { Write-Warning "Native AOT build failed for $($file.Name):`n$($ab.Output)"; $aotStatus = "failed" }
+    }
+    [pscustomobject]@{ Ty = $ty; Ty1 = $ty1; Cp = $cp; Cp1 = $cp1; Aot = $aot; AotStatus = $aotStatus; AotSizeMB = $aotSizeMB; UsesNumpy = $usesNumpy }
+}
+
+# AOT cells: a value, or why there is none
+function AotFmt($m, $value, [switch]$Ram) {
+    switch ($m.AotStatus) {
+        "ok" { if ($Ram) { FmtMB $value } else { Fmt $value } }
+        "dynamic" { "n/a (dynamic)" }
+        "skipped" { "–" }
+        default { "build failed" }
+    }
 }
 
 function Best($series, $series1, $label) { MinOf ($(if ($series) { $series.Times[$label] })) ($(if ($series1) { $series1.Times[$label] })) }
 
 # ── 1. benchmark programs: bench_*.ty ───────────────────────────────────────────────
-$basicRows = @(); $numpyRows = @()
+function SameResult($cp, [object[]]$others) {
+    if (-not $cp) { return "–" }
+    $bad = @($others | Where-Object { $_ -and $_.Result -ne $cp.Result })
+    if ($bad.Count -eq 0) { "yes" } else { "NO: $($cp.Result) vs " + (($bad | ForEach-Object { $_.Result }) -join " / ") }
+}
+
+$basicRows = @(); $numpyRows = @(); $startupRows = @()
 if ($Section -in "all", "programs") {
     foreach ($file in Get-ChildItem $PSScriptRoot -Filter "bench_*.ty" | Where-Object Name -like "*$Filter*" | Sort-Object Name) {
         Write-Host "running $($file.Name) ($Repeat runs per configuration) ..." -ForegroundColor DarkGray
         $m = Measure-Program $file
         if (-not $m) { continue }
-        $ty = $m.Ty; $cp = $m.Cp
+        $ty = $m.Ty; $cp = $m.Cp; $aot = $m.Aot
+        if ($file.BaseName -eq "bench_startup") {
+            # the hot section is ~0 ms here; what matters is the whole process
+            $dllDir = Join-Path $buildRoot ($file.Directory.Name + "_" + $file.BaseName)
+            $jitSize = (Get-ChildItem $dllDir -Filter "typhon_*.dll" | Measure-Object Length -Sum).Sum / 1MB
+            $startupRows += [pscustomobject]@{ Configuration = "CPython"; "Process time" = Fmt $cp.WallMs; "Peak RAM" = FmtMB $cp.RamMB; "What you ship" = "the .py file (needs a Python installation)" }
+            $startupRows += [pscustomobject]@{ Configuration = "Typhon (JIT)"; "Process time" = Fmt $ty.WallMs; "Peak RAM" = FmtMB $ty.RamMB; "What you ship" = [string]::Format($inv, "{0:N2} MB .dll (needs the .NET runtime)", $jitSize) }
+            $startupRows += [pscustomobject]@{ Configuration = "Typhon (Native AOT)"; "Process time" = (AotFmt $m $(if ($aot) { $aot.WallMs })); "Peak RAM" = (AotFmt $m $(if ($aot) { $aot.RamMB }) -Ram); "What you ship" = $(if ($m.AotSizeMB) { [string]::Format($inv, "{0:N1} MB self-contained .exe", $m.AotSizeMB) } else { "–" }) }
+            continue
+        }
         foreach ($label in $ty.Times.Keys | Sort-Object) {
-            $same = if (-not $cp) { "–" } elseif ($cp.Result -eq $ty.Result) { "yes" } else { "NO: $($cp.Result) vs $($ty.Result)" }
+            $same = SameResult $cp @($ty, $aot)
+            $aotMs = if ($aot) { $aot.Times[$label] } else { $null }
             if ($m.UsesNumpy) {
                 $numpyRows += [pscustomobject]@{
                     Benchmark = $label
                     "NumPy" = Fmt $cp.Times[$label]; "NumPy 1 BLAS thread" = Fmt $m.Cp1.Times[$label]
                     "Typhon" = Fmt $ty.Times[$label]; "Typhon 1 thread" = Fmt $m.Ty1.Times[$label]
+                    "Typhon AOT" = AotFmt $m $aotMs
                     "Speed-up (best vs best)" = Ratio (Best $cp $m.Cp1 $label) (Best $ty $m.Ty1 $label)
-                    "RAM NumPy" = FmtMB $cp.RamMB; "RAM Typhon" = FmtMB $ty.RamMB
+                    "RAM NumPy" = FmtMB $cp.RamMB; "RAM Typhon" = FmtMB $ty.RamMB; "RAM Typhon AOT" = AotFmt $m $(if ($aot) { $aot.RamMB }) -Ram
                     "Same result" = $same
                 }
             } else {
                 $basicRows += [pscustomobject]@{
                     Benchmark = $label
-                    CPython = Fmt $cp.Times[$label]; "Typhon" = Fmt $ty.Times[$label]; "Speed-up" = Ratio $cp.Times[$label] $ty.Times[$label]
-                    "RAM CPython" = FmtMB $cp.RamMB; "RAM Typhon" = FmtMB $ty.RamMB
-                    "Process CPython" = Fmt $cp.WallMs; "Process Typhon" = Fmt $ty.WallMs
+                    CPython = Fmt $cp.Times[$label]; "Typhon" = Fmt $ty.Times[$label]; "Typhon AOT" = AotFmt $m $aotMs
+                    "Speed-up" = Ratio $cp.Times[$label] $ty.Times[$label]; "Speed-up AOT" = $(if ($aotMs) { Ratio $cp.Times[$label] $aotMs } else { "–" })
+                    "RAM CPython" = FmtMB $cp.RamMB; "RAM Typhon" = FmtMB $ty.RamMB; "RAM Typhon AOT" = AotFmt $m $(if ($aot) { $aot.RamMB }) -Ram
+                    "Process CPython" = Fmt $cp.WallMs; "Process Typhon" = Fmt $ty.WallMs; "Process Typhon AOT" = AotFmt $m $(if ($aot) { $aot.WallMs })
                     "Same result" = $same
                 }
             }
@@ -231,14 +276,17 @@ if ($Section -in "all", "problems") {
 
         $cpLoops = $L.Cp.Times[$name]; $tyLoops = $L.Ty.Times[$name]
         $cpNumpy = Best $N.Cp $N.Cp1 $name; $tyNumpy = Best $N.Ty $N.Ty1 $name
-        $results = @($L.Cp.Result, $L.Ty.Result, $N.Cp.Result, $N.Ty.Result) | Where-Object { $_ }
-        $agree = if (($results | Select-Object -Unique).Count -eq 1) { "all 4 identical" }
+        $aotLoops = if ($L.Aot) { $L.Aot.Times[$name] } else { $null }
+        $aotNumpy = if ($N.Aot) { $N.Aot.Times[$name] } else { $null }
+        $results = @($L.Cp.Result, $L.Ty.Result, $N.Cp.Result, $N.Ty.Result, $(if ($L.Aot) { $L.Aot.Result }), $(if ($N.Aot) { $N.Aot.Result })) | Where-Object { $_ }
+        $agree = if (($results | Select-Object -Unique).Count -eq 1) { "all identical" }
                  elseif ($L.Cp.Result -eq $L.Ty.Result -and $N.Cp.Result -eq $N.Ty.Result) { "per implementation" }
                  else { "NO: " + ($results -join " | ") }
         $problemRows += [pscustomobject]@{
             Problem = $name
             "CPython loops" = Fmt $cpLoops; "CPython + NumPy" = Fmt $cpNumpy
-            "Typhon loops" = Fmt $tyLoops; "Typhon + NumPy" = Fmt $tyNumpy
+            "Typhon loops" = Fmt $tyLoops; "Typhon loops AOT" = AotFmt $L $aotLoops
+            "Typhon + NumPy" = Fmt $tyNumpy; "Typhon + NumPy AOT" = AotFmt $N $aotNumpy
             "Typhon loops vs CPython loops" = Ratio $cpLoops $tyLoops
             "Typhon loops vs CPython + NumPy" = Ratio $cpNumpy $tyLoops
             "Typhon + NumPy vs CPython + NumPy" = Ratio $cpNumpy $tyNumpy
@@ -247,7 +295,8 @@ if ($Section -in "all", "problems") {
         $problemRamRows += [pscustomobject]@{
             Problem = $name
             "CPython loops" = FmtMB $L.Cp.RamMB; "CPython + NumPy" = FmtMB $N.Cp.RamMB
-            "Typhon loops" = FmtMB $L.Ty.RamMB; "Typhon + NumPy" = FmtMB $N.Ty.RamMB
+            "Typhon loops" = FmtMB $L.Ty.RamMB; "Typhon loops AOT" = AotFmt $L $(if ($L.Aot) { $L.Aot.RamMB }) -Ram
+            "Typhon + NumPy" = FmtMB $N.Ty.RamMB; "Typhon + NumPy AOT" = AotFmt $N $(if ($N.Aot) { $N.Aot.RamMB }) -Ram
         }
     }
 }
@@ -264,6 +313,7 @@ $envLines = @(
     "- NumPy: $(if ($numpyInfo) { $numpyInfo } else { '–' }); Typhon uses Typhon.NumPy (TensorPrimitives SIMD)",
     "- Method: median of $Repeat runs per configuration. Times are the hot section, measured with time.perf_counter() inside each program. RAM is the peak working set of the whole process. Process is end-to-end wall-clock time (startup + program).",
     "- Typhon compile time (``typhon build``, not included above): median $(Fmt (Median $compileMs)) per program",
+    "- Typhon Native AOT: ``typhon build --aot`` (.NET ILCompiler, OptimizationPreference=Speed, InvariantGlobalization); median build time $(Fmt (Median $aotCompileMs)) per program. Programs that use dynamic values cannot be compiled ahead of time and show n/a (dynamic).",
     "- Date: $(Get-Date -Format 'yyyy-MM-dd')"
 )
 
@@ -283,6 +333,10 @@ $md = @(
     "Generated by ``benchmarks/run.ps1``. The same source file runs on both runtimes; ""Same result"" confirms both printed identical output.",
     "",
     ($envLines -join "`n"),
+    "",
+    "## Startup and footprint (bench_startup.ty)",
+    "",
+    (To-Markdown $startupRows),
     "",
     "## Pure Python: CPython vs Typhon",
     "",
@@ -314,5 +368,7 @@ Write-Host "numpy: CPython + NumPy vs Typhon + Typhon.NumPy" -ForegroundColor Cy
 $numpyRows | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 Write-Host "Problems: plain loops vs NumPy, on CPython and on Typhon" -ForegroundColor Cyan
 $problemRows | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+Write-Host "Startup and footprint" -ForegroundColor Cyan
+$startupRows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 $problemRamRows | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 Write-Host "written: benchmarks/RESULTS.md"

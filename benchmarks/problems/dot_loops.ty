@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export sum_squares(float list)
 def sum_squares(xs: list[float]) -> float:
     s = 0.0
     for x in xs:

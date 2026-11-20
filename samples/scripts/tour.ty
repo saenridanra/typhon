@@ -146,6 +146,6 @@ finally:
 a, b = 1, 2
 a, b = b, a
 print("swapped:", a, b)
-print("async:", await fetch(21))
+print("async:", asyncio.run(fetch(21)))
 r = Rect(3.0, 3.0)
 print("is square:", r.is_square, isinstance(r, Shape), isinstance(r, Circle))

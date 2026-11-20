@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export mandelbrot(int, int)
 def mandelbrot(size: int, max_iter: int) -> int:
     inside = 0
     for y in range(size):

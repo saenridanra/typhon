@@ -10,6 +10,7 @@ Chart 1 (speedup.png):  Typhon's speed-up over CPython per benchmark, log scale,
 Chart 2 (problems.png): the same problem written as plain loops and with NumPy; hot-section time on a log scale
                         for CPython loops (gray context), CPython + NumPy (blue) and Typhon loops (orange).
 """
+import math
 import re
 from pathlib import Path
 
@@ -35,6 +36,7 @@ AXIS = "#c3c2b7"
 TYPHON = "#FA9400"
 PYTHON = "#2a78d6"
 CONTEXT = "#898781"
+JIT_GRAY = "#b4b2ab"   # de-emphasis gray for the JIT bars (context next to the orange AOT bars)
 
 plt.rcParams.update({
     "font.family": ["Segoe UI", "DejaVu Sans"],
@@ -124,55 +126,67 @@ def style_log_x(ax, lo: float, hi: float, ticks: list[float], fmt) -> None:
 
 
 def speedup_chart(tables: dict) -> Path:
+    """Windows: speed-up of Typhon over CPython / NumPy per program, as a Native AOT executable (orange) and with the JIT (gray)."""
     basic = table(tables, "Pure Python")
     numpy_rows = table(tables, "numpy")
 
-    rows: list[tuple[str, float]] = []
-    pure = sorted(((r["Benchmark"], ms(r["CPython"]) / ms(r["Typhon"])) for r in basic), key=lambda x: x[1])
-    nump = sorted(
-        ((r["Benchmark"], min(ms(r["NumPy"]), ms(r["NumPy 1 BLAS thread"])) / min(ms(r["Typhon"]), ms(r["Typhon 1 thread"])))
-         for r in numpy_rows),
-        key=lambda x: x[1],
-    )
+    def best(r, *cols):
+        vals = [ms(r[c]) for c in cols if c in r and not math.isnan(ms(r[c]))]
+        return min(vals) if vals else float("nan")
 
-    # layout: numpy group at the bottom, pure-Python group at the top (largest first, reading down)
+    pure = [(r["Benchmark"], ms(r["CPython"]) / ms(r["Typhon"]), ms(r["CPython"]) / ms(r["Typhon AOT"])) for r in basic]
+    nump = [(r["Benchmark"], best(r, "NumPy", "NumPy 1 BLAS thread") / best(r, "Typhon", "Typhon 1 thread"),
+             best(r, "NumPy", "NumPy 1 BLAS thread") / ms(r["Typhon AOT"])) for r in numpy_rows]
+    key = lambda x: x[2] if not math.isnan(x[2]) else x[1]
+    pure.sort(key=key)
+    nump.sort(key=key)
+
     y = 0.0
-    ys, names, values, headers = [], [], [], []
-    for title, group in (("NumPy programs: Typhon.NumPy vs NumPy", nump),
-                         ("Pure Python programs: Typhon vs CPython", pure)):
-        for name, f in group:
-            ys.append(y); names.append(LABELS.get(name, name)); values.append(f)
+    rows, headers = [], []
+    for title, group in (("NumPy programs: Typhon.NumPy vs NumPy", nump), ("Pure Python programs: Typhon vs CPython", pure)):
+        for name, jit, aot in group:
+            rows.append((y, LABELS.get(name, name), jit, aot))
             y += 1
         headers.append((y + 0.15, title))
         y += 1.6
 
-    fig, ax = plt.subplots(figsize=(10, 8.4), dpi=180)
-    fig.subplots_adjust(left=0.30, right=0.97, top=0.83, bottom=0.115)
-    bar_h = 0.56
-    for yy, f in zip(ys, values):
-        color = TYPHON if f >= 1 else PYTHON
+    fig, ax = plt.subplots(figsize=(10, 9.2), dpi=180)
+    fig.subplots_adjust(left=0.30, right=0.97, top=0.835, bottom=0.105)
+    h = 0.34
+
+    def bar(yy, f, color, label_color, weight):
         left, width = (1, f - 1) if f >= 1 else (f, 1 - f)
-        ax.barh(yy, width, left=left, height=bar_h, color=color, linewidth=0)
+        ax.barh(yy, width, left=left, height=h, color=color, linewidth=0)
         if f >= 1:
-            ax.text(f * 1.08, yy, fmt_factor(f), va="center", ha="left", fontsize=10.5, color=INK, fontweight="bold")
+            ax.text(f * 1.07, yy, fmt_factor(f), va="center", ha="left", fontsize=9.5, color=label_color, fontweight=weight)
+        elif math.log10(1 / f) >= 0.6:
+            # wide enough: label inside the bar (dark ink reads on both the orange and the gray fill)
+            ax.text(f * 1.1, yy, f"NumPy {fmt_factor(1 / f)} faster", va="center", ha="left", fontsize=9, color=INK, fontweight=weight)
         else:
-            # the bar is wide enough to carry its label inside (white on blue clears 4.5:1)
-            ax.text(f * 1.12, yy, f"NumPy {fmt_factor(1 / f)} faster", va="center", ha="left", fontsize=10, color="#ffffff", fontweight="bold")
+            ax.text(f / 1.07, yy, f"NumPy {fmt_factor(1 / f)} faster", va="center", ha="right", fontsize=9.5, color=label_color, fontweight=weight)
+
+    for yy, _, jit, aot in rows:
+        if math.isnan(aot):
+            ax.text(1.07, yy + 0.19, "Native AOT n/a (dynamic code)", va="center", ha="left", fontsize=8.5, color=MUTED)
+        else:
+            bar(yy + 0.19, aot, TYPHON, INK, "bold")
+        bar(yy - 0.19, jit, JIT_GRAY, INK_2, "normal")
     ax.axvline(1, color=INK_2, linewidth=1.2, zorder=3)
-    ax.set_yticks(ys, names)
+    ax.set_yticks([r[0] for r in rows], [r[1] for r in rows])
     header_tf = blended_transform_factory(fig.transFigure, ax.transData)
     for hy, title in headers:
         ax.text(0.03, hy, title, transform=header_tf, ha="left", va="bottom", fontsize=10.5, color=INK_2, fontweight="bold")
     ax.set_ylim(-0.8, y - 1.1)
-    style_log_x(ax, 0.04, 250, [0.1, 0.3, 1, 3, 10, 30, 100], lambda v, _: f"{v:g}x")
-    ax.set_xlabel("Speed-up of Typhon (hot section, median of 5 runs, log scale)", fontsize=10, color=INK_2, labelpad=8)
+    style_log_x(ax, 0.03, 250, [0.1, 0.3, 1, 3, 10, 30, 100], lambda v, _: f"{v:g}x")
+    ax.set_xlabel("Speed-up over CPython 3.15 / NumPy 2.5 (hot section, median of 5 runs, log scale; right of 1x = Typhon faster)",
+                  fontsize=10, color=INK_2, labelpad=8)
 
-    fig.text(0.03, 0.955, "Same Python source, compiled to .NET IL", fontsize=19, fontweight="bold", color=INK)
-    fig.text(0.03, 0.918, "Typhon (.NET 11) vs CPython 3.15 and NumPy 2.5: every file runs unchanged on both, with identical output",
+    fig.text(0.03, 0.958, "Same Python source, compiled to .NET", fontsize=19, fontweight="bold", color=INK)
+    fig.text(0.03, 0.924, "Typhon vs CPython 3.15 and NumPy 2.5: every file runs unchanged on both, with identical output",
              fontsize=11, color=INK_2)
-    fig.legend(handles=[Patch(color=TYPHON, label="Typhon faster"), Patch(color=PYTHON, label="CPython / NumPy faster")],
-               loc="upper left", bbox_to_anchor=(0.025, 0.905), ncol=2, frameon=False, fontsize=10.5, handlelength=1.2)
-    fig.text(0.03, 0.014, "Intel Core Ultra 9 285HX, Windows 11. Typhon programs are compiled before the run (compile time not included);\n"
+    fig.legend(handles=[Patch(color=TYPHON, label="Typhon, Native AOT executable"), Patch(color=JIT_GRAY, label="Typhon, .NET JIT")],
+               loc="upper left", bbox_to_anchor=(0.025, 0.912), ncol=2, frameon=False, fontsize=10.5, handlelength=1.2)
+    fig.text(0.03, 0.012, "Intel Core Ultra 9 285HX, Windows 11. Programs are compiled before the run (compile time not included);\n"
              "NumPy rows use each side's faster thread setting. github.com/saenridanra/typhon", fontsize=8.5, color=MUTED)
     out = OUT / "speedup.png"
     fig.savefig(out)
@@ -220,8 +234,72 @@ def problems_chart(tables: dict) -> Path:
     return out
 
 
+CODON = "#2a78d6"
+PYTHRAN = "#1baf7a"
+
+
+def compilers_chart(tables: dict) -> Path:
+    """Linux: speed-up over CPython for three ahead-of-time compilers of Python-syntax code."""
+    tools = [("Typhon (Native AOT)", "Typhon AOT", TYPHON, "D"), ("Codon", "Codon", CODON, "s"), ("Pythran", "Pythran", PYTHRAN, "o")]
+    groups = []
+    for heading, base, title in (("numpy programs", "CPython + NumPy", "NumPy programs"), ("Pure Python", "CPython", "Pure Python programs")):
+        rows = []
+        for r in table(tables, heading):
+            if r["Benchmark"] == "startup":
+                continue
+            ref = ms(r[base])
+            vals = [ref / ms(r[col]) if not math.isnan(ms(r[col])) else float("nan") for _, col, _, _ in tools]
+            rows.append((r["Benchmark"], vals))
+        rows.sort(key=lambda x: max((v for v in x[1] if not math.isnan(v)), default=0))
+        groups.append((title, rows))
+
+    fig, ax = plt.subplots(figsize=(10, 8.6), dpi=180)
+    fig.subplots_adjust(left=0.30, right=0.97, top=0.82, bottom=0.115)
+    y = 0.0
+    ys, names, headers = [], [], []
+    for title, rows in groups:
+        for name, vals in rows:
+            finite = [v for v in vals if not math.isnan(v)]
+            if finite:
+                ax.plot([min(finite + [1]), max(finite + [1])], [y, y], color=AXIS, linewidth=1.1, zorder=1)
+            # dodge the three tools vertically so equal results never hide each other
+            for offset, z, ((_, _, color, marker), v) in zip((-0.3, 0.0, 0.3), (5, 4, 3), zip(tools, vals)):
+                if not math.isnan(v):
+                    ax.plot(v, y + offset, marker=marker, markersize=8 if marker == "D" else 8.5, color=color,
+                            markeredgecolor=SURFACE, markeredgewidth=1.5, zorder=z, linestyle="none")
+            ys.append(y); names.append(LABELS.get(name, name))
+            y += 1
+        headers.append((y + 0.15, title))
+        y += 1.6
+    ax.axvline(1, color=INK_2, linewidth=1.2, zorder=2)
+    ax.set_yticks(ys, names)
+    header_tf = blended_transform_factory(fig.transFigure, ax.transData)
+    for hy, title in headers:
+        ax.text(0.03, hy, title, transform=header_tf, ha="left", va="bottom", fontsize=10.5, color=INK_2, fontweight="bold")
+    ax.set_ylim(-0.8, y - 1.1)
+    style_log_x(ax, 0.03, 600, [0.1, 0.3, 1, 3, 10, 30, 100, 300], lambda v, _: f"{v:g}x")
+    ax.set_xlabel("Speed-up over CPython 3.15 (hot section, median of 5 runs, log scale; right of 1x = faster)", fontsize=10, color=INK_2, labelpad=8)
+
+    fig.text(0.03, 0.955, "Three ways to compile Python", fontsize=19, fontweight="bold", color=INK)
+    fig.text(0.03, 0.918, "Typhon (Native AOT), Codon and Pythran on the same, unchanged source files, compared with CPython",
+             fontsize=11, color=INK_2)
+    fig.legend(handles=[Line2D([], [], marker=m, color=c, linestyle="none", markersize=9, markeredgecolor=SURFACE,
+                               markeredgewidth=1.5, label=lab) for lab, _, c, m in tools],
+               loc="upper left", bbox_to_anchor=(0.025, 0.905), ncol=3, frameon=False, fontsize=10.5, handletextpad=0.3)
+    fig.text(0.03, 0.014, "Linux (Ubuntu 26.04 on WSL2), Intel Core Ultra 9 285HX. A missing marker means the tool cannot compile that program\n"
+             "(Pythran: no classes; Codon: string type annotations; Typhon AOT: dynamic values). Details: benchmarks/REPORT.md", fontsize=8.5, color=MUTED)
+    out = OUT / "compilers.png"
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     tables = parse_tables((HERE / "RESULTS.md").read_text(encoding="utf-8-sig"))
-    for path in (speedup_chart(tables), problems_chart(tables)):
+    paths = [speedup_chart(tables), problems_chart(tables)]
+    linux = HERE / "RESULTS_LINUX.md"
+    if linux.exists():
+        paths.append(compilers_chart(parse_tables(linux.read_text(encoding="utf-8-sig"))))
+    for path in paths:
         print("written:", path.relative_to(HERE.parent))

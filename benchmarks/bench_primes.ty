@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export sieve(int)
 def sieve(n: int) -> int:
     is_prime = [True] * (n + 1)
     is_prime[0] = False

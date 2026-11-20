@@ -50,5 +50,5 @@ if __name__ == "__main__":
     File.WriteAllText(path, report(inv))
     print(f"wrote {len(File.ReadAllLines(path))} lines to {Path.GetFileName(path)}")
 
-    prices = await load_prices(["tea", "coffee"])
+    prices = asyncio.run(load_prices(["tea", "coffee"]))
     print("prices:", prices)

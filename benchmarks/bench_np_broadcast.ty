@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 
+#pythran export pairwise(int, int)
 def pairwise(n: int, reps: int) -> float:
     xs = np.linspace(0.0, 1.0, n)
     ys = np.sin(xs * 10.0)

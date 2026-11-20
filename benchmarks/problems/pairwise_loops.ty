@@ -6,6 +6,7 @@ import math
 import time
 
 
+#pythran export pairwise(float list, float list)
 def pairwise(xs: list[float], ys: list[float]) -> float:
     n = len(xs)
     total = 0.0

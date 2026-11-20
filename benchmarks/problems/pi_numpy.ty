@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 
+#pythran export estimate_pi(int)
 def estimate_pi(n: int) -> float:
     i = np.arange(n)
     x = (i * 0.6180339887498949) % 1.0

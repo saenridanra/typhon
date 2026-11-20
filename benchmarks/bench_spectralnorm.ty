@@ -31,6 +31,7 @@ def mul_atav(n: int, v: list[float], out: list[float], tmp: list[float]) -> None
     mul_atv(n, tmp, out)
 
 
+#pythran export spectral_norm(int)
 def spectral_norm(n: int) -> float:
     u = [1.0] * n
     v = [0.0] * n

@@ -5,6 +5,7 @@
 import time
 
 
+#pythran export word_count(int)
 def word_count(n: int) -> int:
     words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
     counts: dict[str, int] = {}

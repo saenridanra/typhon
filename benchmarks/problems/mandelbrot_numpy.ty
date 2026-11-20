@@ -7,6 +7,7 @@ import time
 import numpy as np
 
 
+#pythran export mandelbrot(int, int)
 def mandelbrot(size: int, max_iter: int) -> int:
     xs = np.arange(size) * 2.0 / size - 1.5
     ys = np.arange(size) * 2.0 / size - 1.0
