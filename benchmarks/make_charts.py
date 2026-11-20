@@ -9,6 +9,11 @@ Chart 1 (speedup.png):  Typhon's speed-up over CPython per benchmark, log scale,
                         bars right of 1x = Typhon faster (orange), left = CPython/NumPy faster (blue).
 Chart 2 (problems.png): the same problem written as plain loops and with NumPy; hot-section time on a log scale
                         for CPython loops (gray context), CPython + NumPy (blue) and Typhon loops (orange).
+Chart 3 (compilers.png): Linux, Typhon vs Codon vs Pythran (from RESULTS_LINUX.md).
+Chart 4 (oneoff.png):   running a script once, compile time included (from RESULTS_BATTERY.md).
+
+nbody_untyped is left out of charts 1 and 3: those runs predate whole-program type inference, which now types that
+program completely (see RESULTS_BATTERY.md).
 """
 import math
 import re
@@ -61,7 +66,8 @@ LABELS = {
     "primes": "Prime sieve",
     "wordcount": "Word count (str + dict)",
     "sort": "sorted() ints + strings",
-    "nbody_untyped": "N-body without type hints (dynamic)",
+    "nbody_untyped": "N-body without type hints",
+    "startup": "Tiny script (start-up)",
     "np_loop": "Element loop over an ndarray",
     "np_broadcast": "Broadcasting (pairwise distances)",
     "np_reduce": "Reductions along axes",
@@ -125,6 +131,10 @@ def style_log_x(ax, lo: float, hi: float, ticks: list[float], fmt) -> None:
     ax.tick_params(axis="x", length=0, pad=6, labelsize=10)
 
 
+# measured before whole-program type inference existed; their numbers no longer describe Typhon
+PREDATES_INFERENCE = {"nbody_untyped"}
+
+
 def speedup_chart(tables: dict) -> Path:
     """Windows: speed-up of Typhon over CPython / NumPy per program, as a Native AOT executable (orange) and with the JIT (gray)."""
     basic = table(tables, "Pure Python")
@@ -134,7 +144,8 @@ def speedup_chart(tables: dict) -> Path:
         vals = [ms(r[c]) for c in cols if c in r and not math.isnan(ms(r[c]))]
         return min(vals) if vals else float("nan")
 
-    pure = [(r["Benchmark"], ms(r["CPython"]) / ms(r["Typhon"]), ms(r["CPython"]) / ms(r["Typhon AOT"])) for r in basic]
+    pure = [(r["Benchmark"], ms(r["CPython"]) / ms(r["Typhon"]), ms(r["CPython"]) / ms(r["Typhon AOT"])) for r in basic
+            if r["Benchmark"] not in PREDATES_INFERENCE]
     nump = [(r["Benchmark"], best(r, "NumPy", "NumPy 1 BLAS thread") / best(r, "Typhon", "Typhon 1 thread"),
              best(r, "NumPy", "NumPy 1 BLAS thread") / ms(r["Typhon AOT"])) for r in numpy_rows]
     key = lambda x: x[2] if not math.isnan(x[2]) else x[1]
@@ -186,7 +197,7 @@ def speedup_chart(tables: dict) -> Path:
              fontsize=11, color=INK_2)
     fig.legend(handles=[Patch(color=TYPHON, label="Typhon, Native AOT executable"), Patch(color=JIT_GRAY, label="Typhon, .NET JIT")],
                loc="upper left", bbox_to_anchor=(0.025, 0.912), ncol=2, frameon=False, fontsize=10.5, handlelength=1.2)
-    fig.text(0.03, 0.012, "Intel Core Ultra 9 285HX, Windows 11. Programs are compiled before the run (compile time not included);\n"
+    fig.text(0.03, 0.012, "Intel Core Ultra 9 285HX, Windows 11. Programs are compiled before the run (compile time: see oneoff.png);\n"
              "NumPy rows use each side's faster thread setting. github.com/saenridanra/typhon", fontsize=8.5, color=MUTED)
     out = OUT / "speedup.png"
     fig.savefig(out)
@@ -245,7 +256,7 @@ def compilers_chart(tables: dict) -> Path:
     for heading, base, title in (("numpy programs", "CPython + NumPy", "NumPy programs"), ("Pure Python", "CPython", "Pure Python programs")):
         rows = []
         for r in table(tables, heading):
-            if r["Benchmark"] == "startup":
+            if r["Benchmark"] == "startup" or r["Benchmark"] in PREDATES_INFERENCE:
                 continue
             ref = ms(r[base])
             vals = [ref / ms(r[col]) if not math.isnan(ms(r[col])) else float("nan") for _, col, _, _ in tools]
@@ -294,6 +305,52 @@ def compilers_chart(tables: dict) -> Path:
     return out
 
 
+def oneoff_chart(tables: dict) -> Path:
+    """One-off use: end-to-end time of CPython and of `typhon run` on a first run and with the warm compile server."""
+    rows = []
+    for r in table(tables, "One-off"):
+        rows.append((r["Program"], ms(r["CPython"]), ms(r["typhon run, first run"]), ms(r["typhon run, compile server"])))
+    rows.sort(key=lambda x: x[1])
+
+    fig, ax = plt.subplots(figsize=(10, 8.4), dpi=180)
+    fig.subplots_adjust(left=0.29, right=0.80, top=0.82, bottom=0.12)
+    series = [("CPython (python script.py)", PYTHON, "o", PYTHON), ("typhon run, first run (compiles)", TYPHON, "D", SURFACE),
+              ("typhon run, warm compile server", TYPHON, "D", TYPHON)]
+    for y, (name, cp, first, server) in enumerate(rows):
+        vals = (cp, first, server)
+        ax.plot([min(vals), max(vals)], [y, y], color=AXIS, linewidth=1.1, zorder=1)
+        # CPython slightly above, Typhon slightly below the row line, so equal times never hide each other
+        for (_, color, marker, face), v, z, dy in zip(series, vals, (4, 3, 5), (0.16, -0.16, -0.16)):
+            ax.plot(v, y + dy, marker=marker, markersize=8.5, color=color, markerfacecolor=face,
+                    markeredgecolor=color if face == SURFACE else SURFACE, markeredgewidth=1.8 if face == SURFACE else 1.4,
+                    zorder=z, linestyle="none")
+        f = cp / server
+        if 0.95 <= f <= 1.05: text, color = "level", MUTED
+        elif f > 1: text, color = f"{fmt_factor(f)} faster", INK
+        else: text, color = f"CPython {fmt_factor(1 / f)} faster", MUTED
+        ax.text(1.02, y, text, transform=blended_transform_factory(ax.transAxes, ax.transData), va="center", ha="left", fontsize=9.5, color=color)
+    ax.text(1.02, len(rows) - 0.25, "With the server", transform=blended_transform_factory(ax.transAxes, ax.transData),
+            va="bottom", ha="left", fontsize=9.5, color=INK_2, fontweight="bold")
+    ax.set_yticks(range(len(rows)), [LABELS.get(r[0], r[0]) for r in rows])
+    ax.set_ylim(-0.7, len(rows) - 0.3)
+    style_log_x(ax, 25, 5000, [30, 100, 300, 1000, 3000], lambda v, _: f"{v / 1000:g} s" if v >= 1000 else f"{v:g} ms")
+    ax.set_xlabel("End-to-end process time, start to exit (median of 5 runs, log scale)", fontsize=10, color=INK_2, labelpad=8)
+
+    fig.text(0.03, 0.955, "Running a script: CPython vs typhon run", fontsize=19, fontweight="bold", color=INK)
+    fig.text(0.03, 0.918, "The first run compiles in the process; after that a warm compile server (or the script cache) does it",
+             fontsize=11, color=INK_2)
+    fig.legend(handles=[Line2D([], [], marker=m, color=c, markerfacecolor=f, markeredgecolor=c if f == SURFACE else SURFACE,
+                               markeredgewidth=1.8 if f == SURFACE else 1.4, linestyle="none", markersize=9, label=lab)
+                        for lab, c, m, f in series],
+               loc="upper left", bbox_to_anchor=(0.025, 0.905), ncol=3, frameon=False, fontsize=9.5, handletextpad=0.3, columnspacing=1.2)
+    fig.text(0.03, 0.014, "Intel Core Ultra 9 285HX, Windows 11, laptop on battery; Typhon CLI published with ReadyToRun.\n"
+             "A cached, unchanged script also skips the server's compile step. Raw numbers: benchmarks/RESULTS_BATTERY.md", fontsize=8.5, color=MUTED)
+    out = OUT / "oneoff.png"
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
 if __name__ == "__main__":
     OUT.mkdir(exist_ok=True)
     tables = parse_tables((HERE / "RESULTS.md").read_text(encoding="utf-8-sig"))
@@ -301,5 +358,8 @@ if __name__ == "__main__":
     linux = HERE / "RESULTS_LINUX.md"
     if linux.exists():
         paths.append(compilers_chart(parse_tables(linux.read_text(encoding="utf-8-sig"))))
+    battery = HERE / "RESULTS_BATTERY.md"
+    if battery.exists():
+        paths.append(oneoff_chart(parse_tables(battery.read_text(encoding="utf-8-sig"))))
     for path in paths:
         print("written:", path.relative_to(HERE.parent))

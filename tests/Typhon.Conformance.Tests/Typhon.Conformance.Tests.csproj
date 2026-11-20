@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Conformance tests: every tests/conformance/cases/*.ty program must print exactly what CPython prints
+    (tests/conformance/expected/*.out). The tests run the real `typhon` CLI out of process.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Build the CLI first, but do not reference its assembly: the tests start it as a process. -->
+    <ProjectReference Include="..\..\src\Typhon.Cli\Typhon.Cli.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>TyphonRepoRoot</_Parameter1>
+      <_Parameter2>$(TyphonRepoRoot)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>TyphonCli</_Parameter1>
+      <_Parameter2>$(TyphonRepoRoot)src/Typhon.Cli/bin/$(Configuration)/$(TargetFramework)/typhon.dll</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+</Project>

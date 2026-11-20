@@ -29,7 +29,8 @@ param(
     [string]$Filter = "",
     [ValidateSet("all", "programs", "problems")][string]$Section = "all",
     [switch]$NoAot,
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [string]$Output = "RESULTS.md"
 )
 $ErrorActionPreference = "Stop"
 $inv = [Globalization.CultureInfo]::InvariantCulture
@@ -111,10 +112,22 @@ if (Get-Command $Python -ErrorAction SilentlyContinue) {
 if (-not $pythonVersion) { Write-Warning "CPython not found ('$Python'); only Typhon results will be shown." }
 
 if (-not $SkipBuild) {
-    dotnet build (Join-Path $root "src/Typhon.Cli/Typhon.Cli.csproj") -c Release -nologo -v q | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "building the Typhon CLI failed" }
+    # the CLI as users should run it: published with ReadyToRun (Roslyn precompiled, about half the cold compile time)
+    $rid = [System.Runtime.InteropServices.RuntimeInformation]::RuntimeIdentifier
+    dotnet publish (Join-Path $root "src/Typhon.Cli/Typhon.Cli.csproj") -c Release -r $rid --self-contained false -o (Join-Path $root "artifacts/typhon-cli") -nologo -v q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "publishing the Typhon CLI failed" }
 }
-$typhon = (Get-ChildItem (Join-Path $root "src/Typhon.Cli/bin/Release") -Recurse -Filter "typhon.exe" | Select-Object -First 1).FullName
+$typhon = Join-Path $root "artifacts/typhon-cli/typhon.exe"
+
+# Laptops measure very differently on battery (start-up and compile times roughly double): record the power state.
+function Get-PowerState {
+    $b = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $b) { return "AC power (no battery)" }
+    # BatteryStatus 1 = discharging, 4 = low, 5 = critical; everything else means the charger is connected
+    if ($b.BatteryStatus -in 1, 4, 5) { "battery ($($b.EstimatedChargeRemaining)%)" } else { "AC power" }
+}
+$powerAtStart = Get-PowerState
+$powerPlan = if ((powercfg /getactivescheme) -match "\((.+)\)") { $Matches[1] } else { "unknown" }
 $buildRoot = Join-Path $root "artifacts/bench"
 
 # ── helpers ──────────────────────────────────────────────────────────────────────────
@@ -175,6 +188,15 @@ function Measure-Program([IO.FileInfo]$file) {
 
     $ty = Run-Series "dotnet" @($dll)
     if (-not $ty) { return $null }
+    # One-off use, like `python script.py`: `typhon run` in its three situations
+    #   cold:   no compile server, no cached build (compiles in the process; the first run ever)
+    #   server: the warm compile server compiles (the usual case while working; it starts with the first run)
+    #   cached: an unchanged script that ran before (no compiling at all)
+    $oneShot = Run-Series $typhon @("run", $file.FullName, $mode) @{ TYPHON_SERVER = "0"; TYPHON_CACHE = "0" }
+    $oneShotServer = Run-Series $typhon @("run", $file.FullName, $mode) @{ TYPHON_CACHE = "0" }
+    $cacheEnv = @{ TYPHON_SERVER = "0"; TYPHON_CACHE_DIR = (Join-Path $buildRoot "script-cache") }
+    $null = Invoke-Measured $typhon @("run", $file.FullName, $mode) $cacheEnv
+    $oneShotCached = Run-Series $typhon @("run", $file.FullName, $mode) $cacheEnv
     $cp = if ($pyExe) { Run-Series $pyExe @($file.FullName) $pyEnv } else { $null }
     $ty1 = $null; $cp1 = $null
     if ($usesNumpy) {
@@ -184,12 +206,13 @@ function Measure-Program([IO.FileInfo]$file) {
 
     # Native AOT: same program as a self-contained native executable (no JIT). Programs that use dynamic values are
     # rejected by `typhon build --aot` (TY2001) and reported as n/a.
-    $aot = $null; $aotStatus = "skipped"; $aotSizeMB = $null
+    $aot = $null; $aotStatus = "skipped"; $aotSizeMB = $null; $aotBuildMs = $null
     if (-not $NoAot) {
         $aotDir = Join-Path $buildRoot ("aot_" + $file.Directory.Name + "_" + $file.BaseName)
         $ab = Invoke-Measured $typhon @("build", $file.FullName, $mode, "--aot", "-o", $aotDir) @{}
         if ($ab.Ok) {
             $script:aotCompileMs += $ab.WallMs
+            $aotBuildMs = $ab.WallMs
             $exe = Get-ChildItem $aotDir -Filter "typhon_*.exe" | Select-Object -First 1
             $aotSizeMB = $exe.Length / 1MB
             $aot = Run-Series $exe.FullName @()
@@ -197,7 +220,8 @@ function Measure-Program([IO.FileInfo]$file) {
         } elseif ($ab.Output -match "TY2001") { $aotStatus = "dynamic" }
         else { Write-Warning "Native AOT build failed for $($file.Name):`n$($ab.Output)"; $aotStatus = "failed" }
     }
-    [pscustomobject]@{ Ty = $ty; Ty1 = $ty1; Cp = $cp; Cp1 = $cp1; Aot = $aot; AotStatus = $aotStatus; AotSizeMB = $aotSizeMB; UsesNumpy = $usesNumpy }
+    [pscustomobject]@{ Ty = $ty; Ty1 = $ty1; Cp = $cp; Cp1 = $cp1; Aot = $aot; AotStatus = $aotStatus; AotSizeMB = $aotSizeMB; UsesNumpy = $usesNumpy
+                       OneShot = $oneShot; OneShotServer = $oneShotServer; OneShotCached = $oneShotCached; BuildMs = $build.WallMs; AotBuildMs = $aotBuildMs }
 }
 
 # AOT cells: a value, or why there is none
@@ -210,6 +234,33 @@ function AotFmt($m, $value, [switch]$Ram) {
     }
 }
 
+# After how many runs is compiling once (build + n * compiled run) cheaper than running CPython n times?
+function BreakEven($buildMs, $runMs, $cpMs) {
+    if ($null -eq $buildMs -or $null -eq $runMs -or $null -eq $cpMs) { return "–" }
+    if ($runMs -ge $cpMs) { return "never" }
+    [string][math]::Ceiling($buildMs / ($cpMs - $runMs))
+}
+
+# One-off use: end-to-end process times including compilation
+function OneShotRow([string]$name, $m) {
+    $cpMs = if ($m.Cp) { $m.Cp.WallMs } else { $null }
+    $runMs = if ($m.OneShot) { $m.OneShot.WallMs } else { $null }
+    $aotRun = if ($m.Aot) { $m.Aot.WallMs } else { $null }
+    [pscustomobject]@{
+        Program = $name
+        "CPython" = Fmt $cpMs
+        "typhon run, first run" = Fmt $runMs
+        "typhon run, compile server" = Fmt $(if ($m.OneShotServer) { $m.OneShotServer.WallMs })
+        "typhon run, cached" = Fmt $(if ($m.OneShotCached) { $m.OneShotCached.WallMs })
+        "typhon build" = Fmt $m.BuildMs
+        "Compiled run" = Fmt $m.Ty.WallMs
+        "Break-even runs" = BreakEven $m.BuildMs $m.Ty.WallMs $cpMs
+        "build --aot" = AotFmt $m $m.AotBuildMs
+        "AOT run" = AotFmt $m $aotRun
+        "Break-even runs (AOT)" = $(if ($m.AotStatus -eq "ok") { BreakEven $m.AotBuildMs $aotRun $cpMs } else { "–" })
+    }
+}
+
 function Best($series, $series1, $label) { MinOf ($(if ($series) { $series.Times[$label] })) ($(if ($series1) { $series1.Times[$label] })) }
 
 # ── 1. benchmark programs: bench_*.ty ───────────────────────────────────────────────
@@ -219,13 +270,16 @@ function SameResult($cp, [object[]]$others) {
     if ($bad.Count -eq 0) { "yes" } else { "NO: $($cp.Result) vs " + (($bad | ForEach-Object { $_.Result }) -join " / ") }
 }
 
-$basicRows = @(); $numpyRows = @(); $startupRows = @()
+$basicRows = @(); $numpyRows = @(); $startupRows = @(); $oneShotRows = @()
+# the compile server serves the "compile server" columns; it is started (and warmed up) once, stopped at the end
+& $typhon server start 2>&1 | Out-Null
 if ($Section -in "all", "programs") {
     foreach ($file in Get-ChildItem $PSScriptRoot -Filter "bench_*.ty" | Where-Object Name -like "*$Filter*" | Sort-Object Name) {
         Write-Host "running $($file.Name) ($Repeat runs per configuration) ..." -ForegroundColor DarkGray
         $m = Measure-Program $file
         if (-not $m) { continue }
         $ty = $m.Ty; $cp = $m.Cp; $aot = $m.Aot
+        $oneShotRows += OneShotRow ($file.BaseName -replace "^bench_", "") $m
         if ($file.BaseName -eq "bench_startup") {
             # the hot section is ~0 ms here; what matters is the whole process
             $dllDir = Join-Path $buildRoot ($file.Directory.Name + "_" + $file.BaseName)
@@ -308,7 +362,8 @@ $os = (Get-CimInstance Win32_OperatingSystem).Caption
 $envLines = @(
     "- CPU: $($cpu.Name.Trim()) ($($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads), $mem GB RAM",
     "- OS: $os",
-    "- Typhon: .NET SDK $(& dotnet --version); each program compiled once with ``typhon build --strict`` (``--permissive`` for *_untyped*) and run with ``dotnet app.dll``",
+    "- Power: $powerAtStart at the start, $(Get-PowerState) at the end; Windows power plan: $powerPlan",
+    "- Typhon: .NET SDK $(& dotnet --version); CLI published with ReadyToRun; each program compiled once with ``typhon build --strict`` (``--permissive`` for *_untyped*) and run with ``dotnet app.dll``",
     "- CPython: $(if ($pythonVersion) { $pythonVersion } else { 'not installed' })",
     "- NumPy: $(if ($numpyInfo) { $numpyInfo } else { '–' }); Typhon uses Typhon.NumPy (TensorPrimitives SIMD)",
     "- Method: median of $Repeat runs per configuration. Times are the hot section, measured with time.perf_counter() inside each program. RAM is the peak working set of the whole process. Process is end-to-end wall-clock time (startup + program).",
@@ -338,6 +393,12 @@ $md = @(
     "",
     (To-Markdown $startupRows),
     "",
+    "## One-off runs: compile time included",
+    "",
+    "Python scripts are often run once. ``typhon run`` is the equivalent of ``python script.py`` and has three situations: the first run compiles in the process (parse, infer types, Roslyn); while you work, a background compile server keeps the compiler warm and compiles instead; an unchanged script that ran before comes from the script cache without compiling. ``typhon build`` compiles once to a .dll (``--aot``: a native .exe). The CLI is published with ReadyToRun. All times are end-to-end process wall-clock times (median of $Repeat runs; builds measured once). ""Break-even runs"": the number of runs after which building once and running the compiled program is cheaper than running CPython every time (""never"": the compiled program is not faster than CPython).",
+    "",
+    (To-Markdown $oneShotRows),
+    "",
     "## Pure Python: CPython vs Typhon",
     "",
     (To-Markdown $basicRows),
@@ -358,7 +419,8 @@ $md = @(
     "",
     (To-Markdown $problemRamRows)
 ) -join "`n"
-Set-Content -Path (Join-Path $PSScriptRoot "RESULTS.md") -Value $md -Encoding utf8
+& $typhon server stop 2>&1 | Out-Null
+Set-Content -Path (Join-Path $PSScriptRoot $Output) -Value $md -Encoding utf8
 
 Write-Host ""
 $envLines | ForEach-Object { Write-Host $_ }
@@ -368,7 +430,9 @@ Write-Host "numpy: CPython + NumPy vs Typhon + Typhon.NumPy" -ForegroundColor Cy
 $numpyRows | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 Write-Host "Problems: plain loops vs NumPy, on CPython and on Typhon" -ForegroundColor Cyan
 $problemRows | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+Write-Host "One-off runs: compile time included" -ForegroundColor Cyan
+$oneShotRows | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 Write-Host "Startup and footprint" -ForegroundColor Cyan
 $startupRows | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
 $problemRamRows | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
-Write-Host "written: benchmarks/RESULTS.md"
+Write-Host "written: benchmarks/$Output"

@@ -1,0 +1,13 @@
+['negative', 'zero', 'small', 'large']
+25 11
+0 1 0 2 1 0 1 2 2 0 2 1 
+10 6 2 
+finally value | ValueError
+finally zero | ZeroDivisionError
+finally key | KeyError
+finally index | IndexError
+finally custom | MyError: boom
+finally none | ok
+0.33 div by zero
+AssertionError: math is broken
+message: invalid literal for int() with base 10: '12x'

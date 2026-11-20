@@ -11,3 +11,6 @@ __usage_in_claude.png
 
 # local Python environment for the CPython benchmark comparison
 .venv/
+
+# the typhon CLI published locally (README quick start)
+/tools/

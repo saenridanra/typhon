@@ -1,0 +1,11 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: dict behaviour that differs from .NET's Dictionary (iteration yields keys, get() returns None)."""
+
+d = {"b": 2, "a": 1, "c": 3}
+for k in d:
+    print(k, end=" ")
+print()
+print(sorted(d), list(d), len(d))
+print(d.get("missing"))

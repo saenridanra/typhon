@@ -1,0 +1,154 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: classes, inheritance, properties, dunder methods, dataclasses, enums, protocols."""
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+from typing import Protocol
+
+
+class Shape(ABC):
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @abstractmethod
+    def area(self) -> float: ...
+
+    def describe(self) -> str:
+        return f"{self.name}: {self.area():.2f}"
+
+
+class Rect(Shape):
+    def __init__(self, w: float, h: float) -> None:
+        super().__init__("rect")
+        self.w = w
+        self.h = h
+
+    def area(self) -> float:
+        return self.w * self.h
+
+
+class Square(Rect):
+    def __init__(self, side: float) -> None:
+        super().__init__(side, side)
+        self.name = "square"
+
+
+class Circle(Shape):
+    count = 0
+
+    def __init__(self, r: float) -> None:
+        super().__init__("circle")
+        self._r = r
+        Circle.count += 1
+
+    @property
+    def radius(self) -> float:
+        return self._r
+
+    @radius.setter
+    def radius(self, value: float) -> None:
+        self._r = value
+
+    def area(self) -> float:
+        return 3.0 * self._r * self._r
+
+    @staticmethod
+    def unit() -> "Circle":
+        return Circle(1.0)
+
+    @classmethod
+    def made(cls) -> int:
+        return cls.count
+
+
+class Vector:
+    def __init__(self, x: float, y: float) -> None:
+        self.x = x
+        self.y = y
+
+    def __add__(self, other: "Vector") -> "Vector":
+        return Vector(self.x + other.x, self.y + other.y)
+
+    def __mul__(self, k: float) -> "Vector":
+        return Vector(self.x * k, self.y * k)
+
+    def __eq__(self, other: "Vector") -> bool:
+        return self.x == other.x and self.y == other.y
+
+    def __lt__(self, other: "Vector") -> bool:
+        return self.length() < other.length()
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, i: int) -> float:
+        return self.x if i == 0 else self.y
+
+    def __repr__(self) -> str:
+        return f"Vector({self.x}, {self.y})"
+
+    def length(self) -> float:
+        return (self.x ** 2 + self.y ** 2) ** 0.5
+
+
+@dataclass
+class Point:
+    x: int
+    y: int = 0
+
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+
+
+class Greeter(Protocol):
+    def greet(self) -> str: ...
+
+
+class English:
+    def greet(self) -> str:
+        return "hello"
+
+
+class German:
+    def greet(self) -> str:
+        return "hallo"
+
+
+class Animal:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def speak(self) -> str:
+        return "..."
+
+    def __str__(self) -> str:
+        return f"{type(self).__name__}({self.name}) says {self.speak()}"
+
+
+class Dog(Animal):
+    def speak(self) -> str:
+        return "woof"
+
+
+shapes: list[Shape] = [Rect(2.0, 3.0), Square(2.0), Circle(1.0), Circle.unit()]
+for s in shapes:
+    print(s.describe(), isinstance(s, Rect), isinstance(s, Circle))
+c = Circle(2.0)
+c.radius = 3.0
+print(c.radius, c.area(), Circle.count, Circle.made())
+
+v = Vector(1.0, 2.0) + Vector(3.0, 4.0) * 2.0
+print(v, v == Vector(7.0, 10.0), v != Vector(0.0, 0.0), Vector(1.0, 1.0) < v, len(v), v[0], v[1])
+print(sorted([Vector(3.0, 4.0), Vector(1.0, 0.0)]))
+
+p = Point(1, 2)
+print(p, Point(3), p == Point(1, 2), p == Point(2, 1))
+print(Color.RED, Color.GREEN == Color.GREEN, Color.RED.value, Color.GREEN.name)
+
+greeters: list[Greeter] = [English(), German()]
+print([g.greet() for g in greeters])
+print(str(Dog("rex")), Animal("x"))

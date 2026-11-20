@@ -1,0 +1,20 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: NumPy array creation, arithmetic, reductions and printing (Typhon runs it on Typhon.NumPy)."""
+import numpy as np
+
+a = np.array([[1.0, 2.0], [3.0, 4.0]])
+b = np.arange(4.0).reshape(2, 2)
+print(a)
+print(a + b)
+print(a * 2.0 - 1.0)
+print(a @ b)
+print(a.T)
+print(a.sum(), a.mean(), a.max(), a.min())
+print(a.sum(axis=0), a.sum(axis=1))
+x = np.linspace(0.0, 1.0, 5)
+print(x)
+print(np.sqrt(x))
+print(x[1:3], x[-1])
+print(np.zeros(3), np.ones((2, 3)))

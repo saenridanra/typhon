@@ -1,0 +1,16 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: print() and the str/repr formatting of built-in values."""
+
+print("a", "b", "c")
+print("a", "b", sep="-")
+print("no newline", end="")
+print(" <- continued")
+print()
+print(None, True, False, 0, -1, 3.0, -0.0, 1e100, float("nan"), float("inf"))
+mixed: list[object] = [1, "two", 3.0, None, True]
+print(mixed, (1,), (1, 2), {"k": [1, 2], "n": None})
+print([[1, 2], [3]], [["nested", "deep"]])
+print(repr("x"), str("x"), [repr("x")], ["it's"], ['a"b'])
+print(f"{None} {True} {[1, 2]} {(1, 'a')} {3.0}")

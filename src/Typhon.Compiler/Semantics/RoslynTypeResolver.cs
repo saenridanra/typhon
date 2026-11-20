@@ -65,5 +65,25 @@ namespace Typhon.Compiler.Semantics
                     if ((m.IsVirtual || m.IsAbstract || m.IsOverride) && !m.IsSealed) return true;
             return false;
         }
+
+        public IReadOnlyList<CtorSignature> GetConstructors(string metadataName)
+        {
+            var result = new List<CtorSignature>();
+            var t = Find(metadataName);
+            if (t == null || t.TypeKind != TypeKind.Class || t.IsGenericType) return result;
+            foreach (var c in t.InstanceConstructors)
+            {
+                bool isProtected = c.DeclaredAccessibility == Accessibility.Protected || c.DeclaredAccessibility == Accessibility.ProtectedOrInternal;
+                if (c.DeclaredAccessibility != Accessibility.Public && !isProtected) continue;
+                // skip [Obsolete] (e.g. Exception's serialization constructor) and by-ref parameters
+                if (c.GetAttributes().Any(a => a.AttributeClass?.Name == "ObsoleteAttribute")) continue;
+                if (c.Parameters.Any(p => p.RefKind != RefKind.None || p.IsParams)) continue;
+                var sig = new CtorSignature { IsProtected = isProtected };
+                foreach (var p in c.Parameters)
+                    sig.Parameters.Add(new KeyValuePair<string, string>(p.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat), p.Name));
+                result.Add(sig);
+            }
+            return result;
+        }
     }
 }

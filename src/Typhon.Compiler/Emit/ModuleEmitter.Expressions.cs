@@ -52,7 +52,8 @@ namespace Typhon.Compiler.Emit
         /// <summary>When catching, some Python exceptions correspond to several unrelated .NET exceptions.</summary>
         static readonly Dictionary<string, string[]> CatchMap = new Dictionary<string, string[]>
         {
-            ["ValueError"] = new[] { "global::System.ArgumentException", "global::System.FormatException" },
+            // ArgumentOutOfRangeException derives from ArgumentException but is Python's IndexError
+            ["ValueError"] = new[] { "(global::System.ArgumentException and not global::System.ArgumentOutOfRangeException)", "global::System.FormatException" },
             ["IndexError"] = new[] { "global::System.ArgumentOutOfRangeException", "global::System.IndexOutOfRangeException" },
             ["TypeError"] = new[] { "global::System.InvalidCastException", "global::Microsoft.CSharp.RuntimeBinder.RuntimeBinderException" },
             ["ArithmeticError"] = new[] { "global::System.ArithmeticException" },
@@ -549,27 +550,101 @@ namespace Typhon.Compiler.Emit
             if (a.Name == "random" && a.Target is AttributeExpr inner && inner.Name == "random" && DottedName(inner.Target) is string mod &&
                 (_dotnetAliases.TryGetValue(mod, out var target0) ? target0 : mod) == "Typhon.Stdlib.numpy")
                 return EmitExpr(a.Target) + ".random_sample";
+            // type(x).__name__, x.__class__, SomeClass.__name__
+            if (a.Name == "__class__") return Paren(EmitExpr(a.Target)) + ".GetType()";
+            if (a.Name == "__name__")
+            {
+                if (a.Target is CallExpr tc && tc.Func is NameExpr tn && tn.Id == "type" && !IsShadowed("type")) return EmitExpr(a.Target) + ".Name";
+                if (a.Target is AttributeExpr ca && ca.Name == "__class__") return EmitExpr(a.Target) + ".Name";
+                if (DottedName(a.Target) is string tdn && TryTypeExpr(a.Target, out _)) return CsString(tdn.Split('.').Last());
+            }
             string target = EmitExpr(a.Target);
             if (a.Target is ConstExpr || a.Target is UnaryExpr || a.Target is BinOpExpr || a.Target is AwaitExpr) target = Paren(target);
             return target + "." + Esc(a.Name);
         }
 
-        string EmitArgs(List<Arg> args)
+        /// <summary>
+        /// A module-level Typhon function passed as an argument (map(f, xs), sorted(xs, key=f)) becomes a lambda: a method
+        /// group with dynamic or overloaded parameters cannot convert to Func&lt;int, ...&gt;, a lambda binds per call.
+        /// The call inside the lambda has argument types inference cannot see, so the function keeps its dynamic version.
+        /// </summary>
+        string FunctionValueLambda(NameExpr n)
+        {
+            if (IsLocal(n.Id) || _renames.ContainsKey(n.Id)) return null;
+            FunctionDef def = null; ModuleInfo owner = null;
+            if (_m.Functions.Contains(n.Id)) { owner = _m; def = _m.Ast.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == n.Id); }
+            else if (_importedFromModules.TryGetValue(n.Id, out var imp) && imp.Key.Functions.Contains(imp.Value))
+            { owner = imp.Key; def = imp.Key.Ast.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == imp.Value); }
+            if (def == null || def.TypeParams.Count > 0 || def.Params.Any(p => p.Kind != ParamKind.Normal)) return null;
+            // fully annotated functions convert as method groups (and keep their exact delegate type)
+            if (def.Params.All(p => p.Annotation != null)) return null;
+            if (Obs != null && TargetOf(owner, null, def.Name) is InferenceTarget t) Obs.Calls.Add(new Observations.Call { Callee = t.Key, Types = null, Context = _ctxFallbackKey });
+            var ps = def.Params.Where(p => p.Default == null).Select((p, i) => "__a" + i).ToList();
+            string call = $"{EmitName(n)}({string.Join(", ", ps)})";
+            return ps.Count == 1 ? $"({ps[0]} => {call})" : $"(({string.Join(", ", ps)}) => {call})";
+        }
+
+        sealed class IterableArgSpec { public int First; public bool All; public bool OnlyWhenSingle; }
+
+        /// <summary>Builtins whose positional argument(s) are iterables: index of the first, whether all following ones are too.</summary>
+        static readonly Dictionary<string, IterableArgSpec> IterableArgBuiltins = new Dictionary<string, IterableArgSpec>
+        {
+            ["list"] = new IterableArgSpec(), ["set"] = new IterableArgSpec(), ["frozenset"] = new IterableArgSpec(), ["tuple"] = new IterableArgSpec(),
+            ["sorted"] = new IterableArgSpec(), ["sum"] = new IterableArgSpec(), ["any"] = new IterableArgSpec(), ["all"] = new IterableArgSpec(),
+            ["enumerate"] = new IterableArgSpec(), ["reversed"] = new IterableArgSpec(),
+            ["zip"] = new IterableArgSpec { All = true },
+            ["map"] = new IterableArgSpec { First = 1, All = true }, ["filter"] = new IterableArgSpec { First = 1 },
+            ["min"] = new IterableArgSpec { OnlyWhenSingle = true }, ["max"] = new IterableArgSpec { OnlyWhenSingle = true },
+        };
+
+        /// <summary>Calls whose result is never a dict, so iterating them needs no iterable() wrapper.</summary>
+        static readonly HashSet<string> NonDictResults = new HashSet<string> { "range", "enumerate", "zip", "sorted", "reversed", "map", "filter", "list", "set", "tuple", "frozenset", "str", "open" };
+
+        /// <summary>An expression in a position that iterates it: wrapped in iterable() unless it is certainly not a dict.</summary>
+        string EmitIterable(Expr e)
+        {
+            string code = EmitExpr(e);
+            if (e is ListExpr || e is TupleExpr || e is SetExpr || e is ComprehensionExpr || e is ConstExpr || e is FStringExpr) return code;
+            if (e is CallExpr ce && ce.Func is NameExpr cn && !IsShadowed(cn.Id) && NonDictResults.Contains(cn.Id)) return code;
+            if (e is CallExpr me && me.Func is AttributeExpr ma && (ma.Name == "items" || ma.Name == "keys" || ma.Name == "values" || ma.Name == "split" || ma.Name == "splitlines")) return code;
+            string t = InferType(e);
+            if (t != null && (t == "string" || t.EndsWith("[]") || t.StartsWith("List<") || t.StartsWith("HashSet<") || t.StartsWith("IEnumerable<") ||
+                              t.StartsWith("IReadOnlyList<") || t.StartsWith("IList<") || t.StartsWith("(") || t.StartsWith("ValueTuple<")))
+                return code;
+            return $"iterable({code})";
+        }
+
+        string EmitArgs(List<Arg> args, System.Func<int, bool> iterableAt = null)
         {
             var parts = new List<string>();
+            int position = 0;
             foreach (var a in args)
             {
                 if (a.DoubleStar) { Unsupported(a.Value, "**kwargs arguments"); continue; }
-                string v = EmitExpr(a.Value);
+                if (iterableAt != null && a.Name == null && !a.Star && iterableAt(position++))
+                {
+                    parts.Add(EmitIterable(a.Value));
+                    continue;
+                }
+                // a builtin passed as a function (map(str, xs), key=len): C# cannot convert an overloaded method group whose
+                // parameter is object/generic to Func<int, string>, but a lambda binds the right overload at the call site
+                string v = a.Value is NameExpr vn && ValueBuiltins.Contains(vn.Id) && !IsShadowed(vn.Id) && !_renames.ContainsKey(vn.Id)
+                    ? $"(__v => {EmitName(vn)}(__v))"
+                    : a.Value is NameExpr fv && FunctionValueLambda(fv) is string lambda ? lambda
+                    : EmitExpr(a.Value);
                 parts.Add(a.Name != null ? $"{Esc(a.Name)}: {v}" : v); // *xs is passed as-is (works for params arrays)
             }
             return string.Join(", ", parts);
         }
 
+        /// <summary>Overloaded single-argument builtins that are wrapped in a lambda when passed as a function value.</summary>
+        static readonly HashSet<string> ValueBuiltins = new HashSet<string> { "str", "repr", "int", "float", "bool", "len", "abs", "ord", "chr", "hex", "bin", "oct", "round", "sorted", "sum", "min", "max", "list", "tuple", "set" };
+
         static readonly HashSet<string> SpecialBuiltins = new HashSet<string> { "isinstance", "cast", "type", "print", "object", "list", "dict", "set", "super" };
 
         string EmitCall(CallExpr c, bool targetTyped)
         {
+            if (Obs != null) RecordCall(CallTarget(c, out _), c.Args);
             if (c.Func is NameExpr fn && SpecialBuiltins.Contains(fn.Id) && !IsShadowed(fn.Id))
             {
                 switch (fn.Id)
@@ -629,7 +704,18 @@ namespace Typhon.Compiler.Emit
                     return $"{EmitExpr(gs.Target)}<{string.Join(", ", targs.Select(x => MapType(x, c)))}>({EmitArgs(c.Args)})";
             }
 
-            string func = EmitExpr(c.Func);
+            // builtins that consume iterables: a dict argument must contribute its keys (sorted(d), list(d), ", ".join(d))
+            if (c.Func is NameExpr ifn && !IsShadowed(ifn.Id) && IterableArgBuiltins.TryGetValue(ifn.Id, out var spec))
+            {
+                int positional = c.Args.Count(a => a.Name == null && !a.Star && !a.DoubleStar);
+                if (!(spec.OnlyWhenSingle && positional != 1))
+                    return $"{EmitName(ifn)}({EmitArgs(c.Args, i => i >= spec.First && (spec.All || i == spec.First))})";
+            }
+            if (c.Func is AttributeExpr ja && ja.Name == "join" && c.Args.Count == 1 && c.Args[0].Name == null &&
+                (ja.Target is ConstExpr jc && jc.Kind == ConstKind.Str || InferType(ja.Target) == "string"))
+                return $"{Paren(EmitExpr(ja.Target))}.join({EmitIterable(c.Args[0].Value)})";
+
+            string func = c.Func is NameExpr cfn ? EmitName(cfn) : EmitExpr(c.Func);
             if (c.Func is LambdaExpr || c.Func is IfExpr) func = Paren(func);
             return $"{func}({EmitArgs(c.Args)})";
         }
@@ -663,6 +749,8 @@ namespace Typhon.Compiler.Emit
             return (sl.Lower != null ? EmitIndex(sl.Lower) : "") + ".." + (sl.Upper != null ? EmitIndex(sl.Upper) : "");
         }
 
+        bool IsSequenceTyped(Expr e) { var t = InferType(e); return t == "string" || (t != null && t.StartsWith("List<")); }
+
         static bool IsSequenceLiteral(Expr e) => e is ConstExpr c && c.Kind == ConstKind.Str || e is FStringExpr || e is ListExpr;
 
         string EmitBinOp(BinOpExpr b)
@@ -674,7 +762,10 @@ namespace Typhon.Compiler.Emit
                 case "//": return $"floordiv({l}, {r})";
                 case "**": return $"pow({l}, {r})";
                 case "@": return $"{Paren(l)}.__matmul__({r})";
-                case "*" when IsSequenceLiteral(b.Left) || IsSequenceLiteral(b.Right): return $"repeat({l}, {r})";
+                case "*" when IsSequenceLiteral(b.Left) || IsSequenceLiteral(b.Right) || IsSequenceTyped(b.Left) || IsSequenceTyped(b.Right): return $"repeat({l}, {r})";
+                // late-bound operands may be a str or list at run time: "ab" * 2 must repeat, not fail in the binder
+                case "*" when InferType(b.Left) == "dynamic" || InferType(b.Right) == "dynamic": return $"mul({l}, {r})";
+                case "+" when InferType(b.Left) == "dynamic" && InferType(b.Right) == "dynamic": return $"add({l}, {r})";
                 case "+" when IsListy(b.Left) || IsListy(b.Right): return $"concat({l}, {r})";
                 case "%" when b.Left is ConstExpr sc && sc.Kind == ConstKind.Str:
                     Unsupported(b, "'%' string formatting (use an f-string)");
@@ -742,7 +833,7 @@ namespace Typhon.Compiler.Emit
             {
                 var g = c.Generators[i];
                 if (g.IsAsync) Unsupported(c, "async comprehensions");
-                string iter = EmitExpr(g.Iter);
+                string iter = EmitIterable(g.Iter);
                 string param; string deconstruct = null;
                 var bound = new HashSet<string>();
                 AstWalker.VisitAll(g.Target, n => { if (n is NameExpr ne) bound.Add(ne.Id); });
@@ -787,6 +878,55 @@ namespace Typhon.Compiler.Emit
         readonly Dictionary<string, string> _funcReturnTypes = new Dictionary<string, string>();
         readonly Dictionary<string, string> _moduleFieldTypes = new Dictionary<string, string>();
 
+        /// <summary>Element type of iterating a value of C# type <paramref name="t"/> (dict: keys, str: char).</summary>
+        static string ElementTypeOf(string t)
+        {
+            if (t == null || t == TypeInference.Pending) return t;
+            if (t == "string") return "char";
+            if (t.EndsWith("[]")) return t.Substring(0, t.Length - 2);
+            foreach (var g in new[] { "List<", "IList<", "IReadOnlyList<", "IEnumerable<", "HashSet<", "ISet<", "IReadOnlySet<", "IReadOnlyCollection<" })
+                if (t.StartsWith(g) && t.EndsWith(">")) return GenericArg(t);
+            if ((t.StartsWith("Dictionary<") || t.StartsWith("IDictionary<") || t.StartsWith("IReadOnlyDictionary<")) && t.EndsWith(">"))
+            {
+                var targs = SplitTypeArgs(GenericArg(t));
+                return targs.Count == 2 ? targs[0] : null;
+            }
+            return null;
+        }
+
+        /// <summary>Splits "K, List&lt;V&gt;" at top-level commas.</summary>
+        static List<string> SplitTypeArgs(string inner)
+        {
+            var result = new List<string>();
+            int depth = 0, start = 0;
+            for (int i = 0; i < inner.Length; i++)
+            {
+                char ch = inner[i];
+                if (ch == '<' || ch == '(') depth++;
+                else if (ch == '>' || ch == ')') depth--;
+                else if (ch == ',' && depth == 0) { result.Add(inner.Substring(start, i - start).Trim()); start = i + 1; }
+            }
+            result.Add(inner.Substring(start).Trim());
+            return result;
+        }
+
+        bool IsMathModule(Expr e) =>
+            e is NameExpr n && !IsLocal(n.Id) && (n.Id == "math" && !_m.Globals.Contains("math") || _dotnetAliases.TryGetValue(n.Id, out var target) && target == "Typhon.Stdlib.math_");
+
+        static readonly HashSet<string> MathIntFunctions = new HashSet<string> { "floor", "ceil", "trunc", "factorial", "gcd", "lcm", "isqrt", "comb", "perm" };
+        static readonly HashSet<string> MathBoolFunctions = new HashSet<string> { "isnan", "isinf", "isfinite", "isclose" };
+
+        /// <summary>Result type of math.f(...) (Typhon's math module mirrors Python's: floor/ceil/... return int).</summary>
+        string MathCall(AttributeExpr f)
+        {
+            if (!IsMathModule(f.Target)) return null;
+            if (MathIntFunctions.Contains(f.Name)) return "int";
+            if (MathBoolFunctions.Contains(f.Name)) return "bool";
+            return "double";
+        }
+
+        string MathConstant(AttributeExpr a) => IsMathModule(a.Target) && (a.Name == "pi" || a.Name == "e" || a.Name == "tau" || a.Name == "inf" || a.Name == "nan") ? "double" : null;
+
         static readonly HashSet<string> NumericTypes = new HashSet<string> { "int", "long", "double", "float", "decimal" };
 
         /// <summary>Cheap local type inference, used where C# 'var' cannot be used (hoisted locals, fields).</summary>
@@ -813,6 +953,32 @@ namespace Typhon.Compiler.Emit
                 }
                 case AttributeExpr at when at.Target is NameExpr self && self.Id == "self" && _cls != null:
                     return _cls.FieldTypes.TryGetValue(at.Name, out var ft) ? ft : null;
+                case AttributeExpr oa:
+                {
+                    var ot = InferType(oa.Target);
+                    if (ot == TypeInference.Pending) return TypeInference.Pending;
+                    if (ot == null) return MathConstant(oa);
+                    return MemberType(ot, oa.Name, method: false);
+                }
+                case SubscriptExpr ix when !(ix.Index is SliceExpr):
+                {
+                    var t = InferType(ix.Target);
+                    if (t == null || t == TypeInference.Pending) return t;
+                    if (t == "string") return "string";
+                    if (t.EndsWith("[]")) return t.Substring(0, t.Length - 2);
+                    if ((t.StartsWith("List<") || t.StartsWith("IList<") || t.StartsWith("IReadOnlyList<")) && t.EndsWith(">")) return GenericArg(t);
+                    if ((t.StartsWith("Dictionary<") || t.StartsWith("IDictionary<") || t.StartsWith("IReadOnlyDictionary<")) && t.EndsWith(">"))
+                    {
+                        var targs = SplitTypeArgs(GenericArg(t));
+                        return targs.Count == 2 ? targs[1] : null;
+                    }
+                    return null;
+                }
+                case AwaitExpr aw:
+                {
+                    var t = InferType(aw.Value);
+                    return t != null && t.StartsWith("Task<") && t.EndsWith(">") ? GenericArg(t) : null;
+                }
                 case SubscriptExpr sub when sub.Index is SliceExpr:
                 {
                     var t = InferType(sub.Target);
@@ -820,8 +986,16 @@ namespace Typhon.Compiler.Emit
                 }
                 case CallExpr call:
                 {
+                    if (InferredCallType(call) is string inferredCall) return inferredCall;
                     if (call.Func is NameExpr known && _funcReturnTypes.TryGetValue(known.Id, out var rt) && (IsShadowed(known.Id) || IsLocal(known.Id)))
                         return rt == "void" ? null : rt;
+                    if (call.Func is AttributeExpr mc && !(mc.Target is NameExpr mcs && mcs.Id == "self"))
+                    {
+                        if (MathCall(mc) is string mathType) return mathType;
+                        var ot = InferType(mc.Target);
+                        if (ot == TypeInference.Pending) return TypeInference.Pending;
+                        if (ot != null && MemberType(ot, mc.Name, method: true) is string objRet) return objRet;
+                    }
                     if (call.Func is AttributeExpr ma && ma.Target is NameExpr ms && ms.Id == "self" && _cls != null && _cls.MethodReturnTypes.TryGetValue(ma.Name, out var mrt))
                         return mrt == "void" ? null : mrt;
                     if (call.Func is NameExpr fn && !IsShadowed(fn.Id))
@@ -843,6 +1017,13 @@ namespace Typhon.Compiler.Emit
                 case BinOpExpr b:
                 {
                     string l = InferType(b.Left), r = InferType(b.Right);
+                    // a recursive call whose type is still being inferred contributes no information (optimistic inference)
+                    if (l == TypeInference.Pending || r == TypeInference.Pending)
+                    {
+                        if (b.Op == "/") return "double";
+                        if (l == TypeInference.Pending && r == TypeInference.Pending) return TypeInference.Pending;
+                        return l == TypeInference.Pending ? r : l;
+                    }
                     if (b.Op == "/") return (l == "decimal" && r == "decimal") ? "decimal" : (NumericTypes.Contains(l ?? "") && NumericTypes.Contains(r ?? "") ? "double" : null);
                     if (l == null || r == null) return null;
                     if (b.Op == "+" && l == "string" && r == "string") return "string";
@@ -857,7 +1038,13 @@ namespace Typhon.Compiler.Emit
                 case UnaryExpr u: return u.Op == "not" ? "bool" : InferType(u.Operand);
                 case CompareExpr _: return "bool";
                 case BoolOpExpr b: return b.Values.All(IsBoolish) ? "bool" : null;
-                case IfExpr i: { var a = InferType(i.Body); return a != null && a == InferType(i.OrElse) ? a : null; }
+                case IfExpr i:
+                {
+                    var a = InferType(i.Body); var o = InferType(i.OrElse);
+                    if (a == TypeInference.Pending) return o;
+                    if (o == TypeInference.Pending) return a;
+                    return a != null && a == o ? a : null;
+                }
                 case ListExpr l:
                 {
                     if (l.Elts.Count == 0) return null;

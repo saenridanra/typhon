@@ -1,0 +1,19 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: async functions, await, asyncio.run and asyncio.gather."""
+import asyncio
+
+
+async def square(x: int) -> int:
+    await asyncio.sleep(0.001)
+    return x * x
+
+
+async def main() -> int:
+    a = await square(3)
+    results = await asyncio.gather(square(1), square(2), square(4))
+    return a + sum(results)
+
+
+print(asyncio.run(main()))

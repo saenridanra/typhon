@@ -60,6 +60,8 @@ namespace Typhon.Compiler
         /// <summary>If set, only this module's `if __name__ == "__main__":` block becomes the program entry point.</summary>
         public string MainModule;
         public readonly Dictionary<string, ModuleInfo> Modules = new Dictionary<string, ModuleInfo>();
+        /// <summary>Whole-program inference results, computed on the first Emit (all modules must be parsed by then).</summary>
+        internal TypeInference Inference;
 
         public ModuleInfo FindModule(string dotted) => Modules.TryGetValue(dotted, out var m) ? m : null;
 
@@ -135,6 +137,7 @@ namespace Typhon.Compiler
 
         public static string Emit(ModuleInfo module, ProjectContext project, List<TyDiagnostic> diagnostics)
         {
+            if (project.Inference == null) TypeInference.Run(project);
             var emitter = new ModuleEmitter(module, project, diagnostics);
             return emitter.Emit();
         }

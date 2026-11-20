@@ -1,0 +1,172 @@
+// Copyright (c) 2026 The Typhon contributors.
+// Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
+using Typhon.Compiler;
+using Typhon.Compiler.Semantics;
+
+namespace Typhon.Cli;
+
+/// <summary>A source file the compilation read (with its SHA-256), or a module path it probed that did not exist (null).</summary>
+internal sealed record SourceProbe(string Path, string? Sha256);
+
+internal enum CompileTarget
+{
+    /// <summary>In memory for `typhon run` / `check`: references the precompiled Typhon.Runtime.dll (fast).</summary>
+    Script,
+    /// <summary>`typhon build` / `emit` / Native AOT: the runtime is compiled into the program, which needs nothing else.</summary>
+    Build,
+}
+
+internal sealed class CompileOutput
+{
+    public bool Success;
+    public readonly List<string> Messages = new();
+    public byte[]? Pe, Pdb;
+    public string? EntryCode;
+    public readonly List<SourceProbe> Probes = new();
+    public CSharpCompilation? Compilation;
+    public readonly List<SyntaxTree> Trees = new();
+    public long ReferencesMs, FrontMs, RoslynMs;
+}
+
+/// <summary>
+/// Metadata references for compiling Typhon programs: the running .NET runtime's assemblies plus the Typhon libraries
+/// next to the CLI. Creating them is not free, so the compile server keeps one set for its lifetime (Roslyn then also
+/// reuses the assembly symbols it built from them).
+/// </summary>
+internal sealed class ReferenceSet
+{
+    public readonly List<MetadataReference> Script = new();
+    public readonly List<MetadataReference> Build = new();
+
+    public ReferenceSet()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var paths = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
+            .Concat(Directory.GetFiles(AppContext.BaseDirectory, "Typhon.*.dll"))
+            .Where(p => p.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && seen.Add(Path.GetFileName(p)));
+        foreach (var p in paths)
+        {
+            string name = Path.GetFileName(p);
+            if (name.StartsWith("Typhon.Compiler", StringComparison.OrdinalIgnoreCase)) continue;
+            var reference = MetadataReference.CreateFromFile(p);
+            Script.Add(reference);
+            // a built program carries its own (embedded) copy of the runtime
+            if (!name.Equals("Typhon.Runtime.dll", StringComparison.OrdinalIgnoreCase)) Build.Add(reference);
+        }
+    }
+}
+
+/// <summary>Compiles a Typhon program (the entry file plus the sibling modules it imports) with Roslyn.</summary>
+internal static class CliCompiler
+{
+    public const string ScriptAssemblyName = "typhon_script"; // must match Typhon.Runtime's InternalsVisibleTo
+    static readonly CSharpParseOptions ParseOptions = new(LanguageVersion.Preview);
+
+    public static CompileOutput Compile(string entryPath, TypeMode mode, CompileTarget target, ReferenceSet? refs = null, bool csharpOnly = false)
+    {
+        var output = new CompileOutput();
+        var sw = Stopwatch.StartNew();
+        refs ??= new ReferenceSet();
+        output.ReferencesMs = sw.ElapsedMilliseconds;
+
+        var trees = new List<SyntaxTree>();
+        if (target == CompileTarget.Build)
+            trees.Add(CSharpSyntaxTree.ParseText(TyphonCompiler.RuntimeSource, ParseOptions, path: "Typhon.Runtime.g.cs", encoding: Encoding.UTF8));
+        var compilation = CSharpCompilation.Create(
+            target == CompileTarget.Script ? ScriptAssemblyName : "typhon_" + Path.GetFileNameWithoutExtension(entryPath),
+            trees,
+            target == CompileTarget.Script ? refs.Script : refs.Build,
+            new CSharpCompilationOptions(OutputKind.ConsoleApplication, optimizationLevel: OptimizationLevel.Release, allowUnsafe: true,
+                nullableContextOptions: NullableContextOptions.Disable));
+
+        // The entry file is the __main__ module; sibling .ty files it imports (transitively) are compiled with it.
+        // Every path probed is recorded, so a cached build can tell when any of them changes or appears.
+        sw.Restart();
+        var project = new ProjectContext { TypeMode = mode, Resolver = new RoslynTypeResolver(compilation), MainModule = "__main__" };
+        string dir = Path.GetDirectoryName(entryPath)!;
+        var modules = new List<ModuleInfo>();
+        var pending = new Queue<(string Path, string Name)>();
+        pending.Enqueue((entryPath, "__main__"));
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { entryPath };
+        while (pending.Count > 0)
+        {
+            var (path, name) = pending.Dequeue();
+            var m = TyphonCompiler.Parse(path, ReadSource(path, output.Probes), name, "");
+            project.Modules[name] = m;
+            modules.Add(m);
+            foreach (var imported in ImportedModuleNames(m))
+            {
+                string candidate = Path.GetFullPath(Path.Combine(dir, imported.Replace('.', Path.DirectorySeparatorChar) + TyphonCompiler.FileExtension));
+                if (!seen.Add(candidate)) continue;
+                if (File.Exists(candidate)) pending.Enqueue((candidate, imported));
+                else output.Probes.Add(new SourceProbe(candidate, null));
+            }
+        }
+
+        var diagnostics = new List<TyDiagnostic>();
+        foreach (var m in modules) diagnostics.AddRange(m.ParseDiagnostics);
+        foreach (var m in modules.Where(m => m.ParseDiagnostics.Count == 0))
+        {
+            string code = TyphonCompiler.Emit(m, project, diagnostics);
+            if (m.Name == "__main__") output.EntryCode = code;
+            output.Trees.Add(CSharpSyntaxTree.ParseText(code, ParseOptions, path: m.Path + ".g.cs", encoding: Encoding.UTF8));
+        }
+        output.FrontMs = sw.ElapsedMilliseconds;
+        foreach (var d in diagnostics) output.Messages.Add(d.ToString());
+        bool hasErrors = diagnostics.Any(d => d.Severity == Severity.Error);
+        if (csharpOnly) { output.Success = !hasErrors; return output; }
+
+        sw.Restart();
+        compilation = compilation.AddSyntaxTrees(output.Trees);
+        output.Compilation = compilation;
+        using var pe = new MemoryStream();
+        using var pdb = new MemoryStream();
+        var result = compilation.Emit(pe, pdb, options: new EmitOptions(debugInformationFormat: DebugInformationFormat.PortablePdb));
+        output.RoslynMs = sw.ElapsedMilliseconds;
+        foreach (var d in result.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error ||
+                                                         (d.Severity == DiagnosticSeverity.Warning && !d.Location.GetMappedLineSpan().Path.EndsWith(".g.cs"))))
+        {
+            var span = d.Location.GetMappedLineSpan();
+            output.Messages.Add($"{span.Path}({span.StartLinePosition.Line + 1}): {d.Severity.ToString().ToLowerInvariant()} {d.Id}: {d.GetMessage()}");
+            hasErrors |= d.Severity == DiagnosticSeverity.Error;
+        }
+        output.Success = result.Success && !hasErrors;
+        if (output.Success) { output.Pe = pe.ToArray(); output.Pdb = pdb.ToArray(); }
+        return output;
+    }
+
+    static string ReadSource(string path, List<SourceProbe> probes)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        probes.Add(new SourceProbe(path, Sha256(bytes)));
+        using var reader = new StreamReader(new MemoryStream(bytes), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return reader.ReadToEnd();
+    }
+
+    public static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
+
+    static IEnumerable<string> ImportedModuleNames(ModuleInfo m)
+    {
+        var names = new List<string>();
+        void Visit(IEnumerable<Typhon.Compiler.Syntax.Stmt> body)
+        {
+            foreach (var s in body)
+            {
+                if (s is Typhon.Compiler.Syntax.ImportStmt i) names.AddRange(i.Names.Select(n => n.Name));
+                else if (s is Typhon.Compiler.Syntax.ImportFromStmt f && f.Level == 0) names.Add(f.Module);
+                else if (s is Typhon.Compiler.Syntax.FunctionDef fd) Visit(fd.Body);
+                else if (s is Typhon.Compiler.Syntax.ClassDef cd) Visit(cd.Body);
+                else if (s is Typhon.Compiler.Syntax.IfStmt ifs) { Visit(ifs.Body); Visit(ifs.OrElse); }
+            }
+        }
+        Visit(m.Ast.Body);
+        return names;
+    }
+}

@@ -74,9 +74,143 @@ namespace Typhon.Compiler.Emit
         int _tmp;
         string _path;
 
-        public ModuleEmitter(ModuleInfo module, ProjectContext project, List<TyDiagnostic> diags)
+        public ModuleEmitter(ModuleInfo module, ProjectContext project, List<TyDiagnostic> diags, bool dryRun = false)
         {
-            _m = module; _p = project; _diags = diags; _r = project.Resolver; _path = module.Path;
+            _m = module; _p = project; _diags = diags; _r = project.Resolver; _path = module.Path; _dry = dryRun;
+        }
+
+        // ───────────────────────────── whole-program inference hooks ─────────────────────────────
+
+        /// <summary>A dry run only records observations for <see cref="TypeInference"/>; its output is discarded.</summary>
+        readonly bool _dry;
+        TypeInference Ti => _p.Inference;
+        Observations Obs => _dry ? Ti?.Obs : null;
+        /// <summary>Return-type key of the body being emitted (its returns are recorded), or null.</summary>
+        string _retKey;
+        /// <summary>Key of the inference target whose dynamic fallback body is being emitted (its calls might never run).</summary>
+        string _ctxFallbackKey;
+
+        InferenceTarget TargetOf(ModuleInfo m, ClassDef c, string name) =>
+            Ti != null && Ti.Targets.TryGetValue(TypeInference.FuncKey(m, c, name), out var t) ? t : null;
+
+        /// <summary>The __init__ that constructing <paramref name="c"/> runs (its own, or the nearest Typhon base class's).</summary>
+        InferenceTarget InitTarget(ModuleInfo m, ClassDef c, int depth = 0)
+        {
+            if (m == null || c == null || depth > 20) return null;
+            if (c.Body.OfType<FunctionDef>().Any(f => f.Name == "__init__")) return TargetOf(m, c, "__init__") is InferenceTarget t && t.Class == c ? t : null;
+            foreach (var b in c.Bases)
+                if ((b is SubscriptExpr s ? s.Target : b) is NameExpr bn && _p.TryFindClass(m, bn.Id, out var bc, out var owner))
+                    return InitTarget(owner, bc, depth + 1);
+            return null;
+        }
+
+        /// <summary>The project function or constructor a call resolves to (by name, imported name or module attribute).</summary>
+        InferenceTarget CallTarget(CallExpr call, out bool isConstructor)
+        {
+            isConstructor = false;
+            if (Ti == null) return null;
+            ModuleInfo mod = null; string name = null;
+            if (call.Func is NameExpr n)
+            {
+                if (IsLocal(n.Id)) return null;
+                if (_m.Functions.Contains(n.Id) || _m.Classes.ContainsKey(n.Id)) { mod = _m; name = n.Id; }
+                else if (_importedFromModules.TryGetValue(n.Id, out var imp)) { mod = imp.Key; name = imp.Value; }
+            }
+            else if (call.Func is AttributeExpr a && DottedName(a.Target) is string dotted && !IsLocal(dotted.Split('.')[0]) && ModuleRef(dotted) is ModuleInfo mref)
+            {
+                mod = mref; name = a.Name;
+            }
+            if (mod == null) return null;
+            if (mod.Classes.TryGetValue(name, out var cls)) { isConstructor = true; return InitTarget(mod, cls); }
+            return mod.Functions.Contains(name) ? TargetOf(mod, null, name) : null;
+        }
+
+        /// <summary>Argument types of a call, one per parameter (defaults fill omitted ones); null if the shape is unknown.</summary>
+        string[] ArgTypes(InferenceTarget t, List<Arg> args)
+        {
+            var ps = t.Params;
+            var types = new string[ps.Count];
+            int pos = 0;
+            foreach (var a in args)
+            {
+                if (a.Star || a.DoubleStar) return null;
+                int idx = a.Name == null ? pos++ : ps.FindIndex(p => p.Name == a.Name);
+                if (idx < 0 || idx >= ps.Count) return null;
+                types[idx] = InferType(a.Value) ?? TypeInference.Unknown;
+            }
+            for (int i = 0; i < ps.Count; i++)
+            {
+                if (ps[i].Annotation != null) { types[i] = TypeInference.Declared; continue; }
+                if (types[i] == null) types[i] = ps[i].Default != null ? (InferType(ps[i].Default) ?? TypeInference.Unknown) : null;
+                if (types[i] == null) return null;
+                // a type written in another module's terms might not resolve there: only portable types cross modules
+                if (t.Module != _m && !IsPortableType(types[i])) types[i] = TypeInference.Unknown;
+            }
+            return types;
+        }
+
+        static readonly HashSet<string> PortableNames = new HashSet<string>
+        {
+            "int", "long", "double", "float", "bool", "string", "char", "decimal", "List", "Dictionary", "HashSet", "IEnumerable",
+            "IReadOnlyList", "IList", "IDictionary", "IReadOnlyDictionary", "ValueTuple", "global",
+        };
+
+        /// <summary>Built from primitives and generic collections only (or fully qualified), so it means the same in every module.</summary>
+        static bool IsPortableType(string t)
+        {
+            if (t.StartsWith("global::")) return true;
+            foreach (var part in t.Split(new[] { '<', '>', ',', ' ', '(', ')', '[', ']', '?' }, StringSplitOptions.RemoveEmptyEntries))
+                if (!PortableNames.Contains(part)) return false;
+            return true;
+        }
+
+        void RecordCall(InferenceTarget t, List<Arg> args)
+        {
+            if (Obs == null || t == null || !t.InferParams) return;
+            Obs.Calls.Add(new Observations.Call { Callee = t.Key, Types = ArgTypes(t, args), Context = _ctxFallbackKey });
+        }
+
+        /// <summary>The inferred return type of a call to an unannotated project function (Pending while still unknown in a dry run).</summary>
+        string InferredCallType(CallExpr call)
+        {
+            var t = CallTarget(call, out bool isCtor);
+            if (t == null || isCtor || t.Def.Returns != null || t.Def.IsAsync) return null;
+            string sig = "";
+            if (t.InferParams)
+            {
+                var types = ArgTypes(t, call.Args);
+                if (types == null || types.Any(TypeInference.IsUnknown)) return null;
+                sig = TypeInference.SigKey(types);
+                if (!(Ti.Signatures.TryGetValue(t.Key, out var sigs) && sigs.Any(s => TypeInference.SigKey(s) == sig))) return _dry ? TypeInference.Pending : null;
+            }
+            if (Ti.Returns.TryGetValue(TypeInference.ReturnKey(t.Key, sig), out var rt))
+                return t.Module == _m || IsPortableType(rt) ? rt : null;
+            return _dry ? TypeInference.Pending : null;
+        }
+
+        /// <summary>Typhon class key for a C# type name visible in this module (same module, or imported by name).</summary>
+        string ClassKeyOfType(string csType, out bool sameModule)
+        {
+            sameModule = false;
+            if (csType == null) return null;
+            if (_m.Classes.ContainsKey(csType)) { sameModule = true; return TypeInference.ClassKey(_m, csType); }
+            if (_importedFromModules.TryGetValue(csType, out var imp) && imp.Key.Classes.ContainsKey(imp.Value)) return TypeInference.ClassKey(imp.Key, imp.Value);
+            return null;
+        }
+
+        /// <summary>The type of member <paramref name="member"/> (field, or method return when <paramref name="method"/>) of a Typhon class.</summary>
+        string MemberType(string csType, string member, bool method)
+        {
+            if (_cls != null && csType == _cls.CsSelfType)
+            {
+                if (!method && _cls.FieldTypes.TryGetValue(member, out var own)) return own;
+                if (method && _cls.MethodReturnTypes.TryGetValue(member, out var ownRet)) return ownRet == "void" ? null : ownRet;
+            }
+            var key = ClassKeyOfType(csType, out bool same);
+            if (key == null || Ti == null) return null;
+            var table = method ? Ti.MethodReturns : Ti.Fields;
+            if (!table.TryGetValue(key, out var members) || !members.TryGetValue(member, out var t) || t == "void" || t == "dynamic") return null;
+            return same || IsPortableType(t) ? t : null;
         }
 
         // ───────────────────────────── diagnostics ─────────────────────────────
@@ -117,13 +251,15 @@ namespace Typhon.Compiler.Emit
             _w.Raw("// <auto-generated>");
             _w.Raw("//   Generated by the Typhon compiler from " + System.IO.Path.GetFileName(_path) + ". Do not edit.");
             _w.Raw("// </auto-generated>");
-            _w.Raw("#pragma warning disable CS0162, CS0164, CS0168, CS0219, CS8321, CS1998, CS0105, CS0659, CS0660, CS0661, CS8981, CS1591");
+            _w.Raw("#pragma warning disable CS1718, CS0162, CS0164, CS0168, CS0219, CS8321, CS1998, CS0105, CS0659, CS0660, CS0661, CS8981, CS1591");
             _w.Raw("#nullable enable annotations");
             _w.Line("using System;");
             _w.Line("using System.Collections.Generic;");
             _w.Line("using System.Linq;");
             _w.Line("using System.Threading.Tasks;");
             _w.Line("using static global::Typhon.Runtime.Builtins;");
+            _w.Line("using static global::Typhon.Runtime.DictGetStruct;");
+            _w.Line("using static global::Typhon.Runtime.DictGetClass;");
             foreach (var u in _usingLines.Distinct()) _w.Line(u);
             _w.Line();
 
@@ -490,7 +626,7 @@ namespace Typhon.Compiler.Emit
             public Scope Scope;
         }
 
-        Signature BuildSignature(FunctionDef f, bool dropFirst, string selfName = null)
+        Signature BuildSignature(FunctionDef f, bool dropFirst, string selfName = null, string[] paramTypes = null, string retKey = null)
         {
             var sig = new Signature();
             var locals = LocalsAnalyzer.Analyze(f.Body, f.Params.Select(p => p.Name), null);
@@ -501,13 +637,19 @@ namespace Typhon.Compiler.Emit
             sig.Scope = scope;
 
             var ps = new List<string>();
+            var defaults = new List<string>();
+            int pi = 0;
             for (int i = 0; i < f.Params.Count; i++)
             {
                 var p = f.Params[i];
                 if (i == 0 && dropFirst) continue;
                 scope.Params.Add(p.Name);
                 if (p.Kind == ParamKind.KwArgs) { Unsupported(p, "**kwargs"); continue; }
-                string type = p.Annotation != null ? MapType(p.Annotation, p) : ImplicitDynamic(p, $"parameter '{p.Name}'");
+                string inferred = paramTypes != null && pi < paramTypes.Length ? paramTypes[pi] : null;
+                pi++;
+                string type = p.Annotation != null ? MapType(p.Annotation, p)
+                    : inferred != null && inferred != TypeInference.Declared ? inferred
+                    : ImplicitDynamic(p, $"parameter '{p.Name}'");
                 if (type == "void") type = "object";
                 scope.Types[p.Name] = type;
                 string decl;
@@ -518,8 +660,16 @@ namespace Typhon.Compiler.Emit
                     scope.Types[p.Name] = type + "[]";
                 }
                 else decl = $"{type} {Esc(p.Name)}";
-                if (p.Default != null) decl += " = " + EmitExpr(p.Default, targetTyped: true);
+                // an inferred overload keeps a default only if the default has the overload's parameter type
+                bool keepDefault = p.Default != null && (paramTypes == null || p.Annotation != null || InferType(p.Default) == type);
                 ps.Add(decl);
+                defaults.Add(keepDefault ? " = " + EmitExpr(p.Default, targetTyped: true) : null);
+            }
+            // C#: optional parameters must come last
+            for (int i = ps.Count - 1, required = 0; i >= 0; i--)
+            {
+                if (defaults[i] == null) required = 1;
+                else if (required == 0) ps[i] += defaults[i];
             }
             sig.Params = string.Join(", ", ps);
 
@@ -535,7 +685,9 @@ namespace Typhon.Compiler.Emit
                 }
             }
             else if (sig.IsGenerator) elem = ImplicitDynamic(f, $"the values yielded by '{f.Name}'");
-            else if (locals.HasValueReturn) elem = ImplicitDynamic(f, $"the return type of '{f.Name}'");
+            else if (locals.HasValueReturn)
+                elem = retKey != null && Ti != null && Ti.Returns.TryGetValue(retKey, out var inferredReturn) && inferredReturn != "dynamic" ? inferredReturn
+                     : ImplicitDynamic(f, $"the return type of '{f.Name}'");
             else elem = "void";
 
             sig.ElementType = elem;
@@ -557,8 +709,27 @@ namespace Typhon.Compiler.Emit
 
         void EmitFunction(FunctionDef f, bool isModuleLevel)
         {
+            var t = isModuleLevel ? TargetOf(_m, null, f.Name) : null;
+            if (t != null && t.InferParams && Ti.Signatures.TryGetValue(t.Key, out var sigs))
+            {
+                for (int i = 0; i < sigs.Count; i++)
+                {
+                    EmitFunctionVariant(f, sigs[i], TypeInference.ReturnKey(t.Key, TypeInference.SigKey(sigs[i])), null);
+                    if (i < sigs.Count - 1 || Ti.Fallback.Contains(t.Key)) _w.Line();
+                }
+                if (Ti.Fallback.Contains(t.Key)) EmitFunctionVariant(f, null, null, t.Key);
+                return;
+            }
+            EmitFunctionVariant(f, null, t != null && !t.InferParams ? TypeInference.ReturnKey(t.Key, "") : null, t != null && t.InferParams ? t.Key : null);
+        }
+
+        /// <summary>One C# method for a Typhon function: typed by an inferred signature, or as written (dynamic fallback).</summary>
+        void EmitFunctionVariant(FunctionDef f, string[] paramTypes, string retKey, string fallbackKey)
+        {
+            var savedRet = _retKey; var savedCtx = _ctxFallbackKey;
+            _retKey = retKey; _ctxFallbackKey = fallbackKey;
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Add(tp.Name);
-            var sig = BuildSignature(f, dropFirst: false);
+            var sig = BuildSignature(f, dropFirst: false, paramTypes: paramTypes, retKey: retKey);
             EmitDocComment(f.Body);
             LineDirective(f);
             EmitAttributes(f.Decorators);
@@ -567,6 +738,7 @@ namespace Typhon.Compiler.Emit
             _w.Line($"{vis} static {asyncKw}{sig.ReturnType} {Esc(f.Name)}{TypeParamList(f.TypeParams)}({sig.Params}){TypeParamConstraints(f.TypeParams, f)}");
             EmitFunctionBody(f.Body, sig.Scope, null, sig.Locals);
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Remove(tp.Name);
+            _retKey = savedRet; _ctxFallbackKey = savedCtx;
         }
 
         /// <summary>Emits "{ ... }" for a function-like body with Python scoping rules.</summary>
@@ -649,6 +821,11 @@ namespace Typhon.Compiler.Emit
                 baseTypes.Add($"global::System.Collections.Generic.IEnumerable<{iterElem}>");
             }
             ctx.IterElementType = iterElem;
+            // def __lt__(self, other: Self) -> bool  ⇒  IComparable<Self>, so sorted()/min()/max()/List.Sort order the objects
+            if (!isInterface && LtComparesSelf(c, ctx)) baseTypes.Add($"global::System.IComparable<{ctx.CsSelfType}>");
+            // def __len__(self) -> int  ⇒  IPyLen, so len(obj) works without reflection
+            if (!isInterface && c.Body.OfType<FunctionDef>().Any(f => f.Name == "__len__" && f.Params.Count == 1 && f.Returns is NameExpr rn && rn.Id == "int"))
+                baseTypes.Add("global::Typhon.Runtime.IPyLen");
             string baseList = baseTypes.Count > 0 ? " : " + string.Join(", ", baseTypes) : "";
             _w.Line($"{vis} {kind} {Esc(c.Name)}{TypeParamList(c.TypeParams)}{baseList}{TypeParamConstraints(c.TypeParams, c)}");
             _w.Open();
@@ -658,6 +835,12 @@ namespace Typhon.Compiler.Emit
 
             _w.Close();
             _cls = savedCls; _scope = savedScope;
+        }
+
+        bool LtComparesSelf(ClassDef c, ClassContext ctx)
+        {
+            var lt = c.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == "__lt__");
+            return lt != null && lt.Params.Count == 2 && lt.Params[1].Annotation != null && MapType(lt.Params[1].Annotation, lt) == ctx.CsSelfType;
         }
 
         static bool IsProtocol(ClassDef c) => c.Bases.Any(b => { var n = DottedName(b is SubscriptExpr s ? s.Target : b); return n == "Protocol" || n == "typing.Protocol"; });
@@ -817,6 +1000,12 @@ namespace Typhon.Compiler.Emit
             foreach (var m in methods)
                 if (m.Returns != null && !m.IsAsync && m.TypeParams.Count == 0 && !AstWalker.ContainsOutsideNestedScopes(m.Body, n => n is YieldExpr))
                     ctx.MethodReturnTypes[m.Name] = MapType(m.Returns, m, isReturn: true);
+            foreach (var m in methods)
+                if (m.Returns == null && TargetOf(_m, c, m.Name) is InferenceTarget mt && mt.Class == c && !mt.InferParams &&
+                    Ti.Returns.TryGetValue(TypeInference.ReturnKey(mt.Key, ""), out var mrt) && mrt != "dynamic")
+                    ctx.MethodReturnTypes[m.Name] = mrt;
+            if (Obs != null && _m.Classes.TryGetValue(c.Name, out var topCls) && topCls == c)
+                Obs.MethodReturns[TypeInference.ClassKey(_m, c.Name)] = new Dictionary<string, string>(ctx.MethodReturnTypes);
             bool isDataclass = HasDecorator(c.Decorators, "dataclass");
             var dataFields = new List<AnnAssignStmt>();
 
@@ -870,12 +1059,28 @@ namespace Typhon.Compiler.Emit
                 if (ann != null) type = MapType(ann, method);
                 else
                 {
-                    // infer with the method's parameter types in scope
-                    var tmpScope = new Scope();
-                    foreach (var p in method.Params.Skip(1)) if (p.Annotation != null) { tmpScope.Params.Add(p.Name); tmpScope.Types[p.Name] = MapType(p.Annotation, p); }
-                    var saved = _scope; _scope = tmpScope;
-                    type = value != null ? InferType(value) : null;
-                    _scope = saved;
+                    // infer with the method's parameter types in scope: annotations, or every inferred constructor signature
+                    List<string[]> variants = null;
+                    if (method.Name == "__init__" && TargetOf(_m, c, "__init__") is InferenceTarget it && it.Class == c && it.InferParams &&
+                        Ti.Signatures.TryGetValue(it.Key, out var initSigs) && !Ti.Fallback.Contains(it.Key))
+                        variants = initSigs;
+                    var candidates = new HashSet<string>();
+                    foreach (var variant in (IEnumerable<string[]>)variants ?? new string[][] { null })
+                    {
+                        var tmpScope = new Scope();
+                        int vi = 0;
+                        foreach (var p in method.Params.Skip(1))
+                        {
+                            string pt = p.Annotation != null ? MapType(p.Annotation, p) : variant != null && variant[vi] != TypeInference.Declared ? variant[vi] : null;
+                            vi++;
+                            if (pt != null) { tmpScope.Params.Add(p.Name); tmpScope.Types[p.Name] = pt; }
+                        }
+                        var saved = _scope; _scope = tmpScope;
+                        candidates.Add(value != null ? InferType(value) : null);
+                        _scope = saved;
+                    }
+                    type = candidates.Count == 1 ? candidates.First() : null;
+                    if (TypeInference.IsUnknown(type) || type == TypeInference.Pending) type = null;
                     type = type ?? ImplicitDynamic(method, $"attribute 'self.{name}'");
                 }
                 declared.Add(name);
@@ -885,6 +1090,8 @@ namespace Typhon.Compiler.Emit
                 _w.Line($"{Visibility(name, false)} {type} {Esc(name)} {{ get; set; }}");
             }
             if (declared.Count > 0) _w.Line();
+            if (Obs != null && _m.Classes.TryGetValue(c.Name, out var topLevel) && topLevel == c)
+                Obs.Fields[TypeInference.ClassKey(_m, c.Name)] = new Dictionary<string, string>(ctx.FieldTypes);
 
             // 3. dataclass constructor / repr / equality
             if (isDataclass && !methods.Any(m => m.Name == "__init__"))
@@ -926,6 +1133,7 @@ namespace Typhon.Compiler.Emit
                 EmitMethod(f, ctx, bases);
                 _w.Line();
             }
+            if (!isDataclass && !methods.Any(m => m.Name == "__init__")) EmitInheritedConstructors(ctx, bases);
             EmitDunderBridges(methods, ctx);
 
             // 5. nested classes
@@ -964,7 +1172,17 @@ namespace Typhon.Compiler.Emit
 
         void EmitMethodCore(FunctionDef f, ClassContext ctx, List<Expr> bases, bool isStaticDecl, bool isClassMethod)
         {
-            var sig = BuildSignature(f, dropFirst: !isStaticDecl);
+            var target = TargetOf(_m, ctx.Def, f.Name);
+            string retKey = target != null && target.Class == ctx.Def && !target.InferParams && !BaseHasMember(bases, f.Name, requireOverridable: false)
+                ? TypeInference.ReturnKey(target.Key, "") : null;
+            var savedRet = _retKey; _retKey = retKey;
+            try { EmitMethodTyped(f, ctx, bases, isStaticDecl, isClassMethod, retKey); }
+            finally { _retKey = savedRet; }
+        }
+
+        void EmitMethodTyped(FunctionDef f, ClassContext ctx, List<Expr> bases, bool isStaticDecl, bool isClassMethod, string retKey)
+        {
+            var sig = BuildSignature(f, dropFirst: !isStaticDecl, retKey: retKey);
             string mods = MethodModifiers(f, ctx, bases, out bool isStatic, out bool isAbstract);
             if (!isStatic) { sig.Scope.HasSelf = true; sig.Scope.Params.Remove(f.Params[0].Name); }
             if (isClassMethod) { sig.Scope.ClsName = ctx.CsSelfType; sig.Scope.Params.Remove(f.Params[0].Name); }
@@ -979,9 +1197,85 @@ namespace Typhon.Compiler.Emit
             EmitFunctionBody(f.Body, sig.Scope, null, sig.Locals);
         }
 
+        /// <summary>
+        /// Python inherits __init__, C# does not inherit constructors: a class without __init__ gets one constructor per
+        /// constructor of its base (the nearest Typhon __init__, or the .NET base's public/protected constructors).
+        /// </summary>
+        void EmitInheritedConstructors(ClassContext ctx, List<Expr> bases, int depth = 0)
+        {
+            foreach (var b in bases)
+            {
+                if (depth > 20 || !ResolveBase(b, out var py, out var meta)) continue;
+                if (py != null)
+                {
+                    if (IsProtocol(py)) continue;
+                    var init = py.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == "__init__");
+                    if (init == null)
+                    {
+                        if (HasDecorator(py.Decorators, "dataclass")) return;
+                        EmitInheritedConstructors(ctx, py.Bases, depth + 1);
+                        return;
+                    }
+                    if (_p.TryFindClass(_m, py.Name, out var initCls, out var initOwner) && InitTarget(initOwner, initCls) is InferenceTarget it &&
+                        it.InferParams && Ti.Signatures.TryGetValue(it.Key, out var baseSigs))
+                    {
+                        foreach (var types in baseSigs)
+                        {
+                            var tps = it.Params.Select((p, i) => $"{(types[i] == TypeInference.Declared ? MapType(p.Annotation, init) : types[i])} {Esc(p.Name)}");
+                            _w.Line($"public {Esc(ctx.Name)}({string.Join(", ", tps)}) : base({string.Join(", ", it.Params.Select(p => Esc(p.Name)))}) {{ }}");
+                        }
+                        _w.Line();
+                        if (!Ti.Fallback.Contains(it.Key)) return;
+                    }
+                    var ps = new List<string>(); var names = new List<string>();
+                    foreach (var p in init.Params.Skip(1))
+                    {
+                        if (p.Kind != ParamKind.Normal) return; // *args/**kwargs: no faithful C# mirror, write an __init__
+                        string type = p.Annotation != null ? MapType(p.Annotation, init) : "dynamic";
+                        ps.Add($"{type} {Esc(p.Name)}" + (p.Default != null ? " = " + EmitExpr(p.Default, targetTyped: true) : ""));
+                        names.Add(Esc(p.Name));
+                    }
+                    _w.Line($"public {Esc(ctx.Name)}({string.Join(", ", ps)}) : base({string.Join(", ", names)}) {{ }}");
+                    _w.Line();
+                    return;
+                }
+                if (meta != null)
+                {
+                    var ctors = _r.GetConstructors(meta);
+                    foreach (var c in ctors)
+                    {
+                        var ps = c.Parameters.Select(kv => $"{kv.Key} {Esc(kv.Value)}");
+                        _w.Line($"{(c.IsProtected ? "protected" : "public")} {Esc(ctx.Name)}({string.Join(", ", ps)}) : base({string.Join(", ", c.Parameters.Select(kv => Esc(kv.Value)))}) {{ }}");
+                    }
+                    if (ctors.Count > 0) _w.Line();
+                    return;
+                }
+            }
+        }
+
         void EmitConstructor(FunctionDef f, ClassContext ctx, List<Expr> bases)
         {
-            var sig = BuildSignature(f, dropFirst: true);
+            var t = TargetOf(_m, ctx.Def, "__init__");
+            if (t != null && t.Class != ctx.Def) t = null;
+            if (t != null && t.InferParams && Ti.Signatures.TryGetValue(t.Key, out var sigs))
+            {
+                foreach (var types in sigs) { EmitConstructorVariant(f, ctx, bases, types, null); _w.Line(); }
+                if (Ti.Fallback.Contains(t.Key)) EmitConstructorVariant(f, ctx, bases, null, t.Key);
+                return;
+            }
+            EmitConstructorVariant(f, ctx, bases, null, t != null && t.InferParams ? t.Key : null);
+        }
+
+        void EmitConstructorVariant(FunctionDef f, ClassContext ctx, List<Expr> bases, string[] paramTypes, string fallbackKey)
+        {
+            var savedCtx = _ctxFallbackKey; _ctxFallbackKey = fallbackKey;
+            try { EmitConstructorCore(f, ctx, bases, paramTypes); }
+            finally { _ctxFallbackKey = savedCtx; }
+        }
+
+        void EmitConstructorCore(FunctionDef f, ClassContext ctx, List<Expr> bases, string[] paramTypes)
+        {
+            var sig = BuildSignature(f, dropFirst: true, paramTypes: paramTypes);
             sig.Scope.HasSelf = true;
             sig.Scope.Params.Remove(f.Params[0].Name);
             var body = f.Body;
@@ -992,6 +1286,9 @@ namespace Typhon.Compiler.Emit
             {
                 var saved = _scope; _scope = sig.Scope;
                 baseCall = " : base(" + EmitArgs(call.Args) + ")";
+                if (Obs != null && bases.Count > 0 && ResolveBase(bases[0], out var basePy, out _) && basePy != null &&
+                    _p.TryFindClass(_m, basePy.Name, out var bcls, out var bowner))
+                    RecordCall(InitTarget(bowner, bcls), call.Args);
                 _scope = saved;
                 body = body.Where((s, i) => i != first).ToList();
                 sig.Locals = LocalsAnalyzer.Analyze(body, f.Params.Select(p => p.Name), null);
@@ -1101,6 +1398,9 @@ namespace Typhon.Compiler.Emit
                         break;
                 }
             }
+            var ltDef = methods.FirstOrDefault(m => m.Name == "__lt__");
+            if (ltDef != null && ltDef.Params.Count == 2 && ParamType(ltDef, 1) == self)
+                _w.Line($"public int CompareTo({self}? other) => other is null ? 1 : __lt__(other) ? -1 : other.__lt__(this) ? 1 : 0;");
             // C# requires comparison operators in pairs: derive the missing partner by swapping operands
             foreach (var f in methods)
                 if (BinaryDunders.TryGetValue(f.Name, out var op) && ComparisonPairs.TryGetValue(op, out var partner) && !definedOps.Contains(partner))

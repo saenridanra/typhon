@@ -1,0 +1,12 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: a dict keeps insertion order even when keys are deleted and new ones are added afterwards."""
+
+d = {"a": 1, "b": 2, "c": 3}
+del d["a"]
+d["z"] = 26
+print(d, list(d))
+d.pop("c")
+d["y"] = 25
+print(d)

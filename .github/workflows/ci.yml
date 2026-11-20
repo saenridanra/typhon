@@ -1,0 +1,58 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      aot:
+        description: "Also run the Native AOT conformance check (slow)"
+        type: boolean
+        default: false
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      # the conformance oracle must really run in CI, not be skipped
+      TYPHON_REQUIRE_CPYTHON: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "11.0.x"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+
+      - name: Install numpy (oracle for the numpy_* cases)
+        run: python -m pip install numpy
+
+      - name: Point the tests at CPython
+        shell: bash
+        run: echo "TYPHON_CPYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: dotnet build Typhon.slnx -c Release
+
+      - name: Conformance tests
+        run: dotnet test tests/Typhon.Conformance.Tests -c Release --no-build --logger "console;verbosity=normal"
+
+      - name: Native AOT conformance
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.aot }}
+        env:
+          TYPHON_CONFORMANCE_AOT: "1"
+        run: dotnet test tests/Typhon.Conformance.Tests -c Release --no-build --filter "FullyQualifiedName~NativeAot" --logger "console;verbosity=detailed"

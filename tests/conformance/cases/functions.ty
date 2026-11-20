@@ -1,0 +1,82 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: parameters, closures, globals, recursion, generators, lambdas, generics."""
+from typing import Callable, Iterator
+
+
+def greet(name: str, greeting: str = "Hello", punct: str = "!") -> str:
+    return f"{greeting}, {name}{punct}"
+
+
+def total(*nums: int) -> int:
+    s = 0
+    for n in nums:
+        s += n
+    return s
+
+
+def make_counter() -> Callable[[], int]:
+    count = 0
+
+    def inc() -> int:
+        nonlocal count
+        count += 1
+        return count
+
+    return inc
+
+
+calls = 0
+
+
+def tick() -> None:
+    global calls
+    calls += 1
+
+
+def fib(n: int) -> int:
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+
+def countdown(n: int) -> Iterator[int]:
+    while n > 0:
+        yield n
+        n -= 1
+
+
+def chain(a: list[int], b: list[int]) -> Iterator[int]:
+    yield from a
+    yield from b
+
+
+def apply(f: Callable[[int], int], xs: list[int]) -> list[int]:
+    return [f(x) for x in xs]
+
+
+def first[T](items: list[T]) -> T:
+    return items[0]
+
+
+def describe(x: int | None = None) -> str:
+    if x is None:
+        return "nothing"
+    return f"got {x}"
+
+
+print(greet("Ada"), greet("Bob", "Hi"), greet("Cy", punct="?"), greet(greeting="Yo", name="Di"))
+print(total(), total(1, 2, 3))
+c1 = make_counter()
+c1()
+c1()
+print(c1(), make_counter()())
+tick()
+tick()
+tick()
+print(calls)
+print([fib(i) for i in range(10)])
+print(list(countdown(4)), list(chain([1, 2], [3])), sum(countdown(100)))
+double: Callable[[int], int] = lambda x: x * 2
+print(apply(double, [1, 2, 3]), apply(lambda x: x * x, [4, 5]))
+print(first([3, 4]), first(["x", "y"]))
+print(describe(), describe(5))

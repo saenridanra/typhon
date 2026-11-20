@@ -1,0 +1,16 @@
+HELLO, WORLD hello, world Hello, World Hello world
+pad| abc left right|
+['a', 'b', '', 'c'] ['a', 'b', 'c'] ['k', 'v=w'] ['line1', 'line2']
+a-b-c cba
+Hello, Typhon 7 -1 3 4
+True False True True True True
+007 -007 **ab** ab.. ..ab
+H d ello Hello World dlroW ,olleH Hlo ol Worl  12
+ababab False True True
+3.14|   42|42   |  hi  |1,234,567|25.6%|ff|FF|101|1.234500e+03|007
+left    |   right|-3.5|+3|1e+10|0.00012|123.456
+Hello Typhon! len=6 upper=TYPHON repr='Typhon'
+1 + 2 = 3 aba    x
+"it's" 'say "hi"' 'tab\there' 42 2.5 True None
+65 a ÄÖÜ straße 3
+['a', 'b', 'c'] ['h', 'e', 'y'] ['a', 'a', 'a', 'b', 'n', 'n']

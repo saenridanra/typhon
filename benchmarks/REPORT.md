@@ -1,8 +1,9 @@
 # Typhon benchmark report
 
-What was measured, how, and what the numbers mean. Raw tables: [`RESULTS.md`](RESULTS.md) (Windows, from
-[`run.ps1`](run.ps1)) and [`RESULTS_LINUX.md`](RESULTS_LINUX.md) (Linux, from [`linux/run_linux.sh`](linux/run_linux.sh));
-charts: [`make_charts.py`](make_charts.py).
+What was measured, how, and what the numbers mean. Raw tables: [`RESULTS.md`](RESULTS.md) (Windows, plugged in, from
+[`run.ps1`](run.ps1)), [`RESULTS_BATTERY.md`](RESULTS_BATTERY.md) (Windows on battery; the first run with compile times
+and with whole-program type inference) and [`RESULTS_LINUX.md`](RESULTS_LINUX.md) (Linux, from
+[`linux/run_linux.sh`](linux/run_linux.sh)); charts: [`make_charts.py`](make_charts.py).
 
 ![Speed-up of Typhon over CPython and NumPy](img/speedup.png)
 
@@ -12,16 +13,23 @@ charts: [`make_charts.py`](make_charts.py).
   with the JIT, 13.6x as a Native AOT executable**). Biggest wins: numeric loops over floats and small objects
   (N-body 75x, spectral norm 48x, Mandelbrot 40x). Smallest: string, dict and sort workloads, where CPython's C
   runtime already does the heavy lifting (1.6–3.0x).
-* **Type hints are what make it fast.** The N-body source without annotations falls back to .NET `dynamic` and is only
-  1.5x faster than CPython, 54x slower than the typed version.
+* **Static types are what make it fast, and Typhon now infers them.** Without annotations the N-body source used to
+  fall back to .NET `dynamic` (1.5x faster than CPython). With whole-program type inference it runs as fast as the
+  annotated version (74x vs 72x in the same run, section 7) and compiles with Native AOT.
+* **Running a script once is cheap now.** The first `typhon run` compiles in 0.65–0.8 s for most programs; after that
+  a warm compile server or the script cache bring a tiny script to about 80 ms (CPython 30 ms), and every larger
+  pure-Python benchmark runs faster than on CPython, compile included. Before the compile-speed work a first run took
+  1.8–2.1 s (section 7).
+* **On battery** everything gets slower, Typhon's short loops the most; the speed-ups shrink by 4–7% on average but
+  keep their order (section 8).
 * **Native AOT makes Typhon programs small and lean**: a self-contained 1.5–1.9 MB executable, **9 MB of RAM** for small
   programs (CPython 12 MB, Typhon JIT 20 MB) and startup on par with CPython on Windows (21 vs 20 ms); on Linux
   **1.8 ms and 4 MB**, the fastest and smallest of every tool tested.
 * **Compared with other Python compilers on Linux** (same files, same CPython baseline), Typhon AOT is in the same
   league as Codon and Pythran: geometric mean over the 6 programs all four can compile **Typhon AOT 11.8x, Codon
   11.6x, Pythran 13.6x**. Typhon leads on float- and object-heavy code (N-body, Mandelbrot, fib), Codon and Pythran on
-  integer/list code (prime sieve, π). Only **Codon** stays fast on code **without type hints** (29x), because it infers
-  types for the whole program.
+  integer/list code (prime sieve, π). In that run only **Codon** stayed fast on code **without type hints** (29x),
+  because it infers types for the whole program; Typhon does too now (74x, section 7), the Linux run predates it.
 * **NumPy code is at rough parity** with real NumPy (geometric mean 1.04x with the JIT, 1.13x with Native AOT). Typhon
   wins element loops and broadcasting, NumPy wins dense linear algebra (LAPACK) by 5x (Native AOT) to 10x (JIT).
 * **You often don't need NumPy on Typhon**: plain loops compiled by Typhon beat the vectorized NumPy code on 3 of 6
@@ -76,7 +84,7 @@ charts: [`make_charts.py`](make_charts.py).
 | Prime sieve | list indexing, `sum` over a generator | 989 ms | 358 ms | 199 ms | **2.8x** | **5.0x** |
 | Word count | string building + dict updates | 413 ms | 161 ms | 140 ms | **2.6x** | **3.0x** |
 | `sorted()` | Timsort (C in CPython) on 1M ints + 300k strings | 353 ms | 182 ms | 218 ms | **1.9x** | **1.6x** |
-| N-body, untyped | the N-body source without type hints (`dynamic`) | 3,286 ms | 2,168 ms | n/a | **1.5x** | – |
+| N-body, untyped | the N-body source without type hints, before type inference (`dynamic`) | 3,286 ms | 2,168 ms | n/a | **1.5x** | – |
 
 **Why the spread.** Typhon turns annotated Python into statically typed code: a `float` attribute is an unboxed
 `double` field, `a.x * b.x` is one machine instruction, and a call is a direct call. CPython executes bytecode on boxed
@@ -87,9 +95,10 @@ runtime anyway (hashing and comparing strings, sorting).
 slower on two (N-body, sort), where the JIT's runtime profile-guided optimization helps. AOT targets a portable CPU
 baseline by default, while the JIT optimizes for the exact CPU.
 
-**Gradual typing has a real cost.** `nbody_untyped` compiles in `permissive` mode, but every operation becomes a
-late-bound `dynamic` call. `strict` mode rejects it, and Native AOT can't compile it at all (late binding generates
-code at run time).
+**Untyped code needed type inference.** In this run `nbody_untyped` still fell back to `dynamic`: every operation was
+a late-bound call, `strict` mode rejected the program and Native AOT could not compile it. Whole-program type inference
+(added afterwards) infers every parameter, return value and field of that program from its call sites, so it now
+compiles with `--strict` and Native AOT and runs as fast as the annotated version (74x vs 72x in the battery run).
 
 ## 2. Startup and footprint
 
@@ -195,8 +204,9 @@ Typhon JIT 9.2x**.
   profiled yet; likely contributors are `sum(...)` over a generator expression being lowered to LINQ (prime sieve),
   Python-exact floored modulo through a helper (π), and bounds-checked `List<T>` access, while Codon defaults to C
   semantics. This is the clearest optimization lead for Typhon.
-* **Untyped code**: only Codon is fast, because it infers types for the whole program. Typhon falls back to `dynamic`.
-  Better type inference is the most valuable improvement for Typhon (see roadmap).
+* **Untyped code**: in this run only Codon is fast, because it infers types for the whole program; Typhon fell back to
+  `dynamic`. Typhon has whole-program inference now: on Windows the untyped N-body runs at 74x (section 7). The Linux
+  run has not been repeated yet.
 * **Coverage**: Pythran compiles only functions without classes (4 programs n/a), Codon rejected one program (a string
   forward reference in a type annotation), Typhon AOT rejects code that uses `dynamic`.
 
@@ -246,10 +256,86 @@ The published numbers use .NET defaults: no GC tuning. The structural fix for Nu
 compiler: Typhon knows that the intermediate results of `np.sqrt(x) * 2.0 - x / 3.0` are dead after the expression and
 could reuse their buffers or fuse the expression into one loop.
 
+## 7. One-off runs: compile time included
+
+Sections 1–6 time programs that were compiled beforehand. Python scripts are often run once, so `run.ps1` also
+measures the whole process from start to exit: `python script.py`, `typhon run script.ty` in its three situations,
+and a program built ahead of time. From the battery run ([`RESULTS_BATTERY.md`](RESULTS_BATTERY.md)), CLI published
+with ReadyToRun:
+
+* **First run**: `typhon run` compiles in its own process (parse, type inference, Roslyn) and starts the compile server.
+* **Compile server**: later runs send the script to a background process that keeps the compiler loaded and warm.
+* **Cached**: an unchanged script that ran before is not compiled at all (one cache slot per script, invalidated by any
+  changed source file, imported module or compiler build).
+
+![Running a script: CPython vs typhon run](img/oneoff.png)
+
+| Program | CPython | First run | Compile server | Cached | `typhon build` | Built, per run | Build pays off | `build --aot` | AOT, per run | AOT pays off |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Tiny script (start-up) | 30 ms | 642 ms | 84 ms | 80 ms | 1,034 ms | 45 ms | never | 5,775 ms | 23 ms | after 831 runs |
+| fib(32) | 155 ms | 654 ms | 88 ms | 83 ms | 1,026 ms | 72 ms | after 13 runs | 5,917 ms | 34 ms | after 49 runs |
+| Spectral norm | 536 ms | 671 ms | 107 ms | 111 ms | 939 ms | 58 ms | after 2 runs | 5,887 ms | 41 ms | after 12 runs |
+| Fannkuch | 373 ms | 672 ms | 144 ms | 128 ms | 1,051 ms | 100 ms | after 4 runs | 5,680 ms | 76 ms | after 20 runs |
+| Word count | 428 ms | 935 ms | 400 ms | 281 ms | 996 ms | 221 ms | after 5 runs | 6,736 ms | 228 ms | after 34 runs |
+| `sorted()` | 892 ms | 1,029 ms | 375 ms | 371 ms | 985 ms | 319 ms | after 2 runs | 5,948 ms | 356 ms | after 12 runs |
+| Binary trees | 948 ms | 719 ms | 204 ms | 174 ms | 955 ms | 128 ms | after 2 runs | 6,610 ms | 99 ms | after 8 runs |
+| Prime sieve | 1,449 ms | 1,102 ms | 431 ms | 431 ms | 923 ms | 425 ms | 1st run | 6,083 ms | 251 ms | after 6 runs |
+| Mandelbrot | 2,063 ms | 691 ms | 167 ms | 147 ms | 954 ms | 116 ms | 1st run | 5,613 ms | 93 ms | after 3 runs |
+| N-body | 3,283 ms | 721 ms | 146 ms | 126 ms | 915 ms | 95 ms | 1st run | 5,546 ms | 78 ms | after 2 runs |
+| N-body, untyped (inferred) | 3,301 ms | 670 ms | 165 ms | 114 ms | 947 ms | 103 ms | 1st run | 5,852 ms | 80 ms | after 2 runs |
+| NumPy matmul | 169 ms | 667 ms | 167 ms | 140 ms | 1,128 ms | 121 ms | after 24 runs | 6,199 ms | 88 ms | after 77 runs |
+| NumPy ufuncs | 1,666 ms | 2,080 ms | 1,703 ms | 1,632 ms | 952 ms | 1,525 ms | after 7 runs | 6,151 ms | 710 ms | after 7 runs |
+
+"Pays off": the number of runs n after which one build plus n runs of the built program take less time than n runs of
+CPython ("never": the built program is not faster than CPython).
+
+* **First run**: 0.64–0.81 s for 11 of 17 programs, about 2.8x less than before (1.8–2.1 s, see below); it already
+  beats CPython on 6 programs.
+* **While you work**: the compile server and the cache stay within 6–180 ms of a program built ahead of time. CPython
+  remains faster only for the tiny script (30 vs 84 ms) and is level on the two NumPy programs whose time is spent in
+  BLAS and ufunc kernels.
+* **Building ahead** gives the fastest process: `typhon build` takes about 1 s and pays off after 1–13 runs on
+  pure-Python programs; Native AOT builds take 5.5–6.7 s and give the leanest process.
+
+**What made `typhon run` faster.** Measured with `typhon run --time` and in-process experiments on battery:
+
+| `typhon run`, tiny script | Process time | What changed |
+|---|---|---|
+| before | 1,879 ms | ~1.2 s of the compile was Roslyn, mostly Roslyn itself being JIT-compiled on every start |
+| + Typhon runtime precompiled | 1,344 ms | `print`, `str`, list/dict helpers etc. used to be compiled from source into every script |
+| + CLI published with ReadyToRun | 642 ms | Roslyn and the CLI are precompiled to native code |
+| + warm compile server | 84 ms | the compiler stays loaded and JIT-optimized between runs (compiles in 20–110 ms) |
+| + script cache | 80 ms | an unchanged script is not compiled at all |
+
+Once warm, Typhon's own work (parser, whole-program type inference, C# emission) takes 6–30 ms per program.
+
+## 8. On battery
+
+The battery run ([`RESULTS_BATTERY.md`](RESULTS_BATTERY.md), Windows "Balanced" power plan, 77% → 72% charge) against
+the plugged-in run ([`RESULTS.md`](RESULTS.md)). Both are medians of 5 runs on the same machine; the battery run also
+includes whole-program type inference (only `nbody_untyped` changes) and the faster CLI (only compile times change).
+
+| | Plugged in | On battery | Change |
+|---|---|---|---|
+| Typed programs, speed-up over CPython (geometric mean, JIT / AOT) | 11.1x / 13.6x | 10.7x / 12.6x | −4% / −7% |
+| CPython, hot sections (9 typed programs) | | | −9% to +42% (median +7%) |
+| Typhon JIT, hot sections | | | +5% to +39% (fib) |
+| Typhon AOT, hot sections | | | +3% to +55% (Fannkuch) |
+| Tiny script, whole process: CPython / JIT / AOT | 19.7 / 34.5 / 21.3 ms | 29.7 / 45.3 / 22.7 ms | +51% / +31% / +7% |
+| `typhon build --aot` (median per program) | 4,767 ms | 6,098 ms | +28% |
+| NumPy programs, speed-up (geometric mean, JIT) | 1.04x | 1.15x | |
+
+* Battery mode costs Typhon more than CPython in relative terms: Typhon's hot sections are short (milliseconds), so
+  lower clocks and core scheduling weigh more than in CPython's multi-second loops. The ranking does not change.
+* Battery runs vary: an earlier battery run on the same day measured process starts about twice as slow as plugged in.
+* Every program printed the same result as CPython in both runs.
+
 ## Limitations
 
 * One machine (a laptop CPU with performance and efficiency cores); Linux runs in WSL2 on the same machine. Runs vary
   by roughly ±10–30 %; Windows and Linux numbers are not directly comparable with each other (compare within a table).
+  Power matters on a laptop (section 8); `run.ps1` now records it in the results file.
+* The main Windows run and the Linux run predate whole-program type inference; only `nbody_untyped` is affected.
 * A small benchmark set written for this proof of concept, with type annotations (Typhon needs them; CPython ignores
   them). Real applications spend time in I/O, libraries and startup that these programs don't model.
 * Not measured: PyPy, Cython, mypyc, Numba, CPython's experimental JIT.
@@ -262,7 +348,7 @@ could reuse their buffers or fuse the expression into one loop.
 ```powershell
 # Windows: CPython (+ NumPy) vs Typhon JIT + Native AOT (needs the VS "Desktop development with C++" workload for AOT)
 python -m venv .venv; .venv\Scripts\pip install numpy matplotlib
-./benchmarks/run.ps1 -Repeat 5                    # writes benchmarks/RESULTS.md
+./benchmarks/run.ps1 -Repeat 5                    # writes benchmarks/RESULTS.md (incl. one-off runs and the power state)
 
 # Linux (WSL): CPython, Codon, Pythran, Typhon (setup: see the header of benchmarks/linux/run_linux.sh)
 wsl -- bash -lc "cd benchmarks/linux && bash ./run_linux.sh -n 5"   # writes benchmarks/RESULTS_LINUX.md

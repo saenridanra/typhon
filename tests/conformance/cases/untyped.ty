@@ -1,0 +1,66 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: unannotated code that whole-program inference types completely (the suite also checks it with --strict)."""
+import math
+
+SCALE = 2.5
+
+
+class Particle:
+    def __init__(self, x, y, mass):
+        self.x = x
+        self.y = y
+        self.mass = mass * SCALE
+
+    def norm(self):
+        return math.sqrt(self.x * self.x + self.y * self.y)
+
+
+def total_mass(ps):
+    t = 0.0
+    for p in ps:
+        t += p.mass
+    return t
+
+
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+
+
+def describe(v):
+    return f"value={v}"
+
+
+def scale(v, k=2):
+    return v * k
+
+
+def is_even(n):
+    return True if n == 0 else is_odd(n - 1)
+
+
+def is_odd(n):
+    return False if n == 0 else is_even(n - 1)
+
+
+def find(xs, wanted):
+    for x in xs:
+        if x == wanted:
+            return x
+    return None
+
+
+def make_particles(n):
+    ps = [Particle(0.0, 0.0, 1.0)]
+    for i in range(1, n):
+        ps.append(Particle(float(i), i / 2, 1.0))
+    return ps
+
+
+ps = make_particles(4)
+print(total_mass(ps), ps[3].norm(), round(ps[1].norm(), 3), len(ps))
+print(fib(20), describe(3), describe(2.5), describe("x"))
+print(scale(3), scale(1.5), scale(2, 3), scale("ab"))
+print(is_even(10), is_odd(7))
+print(find([1, 2, 3], 2), find([1, 2, 3], 5), find(["a", "b"], "b"))

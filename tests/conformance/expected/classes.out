@@ -1,0 +1,11 @@
+rect: 6.00 True False
+square: 4.00 True False
+circle: 3.00 False True
+circle: 3.00 False True
+3.0 27.0 3 3
+Vector(7.0, 10.0) True True True 2 7.0 10.0
+[Vector(1.0, 0.0), Vector(3.0, 4.0)]
+Point(x=1, y=2) Point(x=3, y=0) True False
+Color.RED True 1 GREEN
+['hello', 'hallo']
+Dog(rex) says woof Animal(x) says ...

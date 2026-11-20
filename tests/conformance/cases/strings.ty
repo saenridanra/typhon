@@ -1,0 +1,25 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: str methods, slicing, formatting, unicode."""
+
+s = "Hello, World"
+print(s.upper(), s.lower(), s.title(), "hello world".capitalize())
+print("  pad  ".strip() + "|", "xxabcxx".strip("x"), "  left".lstrip(), "right  ".rstrip() + "|")
+print("a,b,,c".split(","), "a b  c".split(), "k=v=w".split("=", 1), "line1\nline2".splitlines())
+print("-".join(["a", "b", "c"]), "".join(reversed("abc")))
+print(s.replace("World", "Typhon"), s.find("World"), s.find("x"), s.count("l"), s.index("o"))
+print(s.startswith("Hello"), s.endswith("x"), "123".isdigit(), "abc".isalpha(), "a1".isalnum(), " ".isspace())
+print("7".zfill(3), "-7".zfill(4), "ab".center(6, "*"), "ab".ljust(4, "."), "ab".rjust(4, "."))
+print(s[0], s[-1], s[1:5], s[:5], s[7:], s[::-1], s[::2], s[-5:-1], s[100:], len(s))
+print("ab" * 3, "x" in s, "World" in s, "z" not in s)
+
+print(f"{3.14159:.2f}|{42:5d}|{42:<5d}|{'hi':^6}|{1234567:,}|{0.256:.1%}|{255:x}|{255:X}|{5:b}|{1234.5:e}|{7:03d}")
+print(f"{'left':<8}|{'right':>8}|{-3.5:+.1f}|{3:+d}|{1e10:.3g}|{0.0001234:.2g}|{123.456:g}")
+name = "Typhon"
+print(f"Hello {name}! len={len(name)} upper={name.upper()} repr={name!r}")
+print("{} + {} = {}".format(1, 2, 3), "{0}{1}{0}".format("a", "b"), "{:>4}".format("x"))
+print(repr("it's"), repr('say "hi"'), repr("tab\there"), str(42), str(2.5), str(True), str(None))
+print(ord("A"), chr(97), "äöü".upper(), "Straße".lower(), len("äöü"))
+chars = [c for c in "abc"]
+print(chars, list("hey"), sorted("banana"))

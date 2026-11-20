@@ -20,6 +20,12 @@ using System.Threading.Tasks;
 
 namespace Typhon.Runtime
 {
+    /// <summary>Implemented by Typhon classes that define __len__, so len() needs no reflection (Native AOT).</summary>
+    internal interface IPyLen
+    {
+        int __len__();
+    }
+
     internal sealed class AssertionError : Exception
     {
         public AssertionError() : base("assertion failed") { }
@@ -112,23 +118,84 @@ namespace Typhon.Runtime
             return sb.Append(q).ToString();
         }
 
+        /// <summary>CPython's float repr: shortest round-trip digits, exponent form when the decimal exponent is &lt; -4 or &gt;= 16.</summary>
         static string FormatFloat(double d)
         {
-            if (double.IsPositiveInfinity(d)) return "inf";
-            if (double.IsNegativeInfinity(d)) return "-inf";
             if (double.IsNaN(d)) return "nan";
-            if (d == Math.Floor(d) && Math.Abs(d) < 1e16) return d.ToString("0.0", Inv);
-            string r = d.ToString("R", Inv);
-            int e = r.IndexOf('E');
-            if (e >= 0)
-            {
-                int exp = int.Parse(r.Substring(e + 1), Inv);
-                r = r.Substring(0, e) + "e" + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString("00", Inv);
-            }
-            return r;
+            if (double.IsInfinity(d)) return d > 0 ? "inf" : "-inf";
+            if (d == 0) return double.IsNegative(d) ? "-0.0" : "0.0";
+            var (neg, digits, point) = ShortestDigits(d);
+            int exp = point - 1;
+            string s;
+            if (exp >= 16 || exp < -4)
+                s = digits.Substring(0, 1) + (digits.Length > 1 ? "." + digits.Substring(1) : "") + ExpSuffix('e', exp);
+            else if (point <= 0) s = "0." + new string('0', -point) + digits;
+            else if (point >= digits.Length) s = digits + new string('0', point - digits.Length) + ".0";
+            else s = digits.Substring(0, point) + "." + digits.Substring(point);
+            return neg ? "-" + s : s;
         }
 
-        static bool IsSet(object o) => o.GetType().GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ISet<>));
+        /// <summary>Shortest round-trip decimal digits of d (no leading/trailing zeros) and the decimal point position: value = 0.DIGITS * 10^point.</summary>
+        static (bool neg, string digits, int point) ShortestDigits(double d)
+        {
+            string r = d.ToString("R", Inv);
+            bool neg = r[0] == '-';
+            if (neg) r = r.Substring(1);
+            int exp10 = 0, e = r.IndexOfAny(new[] { 'E', 'e' });
+            if (e >= 0) { exp10 = int.Parse(r.Substring(e + 1), Inv); r = r.Substring(0, e); }
+            int dot = r.IndexOf('.');
+            string intPart = dot >= 0 ? r.Substring(0, dot) : r;
+            string digits = intPart + (dot >= 0 ? r.Substring(dot + 1) : "");
+            int point = intPart.Length + exp10;
+            int lead = 0;
+            while (lead < digits.Length - 1 && digits[lead] == '0') lead++;
+            digits = digits.Substring(lead).TrimEnd('0');
+            point -= lead;
+            if (digits.Length == 0) { digits = "0"; point = 1; }
+            return (neg, digits, point);
+        }
+
+        static string ExpSuffix(char e, int exp) => e + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString("00", Inv);
+
+        /// <summary>Python's 'g' presentation (and the no-type form with a precision when <paramref name="noType"/>): p significant digits,
+        /// exponent form when exp &lt; -4 or exp &gt;= p (exp &gt;= p - 1 without a type), trailing zeros removed.</summary>
+        static string FormatGeneral(double a, int precision, bool upper, bool noType, bool alternate)
+        {
+            if (double.IsNaN(a)) return upper ? "NAN" : "nan";
+            if (double.IsInfinity(a)) return upper ? "INF" : "inf";
+            int p = precision < 0 ? 6 : Math.Max(precision, 1);
+            if (a == 0) return noType ? "0.0" : (alternate ? "0." + new string('0', p - 1) : "0");
+            string es = a.ToString("E" + (p - 1), Inv);
+            int ei = es.IndexOf('E');
+            int exp = int.Parse(es.Substring(ei + 1), Inv);
+            bool useExp = exp < -4 || exp >= (noType ? p - 1 : p);
+            string body;
+            if (useExp)
+            {
+                string mant = es.Substring(0, ei);
+                if (!alternate && mant.Contains('.')) mant = mant.TrimEnd('0').TrimEnd('.');
+                body = mant + ExpSuffix(upper ? 'E' : 'e', exp);
+            }
+            else
+            {
+                body = a.ToString("F" + Math.Max(p - 1 - exp, 0), Inv);
+                if (!alternate && body.Contains('.')) body = body.TrimEnd('0').TrimEnd('.');
+                if (noType && !body.Contains('.')) body += ".0";
+            }
+            return body;
+        }
+
+        // the generic type definition check works under Native AOT, where GetInterfaces() may not list trimmed interfaces
+        static bool IsSet(object o)
+        {
+            var t = o.GetType();
+            if (t.IsGenericType)
+            {
+                var def = t.GetGenericTypeDefinition();
+                if (def == typeof(HashSet<>) || def == typeof(SortedSet<>) || def == typeof(System.Collections.Frozen.FrozenSet<>)) return true;
+            }
+            return t.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(ISet<>));
+        }
 
         static string? CollectionRepr(object o)
         {
@@ -161,7 +228,8 @@ namespace Typhon.Runtime
             if (spec.Length >= 2 && "<>^=".IndexOf(spec[1]) >= 0) { fill = spec[0]; align = spec[1]; i = 2; }
             else if ("<>^=".IndexOf(spec[0]) >= 0) { align = spec[0]; i = 1; }
             if (i < spec.Length && "+- ".IndexOf(spec[i]) >= 0) sign = spec[i++];
-            if (i < spec.Length && spec[i] == '#') i++;
+            bool alternate = false;
+            if (i < spec.Length && spec[i] == '#') { alternate = true; i++; }
             if (i < spec.Length && spec[i] == '0') { zero = true; i++; }
             while (i < spec.Length && char.IsDigit(spec[i])) width = width * 10 + (spec[i++] - '0');
             if (i < spec.Length && (spec[i] == ',' || spec[i] == '_')) grouping = spec[i++];
@@ -202,10 +270,10 @@ namespace Typhon.Runtime
                     case 'X': body = Convert.ToInt64(a).ToString("X", Inv); break;
                     case 'o': body = Convert.ToString(Convert.ToInt64(a), 8); break;
                     case 'b': body = Convert.ToString(Convert.ToInt64(a), 2); break;
-                    case 'g': case 'G': body = a.ToString("G" + (precision < 0 ? 6 : Math.Max(precision, 1)), Inv); break;
+                    case 'g': case 'G': body = isInt && precision < 0 ? Convert.ToInt64(a).ToString(Inv) : FormatGeneral(a, precision, type == 'G', false, alternate); break;
                     default:
                         if (isInt) body = g == "" ? Convert.ToInt64(a).ToString(Inv) : Convert.ToInt64(a).ToString("N0", Inv);
-                        else if (precision >= 0) body = a.ToString("G" + Math.Max(precision, 1), Inv);
+                        else if (precision >= 0) body = FormatGeneral(a, precision, false, true, alternate);
                         else body = FormatFloat(a);
                         break;
                 }
@@ -387,6 +455,36 @@ namespace Typhon.Runtime
             return r;
         }
         public static List<T> repeat<T>(int n, List<T> l) => repeat(l, n);
+        /// <summary>a * b with late-bound operands: sequence repetition when one side is a str or list.</summary>
+        public static dynamic mul(dynamic a, dynamic b)
+        {
+            if (a is string s1 && b is int n1) return repeat(s1, n1);
+            if (b is string s2 && a is int n2) return repeat(s2, n2);
+            if (a is IList l1 && b is int n3) return RepeatList(l1, n3);
+            if (b is IList l2 && a is int n4) return RepeatList(l2, n4);
+            return a * b;
+        }
+
+        /// <summary>a + b with late-bound operands: list concatenation (str and numbers bind normally).</summary>
+        public static dynamic add(dynamic a, dynamic b)
+        {
+            if (a is IList la && b is IList lb && !(a is string))
+            {
+                var r = (IList)Activator.CreateInstance(((object)a).GetType())!;
+                foreach (var x in la) r.Add(x);
+                foreach (var x in lb) r.Add(x);
+                return r;
+            }
+            return a + b;
+        }
+
+        static IList RepeatList(IList l, int n)
+        {
+            var r = (IList)Activator.CreateInstance(l.GetType())!;
+            for (int i = 0; i < n; i++) foreach (var x in l) r.Add(x);
+            return r;
+        }
+
         public static List<T> concat<T>(List<T> a, IEnumerable<T> b) { var r = new List<T>(a); r.AddRange(b); return r; }
         public static List<T> concat<T>(IEnumerable<T> a, List<T> b) { var r = new List<T>(a); r.AddRange(b); return r; }
         public static List<T> concat<T>(List<T> a, List<T> b) { var r = new List<T>(a.Count + b.Count); r.AddRange(a); r.AddRange(b); return r; }
@@ -396,9 +494,22 @@ namespace Typhon.Runtime
         public static int len(string s) => s.Length;
         public static int len<T>(List<T> l) => l.Count;
         public static int len<T>(T[] a) => a.Length;
+        public static int len<T>(T t) where T : struct, ITuple => t.Length;
+
+        /// <summary>del d[key] / del xs[i]</summary>
+        public static void delitem<K, V>(IDictionary<K, V> d, K key) { if (!d.Remove(key)) throw new KeyNotFoundException(repr(key)); }
+        public static void delitem<T>(List<T> xs, int i)
+        {
+            if (i < 0) i += xs.Count;
+            if ((uint)i >= (uint)xs.Count) throw new ArgumentOutOfRangeException(nameof(i), "list assignment index out of range");
+            xs.RemoveAt(i);
+        }
+        public static void delitem(object container, object? key) => ((dynamic)container).__delitem__((dynamic?)key);
         public static int len(object o)
         {
+            if (o is IPyLen pl) return pl.__len__();
             if (o is ICollection c) return c.Count;
+            if (o is ITuple tuple) return tuple.Length;
             var t = o.GetType();
             var p = t.GetProperty("Count") ?? t.GetProperty("Length");
             if (p != null && p.PropertyType == typeof(int)) return (int)p.GetValue(o)!;
@@ -437,6 +548,18 @@ namespace Typhon.Runtime
             if (step > 0) for (int i = start; i < stop; i += step) yield return i;
             else for (int i = start; i > stop; i += step) yield return i;
         }
+
+        // Python iterates a dict over its keys, .NET over KeyValuePairs: every iteration site whose source might be a dict
+        // goes through iterable(). The overloads return lists, arrays and sets unchanged (their struct enumerators stay).
+        public static Dictionary<K, V>.KeyCollection iterable<K, V>(Dictionary<K, V> d) where K : notnull => d.Keys;
+        public static IEnumerable<K> iterable<K, V>(IDictionary<K, V> d) => d.Keys;
+        public static IEnumerable<K> iterable<K, V>(IReadOnlyDictionary<K, V> d) => d.Keys;
+        public static List<T> iterable<T>(List<T> xs) => xs;
+        public static T[] iterable<T>(T[] xs) => xs;
+        public static HashSet<T> iterable<T>(HashSet<T> xs) => xs;
+        public static IEnumerable<T> iterable<T>(IEnumerable<T> xs) => xs is IDictionary d ? d.Keys.Cast<T>() : xs;
+        public static string iterable(string s) => s;
+        public static IEnumerable iterable(IEnumerable xs) => xs is IDictionary d ? d.Keys : xs;
 
         public static IEnumerable<(int, T)> enumerate<T>(IEnumerable<T> xs, int start = 0)
         {
@@ -587,6 +710,13 @@ namespace Typhon.Runtime
 
         // ───────────── str methods ─────────────
 
+        // Color.RED.value / Color.RED.name (Typhon enums are CLR enums with int values)
+        extension<TEnum>(TEnum e) where TEnum : struct, Enum
+        {
+            public int value => Convert.ToInt32(e, Inv);
+            public string name => e.ToString();
+        }
+
         public static string upper(this string s) => s.ToUpperInvariant();
         public static string lower(this string s) => s.ToLowerInvariant();
         public static string strip(this string s, string? chars = null) => chars == null ? s.Trim() : s.Trim(chars.ToCharArray());
@@ -659,13 +789,29 @@ namespace Typhon.Runtime
         public static IEnumerable<(K, V)> items<K, V>(this IDictionary<K, V> d) => d.Select(kv => (kv.Key, kv.Value));
         public static ICollection<K> keys<K, V>(this IDictionary<K, V> d) => d.Keys;
         public static ICollection<V> values<K, V>(this IDictionary<K, V> d) => d.Values;
-        public static V get<K, V>(this IDictionary<K, V> d, K key, V @default = default!) => d.TryGetValue(key, out var v) ? v : @default;
+        public static V get<K, V>(this IDictionary<K, V> d, K key, V @default) => d.TryGetValue(key, out var v) ? v : @default;
         public static V setdefault<K, V>(this IDictionary<K, V> d, K key, V @default = default!) { if (!d.TryGetValue(key, out var v)) d[key] = v = @default; return v; }
         public static V pop<K, V>(this IDictionary<K, V> d, K key) { var v = d[key]; d.Remove(key); return v; }
         public static void update<K, V>(this IDictionary<K, V> d, IDictionary<K, V> other) { foreach (var kv in other) d[kv.Key] = kv.Value; }
         public static Dictionary<K, V> copy<K, V>(this Dictionary<K, V> d) where K : notnull => new Dictionary<K, V>(d);
         public static void add<T>(this HashSet<T> s, T x) => s.Add(x);
         public static void discard<T>(this HashSet<T> s, T x) => s.Remove(x);
+    }
+}
+
+namespace Typhon.Runtime
+{
+    // d.get(key) without a default returns None when the key is missing. For an int value that is int? (Nullable<int>),
+    // for a reference type a null reference: two extension methods that differ only in their constraint, so they live
+    // in two classes and C# drops the one whose constraint the value type does not satisfy.
+    internal static class DictGetStruct
+    {
+        public static V? get<K, V>(this IDictionary<K, V> d, K key) where V : struct => d.TryGetValue(key, out var v) ? v : null;
+    }
+
+    internal static class DictGetClass
+    {
+        public static V? get<K, V>(this IDictionary<K, V> d, K key) where V : class => d.TryGetValue(key, out var v) ? v : null;
     }
 }
 

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The Typhon runtime (Python builtins + small stdlib) precompiled once, for `typhon run` / `typhon check` and the
+    compile server: scripts compiled in memory reference this assembly instead of compiling the runtime source every
+    time (it is most of the work of a warm compile). `typhon build`, Native AOT and the source generator keep embedding
+    the same source as internal types, so built programs and libraries still need no extra assembly.
+  -->
+  <PropertyGroup>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>Typhon.Runtime</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Typhon.Compiler\Runtime\Builtins.cs" Link="Builtins.cs" />
+  </ItemGroup>
+
+</Project>

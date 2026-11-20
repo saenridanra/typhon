@@ -1,0 +1,6 @@
+# Conformance cases that are known to differ from CPython, one per line: <case>  # reason
+# The test suite checks that these still fail. When a fix makes one pass, the suite fails
+# until the line is removed, so this list never goes stale.
+
+dict_order       # .NET Dictionary reuses freed slots: after del/pop a new key is not appended at the end (planned: insertion-ordered dict)
+numpy_details    # Typhon.NumPy: shape is int[] not a tuple, stepped slices of ndarray are unsupported, bool arrays sum to float

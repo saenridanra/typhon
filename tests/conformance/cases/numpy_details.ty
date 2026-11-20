@@ -1,0 +1,12 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: NumPy details where Typhon.NumPy is known to differ (shape tuples, integer results, stepped slices)."""
+import numpy as np
+
+a = np.array([[1.0, 2.0], [3.0, 4.0]])
+x = np.linspace(0.0, 1.0, 5)
+print(a.shape, a.size, a.ndim)
+print(x[::2])
+print((x > 0.5).sum())
+print(np.dot(x, x))

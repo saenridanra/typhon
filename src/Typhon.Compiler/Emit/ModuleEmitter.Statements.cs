@@ -48,7 +48,7 @@ namespace Typhon.Compiler.Emit
                 case AssertStmt a:
                     _w.Line($"if (!{Paren(Cond(a.Test))}) throw new global::Typhon.Runtime.AssertionError({(a.Msg != null ? "str(" + EmitExpr(a.Msg) + ")" : "\"assertion failed\"")});");
                     break;
-                case DelStmt d: Unsupported(d, "'del'"); break;
+                case DelStmt d: EmitDel(d); break;
                 case IfStmt i: EmitIf(i, isElif: false); break;
                 case WhileStmt w:
                     if (w.OrElse.Count > 0) Unsupported(w, "'while ... else'");
@@ -254,6 +254,8 @@ namespace Typhon.Compiler.Emit
                 _w.Line("yield break;");
                 return;
             }
+            if (Obs != null && _retKey != null)
+                Obs.AddReturn(_retKey, r.Value == null || (r.Value is ConstExpr rc && rc.Kind == ConstKind.None) ? TypeInference.NoneType : (InferType(r.Value) ?? TypeInference.Unknown));
             if (r.Value == null) { _w.Line("return;"); return; }
             string rt = _scope?.ReturnType;
             _w.Line($"return {EmitExpr(r.Value, targetTyped: rt != null && rt != "dynamic" && rt != "void")};");
@@ -354,11 +356,11 @@ namespace Typhon.Compiler.Emit
                 return;
             }
 
-            string iter = EmitExpr(f.Iter);
+            string iter = f.IsAsync ? EmitExpr(f.Iter) : EmitIterable(f.Iter);
             string kw = f.IsAsync ? "await foreach" : "foreach";
             if (f.Target is NameExpr n)
             {
-                if (IsInline(f, n.Id)) { _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
+                if (IsInline(f, n.Id)) { SetType(n.Id, ElementTypeOf(InferType(f.Iter))); _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
                 else
                 {
                     string t = NewTmp();
@@ -401,22 +403,31 @@ namespace Typhon.Compiler.Emit
             return null;
         }
 
+        static bool EndsWithJump(List<Stmt> body) =>
+            body.Count > 0 && (body[body.Count - 1] is ReturnStmt || body[body.Count - 1] is RaiseStmt || body[body.Count - 1] is BreakStmt || body[body.Count - 1] is ContinueStmt);
+
+        /// <summary>del d[key] / del xs[i]: item deletion. Deleting names or attributes has no CLR equivalent.</summary>
+        void EmitDel(DelStmt d)
+        {
+            foreach (var t in d.Targets)
+            {
+                if (t is SubscriptExpr s && !(s.Index is SliceExpr)) _w.Line($"delitem({EmitExpr(s.Target)}, {EmitExpr(s.Index)});");
+                else Unsupported(t, "'del' of a name, attribute or slice");
+            }
+        }
+
         void EmitTry(TryStmt t)
         {
             bool hasElse = t.OrElse.Count > 0;
             bool hasFinally = t.FinalBody.Count > 0;
-            string ok = null;
-            if (hasElse)
-            {
-                // try: A except: B else: C finally: D  →  try { ok=false; try { A; ok=true } catch {B}; if (ok) C } finally { D }
-                if (hasFinally) { _w.Line("try"); _w.Open(); }
-                ok = NewTmp("ok");
-                _w.Line($"bool {ok} = false;");
-            }
+            // try: A except: B else: C finally: D  →  try { try { A } catch { B; goto after; } C; after: ; } finally { D }
+            // (C runs only when A completed normally and is outside the handlers; C#'s flow analysis sees every path)
+            string after = hasElse ? NewTmp("after") : null;
+            bool usedAfter = false;
+            if (hasElse && hasFinally) { _w.Line("try"); _w.Open(); }
             _w.Line("try");
             _w.Open();
             EmitBlockStatements(t.Body);
-            if (ok != null) _w.Line($"{ok} = true;");
             _w.Close();
             foreach (var h in t.Handlers)
             {
@@ -429,7 +440,7 @@ namespace Typhon.Compiler.Emit
                 else
                 {
                     var types = CatchTypes(h.Type, h);
-                    if (types.Count == 1) _w.Line(name == null ? $"catch ({types[0]})" : $"catch ({types[0]} {Esc(csName)})");
+                    if (types.Count == 1 && !types[0].StartsWith("(")) _w.Line(name == null ? $"catch ({types[0]})" : $"catch ({types[0]} {Esc(csName)})");
                     else
                     {
                         string v = csName ?? NewTmp("e");
@@ -438,14 +449,17 @@ namespace Typhon.Compiler.Emit
                 }
                 string saved = null;
                 if (renamed) { _renames.TryGetValue(name, out saved); _renames[name] = csName; }
-                EmitBlock(h.Body);
+                _w.Open();
+                EmitBlockStatements(h.Body);
+                if (hasElse && !EndsWithJump(h.Body)) { _w.Line($"goto {after};"); usedAfter = true; }
+                _w.Close();
                 if (renamed) { if (saved != null) _renames[name] = saved; else _renames.Remove(name); }
             }
             if (hasElse)
             {
                 if (t.Handlers.Count == 0) { _w.Line("finally"); _w.Open(); _w.Close(); }
-                _w.Line($"if ({ok})");
                 EmitBlock(t.OrElse);
+                if (usedAfter) _w.Line($"{after}: ;");
                 if (hasFinally)
                 {
                     _w.Close();
@@ -483,6 +497,7 @@ namespace Typhon.Compiler.Emit
         {
             if (f.Decorators.Count > 0) Unsupported(f, "decorators on nested functions");
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Add(tp.Name);
+            var savedRet = _retKey; _retKey = null; // a nested function's returns are its own
             var sig = BuildSignature(f, dropFirst: false);
             sig.Scope.HasSelf = false;
             if (!f.IsAsync && !sig.IsGenerator) _funcReturnTypes[f.Name] = sig.ReturnType;
@@ -490,6 +505,7 @@ namespace Typhon.Compiler.Emit
             _w.Line($"{asyncKw}{sig.ReturnType} {Esc(f.Name)}{TypeParamList(f.TypeParams)}({sig.Params}){TypeParamConstraints(f.TypeParams, f)}");
             EmitFunctionBody(f.Body, sig.Scope, null, sig.Locals);
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Remove(tp.Name);
+            _retKey = savedRet;
         }
     }
 }

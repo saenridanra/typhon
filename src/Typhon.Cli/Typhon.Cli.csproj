@@ -12,12 +12,17 @@
     <ToolCommandName>typhon</ToolCommandName>
     <PackageId>Typhon.Cli</PackageId>
     <Version>0.1.0</Version>
+    <!-- `dotnet publish -r <rid>` precompiles the CLI and Roslyn to native code (ReadyToRun): Roslyn no longer has to be
+         JIT-compiled on every `typhon run`, which roughly halves a cold compile. -->
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Typhon.Compiler\Typhon.Compiler.csproj" />
     <!-- Typhon standard modules shipped with the CLI: `import numpy as np` in scripts run by `typhon run` -->
     <ProjectReference Include="..\Typhon.NumPy\Typhon.NumPy.csproj" />
+    <!-- the runtime precompiled for scripts compiled in memory (`typhon run`, the compile server) -->
+    <ProjectReference Include="..\Typhon.Runtime\Typhon.Runtime.csproj" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.0.0" />
   </ItemGroup>
 

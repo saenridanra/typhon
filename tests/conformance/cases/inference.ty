@@ -1,0 +1,60 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: inference keeps Python semantics when call sites disagree, pass values of unknown type, or use a function as a value."""
+
+
+def double(x):
+    return x * 2
+
+
+def label(x):
+    return "<" + str(x) + ">"
+
+
+def triple(x):
+    return x * 3
+
+
+def greet(name=None):
+    if name is None:
+        return "hi anonymous"
+    return "hi " + name
+
+
+class Box:
+    def __init__(self, v):
+        self.v = v
+
+    def get(self):
+        return self.v
+
+
+class Labeled(Box):
+    def tag(self):
+        return "#" + str(self.v)
+
+
+mixed: list[object] = [1, "a", 2.5]
+print(double(21), double(1.25), double("ab"))
+print([label(m) for m in mixed], label(7))
+print(list(map(triple, [1, 2, 3])))
+print(greet(), greet("Ada"))
+b1 = Box(1)
+b2 = Box("s")
+print(b1.get(), b2.get(), Labeled(3.5).tag(), Labeled("z").get())
+
+
+def either(flag):
+    if flag:
+        return 1
+    return "one"
+
+
+def show(v):
+    return "<" + str(v) + ">"
+
+
+x = either(True)
+y = x + 1
+print(show(y), show(either(False)), show(2))

@@ -49,13 +49,18 @@ dotnet run --project samples/HelloTyphon
 # 2. A C# app using a Typhon class library *and* mixing .cs/.ty in one project
 dotnet run --project samples/CSharpApp
 
-# 3. Python-style scripting: compile in memory and run
-dotnet run --project src/Typhon.Cli -c Release -- run samples/scripts/tour.ty
-dotnet run --project src/Typhon.Cli -c Release -- emit samples/scripts/tour.ty   # show the generated C#
-dotnet run --project src/Typhon.Cli -c Release -- build samples/scripts/tour.ty -o out/tour   # → dotnet out/tour/typhon_tour.dll
-dotnet run --project src/Typhon.Cli -c Release -- build samples/scripts/tour.ty --aot -o out/tour-aot   # → native out/tour-aot/typhon_tour.exe
+# 3. Python-style scripting with the typhon CLI (published with ReadyToRun: compiles about twice as fast)
+dotnet publish src/Typhon.Cli -c Release -r win-x64 -o tools/typhon    # linux-x64, osx-arm64, ...
+tools/typhon/typhon run samples/scripts/tour.ty          # compile in memory and run, like `python tour.py`
+tools/typhon/typhon emit samples/scripts/tour.ty         # show the generated C#
+tools/typhon/typhon build samples/scripts/tour.ty -o out/tour            # → dotnet out/tour/typhon_tour.dll
+tools/typhon/typhon build samples/scripts/tour.ty --aot -o out/tour-aot  # → native out/tour-aot/typhon_tour.exe
+tools/typhon/typhon server status                        # the background compile server (see below)
 
-# 4. Benchmarks: the same files under CPython (+ NumPy) and Typhon, time and peak RAM
+# 4. Conformance tests: every case must print exactly what CPython prints
+dotnet test tests/Typhon.Conformance.Tests
+
+# 5. Benchmarks: the same files under CPython (+ NumPy) and Typhon, time and peak RAM
 python -m venv .venv; .venv\Scripts\pip install numpy     # once, for the CPython side
 ./benchmarks/run.ps1
 ```
@@ -107,7 +112,15 @@ items to control it yourself). Nothing in the .NET SDK, MSBuild or Roslyn is mod
   both directions, and why Typhon types show up in C# IntelliSense.
 * **Runtime** (`src/Typhon.Compiler/Runtime/Builtins.cs`): Python builtins (`print`, `len`, `range`, `sorted`, `format`,
   str/list/dict methods, ...) and small stdlib shims (`math`, `time`, `random`, `sys`, `os`, `asyncio`), compiled
-  *into* every Typhon assembly as internal types — no runtime dependency.
+  *into* every Typhon assembly as internal types — no runtime dependency. Scripts compiled in memory by `typhon run`
+  reference a precompiled copy instead (`src/Typhon.Runtime`), which saves recompiling it on every run.
+* **CLI** (`src/Typhon.Cli`): `typhon run` takes the fastest way that is still exact. An unchanged script that ran
+  before comes from the **script cache** (like CPython's `__pycache__`, in the user's cache directory; a changed source
+  file, imported module or compiler build invalidates and overwrites the entry; unused entries go after 30 days).
+  Otherwise a background **compile server** with a warm compiler compiles it (like Roslyn's VBCSCompiler; one per user
+  and CLI build, reachable only by that user, exits after 10 idle minutes). The very first run compiles in the
+  process and starts the server. Switch them off with `TYPHON_CACHE=0` / `--no-cache` and `TYPHON_SERVER=0` /
+  `--no-server`; `--time` shows which path was taken and how long it took.
 * **numpy** (`src/Typhon.NumPy`): a numpy-compatible API (float64 `ndarray`, ufuncs, `@`, `linalg`, `random`) written
   in C# on top of `System.Numerics.Tensors.TensorPrimitives` (SIMD).
 
@@ -126,9 +139,25 @@ items to control it yourself). Nothing in the .NET SDK, MSBuild or Roslyn is mod
 | `Iterator[T]` | `IEnumerable<T>` | | `Array[T]` (Typhon) | `T[]` |
 | `decimal`, `long`, `float32`, ... | `decimal`, `long`, `float`, ... | | any .NET type | itself |
 
-Locals are inferred (`x = 1.5` → `var x = 1.5`). Where the compiler cannot determine a type — an unannotated
-parameter, an empty `[]`, a variable first assigned in a nested block — it falls back to C# `dynamic`, and
-`TyphonTypeMode` decides what that means:
+Locals are inferred (`x = 1.5` → `var x = 1.5`). Parameters, return types and fields without annotations are inferred
+from the whole program:
+
+* **Parameters from call sites.** Every call of a project function or constructor records the argument types. Each
+  distinct combination becomes one typed overload, so `scale(3)` and `scale(1.5)` call `scale(int)` and
+  `scale(double)` and keep Python's int/float behaviour.
+* **Return types from `return` statements**, including recursion (`fib(n)` → `int`) and `None` (a function that
+  returns an `int` or `None` → `int?`).
+* **Fields from the constructor**: `self.x = x` gets the type `x` has in every constructor signature.
+
+The untyped (`dynamic`) version of a function stays only where it can actually run: when a call passes a value of
+unknown type. A function passed as a value (`map(f, xs)`) is called through a lambda and keeps it too. The inference
+runs the emitter until the signatures stop changing; if they do not settle, the code is emitted as written.
+[`tests/conformance/cases/untyped.ty`](tests/conformance/cases/untyped.ty) has no annotations at all and compiles
+with `--strict`. Not inferred yet: parameters of methods other than `__init__`. Note that a public function called only
+with ints inside the project gets an `int` signature for C# callers too.
+
+Where the compiler still cannot determine a type — an empty `[]`, a value from a dynamic API, a function that is only
+called from C# — it falls back to C# `dynamic`, and `TyphonTypeMode` decides what that means:
 
 | Mode | Implicit `dynamic` | Use for |
 |---|---|---|
@@ -158,7 +187,8 @@ Typhon stdlib, functions with defaults/`*args`/keyword arguments, PEP 695 generi
 classes with inheritance, `super()`, properties (+setters), `@staticmethod`/`@classmethod`, `@abstractmethod`/`ABC`,
 `@override`, `@final`, `@dataclass`, `Enum`, `Protocol` (→ interface, implemented structurally *or* explicitly),
 operator overloading, any other decorator → .NET attribute (`@Obsolete("...")`, `@Fact`), docstrings → XML docs,
-`if/elif/else`, `while`, `for` (counting loops over `range` compile to plain `for` loops), `try/except/else/finally`,
+`if/elif/else`, `while`, `for` (counting loops over `range` compile to plain `for` loops; iterating a dict yields its
+keys), `del d[key]`/`del xs[i]`, `try/except/else/finally`,
 `raise`, `with` (→ `using`), `async def`/`await`/`async for`/`async with` (→ `Task`), generators (`yield`, `yield from`),
 lambdas, closures, `global`/`nonlocal`, list/dict/set comprehensions and generator expressions (→ LINQ), f-strings with
 the Python format-spec mini-language, tuple unpacking, `if __name__ == "__main__":` (or a `__main__.ty` file) as the
@@ -166,25 +196,56 @@ entry point, `asyncio.run(...)` to call async code from synchronous code.
 
 ### Not supported yet / known gaps
 
-`match`, walrus `:=`, `**kwargs`, `del`, `while/for ... else`, bytes, complex, `%`-formatting, metaclasses,
+`match`, walrus `:=`, `**kwargs`, `del` of names/attributes/slices, `while/for ... else`, bytes, complex, `%`-formatting, metaclasses,
 `eval`/`exec`/`setattr` and other runtime reflection on Python objects, multiple inheritance of classes, tuple indexing
 (`t[0]`; use unpacking), static methods on generic classes need explicit type arguments (`Stack[int].of(...)`),
 .NET `out`/`ref` parameters (planned: tuple returns like IronPython), arbitrary-precision `int` (`int` is 32-bit),
-iterating a `str` yields `char` (which has the common str methods). Union types other than `X | None` are `object`
-for now (see roadmap).
+iterating a `str` yields `char` (which has the common str methods), a dict that had keys deleted puts new keys into the
+freed slots instead of at the end (it is a .NET `Dictionary`). Union types other than `X | None` are `object` for now
+(see roadmap). The conformance suite below tracks the differences that are known.
 
 **numpy (Typhon.NumPy)** covers the common API (creation, ufuncs with broadcasting, reductions with `axis`, `@`,
 `linalg`, `random`, slicing/masks) but: float64 only, slices and `.T` are copies (`reshape`/`ravel` are views),
 `a[i]` returns `dynamic` (annotate the target, `v: float = a[i]`, to get back to static code), `==` compares references
 (use `np.equal`), random streams are deterministic per seed but differ from NumPy's.
 
+## Conformance tests
+
+CPython is the oracle. `tests/conformance/cases/*.ty` are small programs that cover one area each: arithmetic, strings and
+format specs, collections, dict semantics, control flow and exceptions, functions and generators, classes and dunder
+methods, printing, async, NumPy. They are valid Python. `tests/conformance/expected/*.out` holds what CPython 3.15 printed
+for them, and a case passes only when Typhon's output matches it byte for byte.
+
+```powershell
+dotnet test tests/Typhon.Conformance.Tests                                   # typhon run (JIT) vs expected output
+$env:TYPHON_CONFORMANCE_AOT = "1"; dotnet test tests/Typhon.Conformance.Tests   # also build every case with --aot
+python tests/conformance/update_expected.py                                  # regenerate expected/*.out after changing a case
+```
+
+* The suite also re-runs every case under CPython (`TYPHON_CPYTHON`, the repo's `.venv`, or `python` on PATH), so a
+  stale `.out` file fails the build.
+* Known differences are listed in [`tests/conformance/known-failures.txt`](tests/conformance/known-failures.txt) with
+  the reason. Such a case must keep failing: when a fix makes it pass, the suite fails until the line is removed.
+* CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the suite on Windows and Linux. The Native AOT pass
+  can be started by hand.
+
+Status: 10 of 12 cases match CPython under `typhon run`. With `--aot`, 8 of them build and match as native executables
+(`arithmetic` and `numpy_basics` use dynamic values, which Native AOT rejects). Known failures: dict insertion order after deleting keys, and NumPy details
+(`a.shape` is not a tuple, stepped `ndarray` slices, boolean `sum`). Writing the suite surfaced and fixed these
+differences: inherited constructors (an `Exception` subclass without `__init__`), `sorted()` over objects with
+`__lt__`, `Color.RED.value`/`.name`, `type(x).__name__`, `try/except/else` in functions that return a value,
+`except ValueError` catching an `IndexError`, iterating a dict, `d.get(k)` without a default, `del`, the `g` format and
+float repr (`1e+16`), and built-in functions as values (`map(str, xs)`, `key=len`). The Native AOT pass found two more:
+`len()` of a class with `__len__` and the repr of a `set` relied on reflection that AOT trims away.
+
 ## Benchmark results
 
 Every benchmark is a single file that is valid Python *and* valid Typhon. CPython 3.15.2 runs it directly, Typhon
 compiles it (JIT or Native AOT); the runners check that every tool prints the same result (they all do) and report the
 median of 5 runs plus the peak RAM of each process. Full analysis, method and caveats:
-**[benchmarks/REPORT.md](benchmarks/REPORT.md)**; raw tables: [RESULTS.md](benchmarks/RESULTS.md) (Windows) and
-[RESULTS_LINUX.md](benchmarks/RESULTS_LINUX.md) (Linux, incl. Codon and Pythran). Measured on an Intel Core Ultra 9
+**[benchmarks/REPORT.md](benchmarks/REPORT.md)**; raw tables: [RESULTS.md](benchmarks/RESULTS.md) (Windows, plugged
+in), [RESULTS_BATTERY.md](benchmarks/RESULTS_BATTERY.md) (Windows, on battery, with compile times and type inference)
+and [RESULTS_LINUX.md](benchmarks/RESULTS_LINUX.md) (Linux, incl. Codon and Pythran). Measured on an Intel Core Ultra 9
 285HX laptop, .NET 11.0.100, CPython 3.15.2, NumPy 2.5.5 + OpenBLAS.
 
 ![Speed-up of Typhon over CPython and NumPy](benchmarks/img/speedup.png)
@@ -192,8 +253,14 @@ median of 5 runs plus the peak RAM of each process. Full analysis, method and ca
 * **Typed pure-Python programs: 1.9–75x faster** than CPython; geometric mean **11.1x with the JIT, 13.6x as a Native
   AOT executable** (9 programs). Largest on numeric code over floats and small objects, smallest on `str`/`dict`/sorting,
   where CPython already runs C.
-* **Type hints are the reason.** The same N-body source without annotations falls back to `dynamic` and is only 1.5x
-  faster than CPython, 54x slower than the typed version.
+* **Types are the reason, and they no longer have to be written.** Without annotations the N-body source used to fall
+  back to `dynamic` (1.5x faster than CPython). Whole-program inference now types it completely: it runs as fast as the
+  annotated version (74x vs 72x in the same run) and builds as a Native AOT executable.
+* **Running a script costs little extra.** `typhon run` compiles on the first run (0.65–0.8 s for most programs);
+  after that a warm compile server or the script cache take over, and a tiny script runs in about 80 ms (CPython
+  30 ms). Apart from such tiny scripts, every pure-Python benchmark already runs faster than on CPython that way, compile
+  included
+  ([details](#one-off-scripts-compile-time-included)).
 * **Native AOT**: one self-contained 1.5–1.9 MB executable, **9 MB of RAM** for small programs (CPython 12 MB, JIT 20 MB);
   on Linux a tiny program starts in **1.8 ms with 4 MB**, the fastest and leanest of every tool tested.
 * **NumPy programs: rough parity** (geometric mean 1.04x JIT, 1.13x AOT, each side in its faster thread setting).
@@ -212,7 +279,9 @@ median of 5 runs plus the peak RAM of each process. Full analysis, method and ca
 | Prime sieve | 989 ms | 358 ms | 199 ms | **2.8x** | **5.0x** | 50 MB | 37 MB | 23 MB |
 | Word count (str + dict) | 413 ms | 161 ms | 140 ms | **2.6x** | **3.0x** | 12 MB | 41 MB | 27 MB |
 | `sorted()` ints + strings | 353 ms | 182 ms | 218 ms | **1.9x** | **1.6x** | 88 MB | 61 MB | 54 MB |
-| N-body without type hints | 3,286 ms | 2,168 ms | n/a (dynamic) | **1.5x** | – | 12 MB | 59 MB | – |
+
+The N-body source without type hints is not in this table: this run predates type inference, when it was 1.5x faster than
+CPython. With inference it runs as fast as the annotated version: 74x vs 72x in the battery run (see [On battery](#on-battery)).
 
 ### NumPy programs (Windows)
 
@@ -239,6 +308,74 @@ A tiny program (`bench_startup.ty`), measured from start to exit:
 | Typhon JIT | 34.5 ms | 20 MB | 20.0 ms | 30 MB | a 0.05 MB `.dll` + the .NET runtime |
 | **Typhon Native AOT** | **21.3 ms** | **9 MB** | **1.8 ms** | **4 MB** | **one 1.5–1.9 MB self-contained executable** |
 
+### One-off scripts: compile time included
+
+The tables above time programs that are already compiled. A Python script is often run just once, so this compares
+the whole process from start to exit: `python script.py` and `typhon run script.ty` in its three situations, plus a
+program built ahead of time. Measured on battery ([RESULTS_BATTERY.md](benchmarks/RESULTS_BATTERY.md)) with the CLI
+published as ReadyToRun.
+
+* **First run**: `typhon run` compiles in its own process (parse, type inference, Roslyn) and starts the compile server
+  in the background.
+* **Compile server**: later runs send the script to the warm server, which compiles it in about 20–110 ms.
+* **Cached**: an unchanged script that ran before is not compiled at all (like CPython's `__pycache__`).
+
+![Running a script: CPython vs typhon run](benchmarks/img/oneoff.png)
+
+| Program | CPython | First run | Compile server | Cached | `typhon build` | Built, per run | Build pays off | `build --aot` | AOT, per run | AOT pays off |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Tiny script (start-up) | 30 ms | 642 ms | 84 ms | 80 ms | 1,034 ms | 45 ms | never | 5,775 ms | 23 ms | after 831 runs |
+| fib(32) | 155 ms | 654 ms | 88 ms | 83 ms | 1,026 ms | 72 ms | after 13 runs | 5,917 ms | 34 ms | after 49 runs |
+| Spectral norm | 536 ms | 671 ms | 107 ms | 111 ms | 939 ms | 58 ms | after 2 runs | 5,887 ms | 41 ms | after 12 runs |
+| Word count | 428 ms | 935 ms | 400 ms | 281 ms | 996 ms | 221 ms | after 5 runs | 6,736 ms | 228 ms | after 34 runs |
+| Binary trees | 948 ms | 719 ms | 204 ms | 174 ms | 955 ms | 128 ms | after 2 runs | 6,610 ms | 99 ms | after 8 runs |
+| Prime sieve | 1,449 ms | 1,102 ms | 431 ms | 431 ms | 923 ms | 425 ms | 1st run | 6,083 ms | 251 ms | after 6 runs |
+| Mandelbrot | 2,063 ms | 691 ms | 167 ms | 147 ms | 954 ms | 116 ms | 1st run | 5,613 ms | 93 ms | after 3 runs |
+| N-body | 3,283 ms | 721 ms | 146 ms | 126 ms | 915 ms | 95 ms | 1st run | 5,546 ms | 78 ms | after 2 runs |
+| N-body without type hints | 3,301 ms | 670 ms | 165 ms | 114 ms | 947 ms | 103 ms | 1st run | 5,852 ms | 80 ms | after 2 runs |
+| NumPy matmul | 169 ms | 667 ms | 167 ms | 140 ms | 1,128 ms | 121 ms | after 24 runs | 6,199 ms | 88 ms | after 77 runs |
+| NumPy ufuncs | 1,666 ms | 2,080 ms | 1,703 ms | 1,632 ms | 952 ms | 1,525 ms | after 7 runs | 6,151 ms | 710 ms | after 7 runs |
+
+* **First run**: 0.64–0.81 s for 11 of 17 programs, about 2.8x less than before the improvements below (1.8–2.1 s
+  for the same programs). It already beats CPython on 6 programs (N-body 4.6x, Mandelbrot 3.0x).
+* **While you work** (compile server or cache): within 6–180 ms of a program built ahead of time. CPython stays faster
+  only for the tiny script (30 vs 84 ms) and is level on the two NumPy programs dominated by BLAS and ufunc kernels.
+* **Building ahead** still gives the fastest process: `typhon build` takes about 1 s and pays off after 1–13 runs on
+  pure-Python programs; Native AOT builds take 5.5–6.7 s.
+
+What made `typhon run` faster (tiny script, battery):
+
+| `typhon run` | Process time |
+|---|---|
+| Before: Roslyn JIT-compiled on every start, Typhon runtime compiled from source every time | 1,879 ms |
+| + CLI published with ReadyToRun, runtime precompiled (`src/Typhon.Runtime`) | 642 ms |
+| + warm compile server | 84 ms |
+| + script cache (unchanged script) | 80 ms |
+
+Where the time went before: a cold compile spent about 1.2 s in Roslyn, mostly Roslyn itself being JIT-compiled, and
+most of a warm compile was the Typhon runtime's own source (about 180 ms of 200 ms). Typhon's parser, type inference
+and C# emission take 6–30 ms once warm.
+
+### On battery
+
+The same benchmark on battery power ([RESULTS_BATTERY.md](benchmarks/RESULTS_BATTERY.md), Windows "Balanced" plan)
+against the plugged-in run ([RESULTS.md](benchmarks/RESULTS.md)):
+
+| | Plugged in | On battery |
+|---|---|---|
+| Typed programs, speed-up (geometric mean, JIT / AOT) | 11.1x / 13.6x | 10.7x / 12.6x |
+| fib(32): CPython / Typhon JIT / Typhon AOT | 134 / 9.0 / 4.7 ms | 123 / 12.5 / 5.4 ms |
+| N-body: CPython / Typhon JIT / Typhon AOT | 3,024 / 40.3 / 43.8 ms | 3,250 / 45.2 / 46.2 ms |
+| Tiny script, whole process: CPython / Typhon JIT / Typhon AOT | 19.7 / 34.5 / 21.3 ms | 29.7 / 45.3 / 22.7 ms |
+| `typhon build --aot` (median per program) | 4,767 ms | 6,098 ms |
+| N-body without type hints: Typhon JIT (speed-up) | 2,168 ms (1.5x, before inference) | 44.0 ms (74x, with inference) |
+
+* Hot loops on battery: CPython −9% to +42% (median +7%), Typhon JIT +5% to +39%, Typhon AOT +3% to +55%. Typhon's
+  short, tight loops lose the most (fib), so the speed-ups shrink by 4–7% on average but keep their order.
+* Process start gets 7–51% slower, Native AOT builds 28%. Battery runs vary: an earlier battery run measured process
+  starts about twice as slow as plugged in.
+* Every program printed the same result as CPython in both runs.
+
 ### Typhon vs Codon vs Pythran (Linux)
 
 The same files compiled with two other Python compilers, [Codon](https://github.com/exaloop/codon) (whole programs to
@@ -260,15 +397,16 @@ Speed-up over CPython (Linux):
 | Prime sieve | 12x | **15x** | 2.8x | 5.1x |
 | `sorted()` | **3.9x** | n/a (not in a function) | 2.0x | 1.6x |
 | Word count | 2.5x | 1.2x | 1.9x | **2.6x** |
-| N-body without type hints | **29x** | n/a (classes) | 1.1x | n/a (dynamic) |
+| N-body without type hints | **29x** | n/a (classes) | 1.1x (before inference) | n/a (dynamic) |
 | NumPy element loop | 19x | **31x** | 4.4x | n/a (dynamic) |
 | NumPy broadcasting | 1.1x | **5.1x** | 1.4x | 2.4x |
 | NumPy ufuncs | 1.5x | **2.3x** | 0.8x | 1.9x |
 | NumPy matmul 1000 x 1000 | 0.4x | n/a (not in a function) | **0.6x** | 0.3x |
 
 On the 6 programs all of them can compile: **Pythran 13.6x, Typhon AOT 11.8x, Codon 11.6x, Typhon JIT 9.2x** (geometric
-means). Typhon leads on float- and object-heavy code, Codon and Pythran on integer/list code and NumPy-style code; only
-Codon stays fast without type hints, because it infers types for the whole program.
+means). Typhon leads on float- and object-heavy code, Codon and Pythran on integer/list code and NumPy-style code. In this
+run only Codon stayed fast without type hints, because it infers types for the whole program; Typhon does that now too
+(74x on Windows, see [On battery](#on-battery)), the Linux run predates it.
 
 Peak RAM (Linux, max resident set size):
 
@@ -336,7 +474,7 @@ CPython on every pure-Python benchmark.
    gradual typing keeps porting possible. `typhon build --aot` builds a native executable; it additionally rejects dynamic values that come from libraries (TY2001), because Native AOT cannot run late-bound code.
 4. **"Valid Python" as a design constraint.** Never add syntax CPython can't parse. You get editor support, formatters
    and linters for free, and — as the benchmarks show — the same file can run on both runtimes, which is also the
-   cheapest possible conformance test (diff the outputs).
+   cheapest possible conformance test: diff the outputs (that is exactly what `tests/conformance` does).
 5. **Names are kept as written** (`calculate_area` stays `calculate_area` for C# callers). Leading `_` → `internal`
    / `protected internal`, `__x` → `private`. A PascalCase-mapping option is easy to add if C# consumers want it.
 6. **Python protocols are bridged, not emulated.** `__eq__` becomes `Equals` + `==`, `__iter__` becomes
@@ -352,7 +490,11 @@ Typhon is licensed under the [MIT License](LICENSE), the same license as .NET (r
 
 * C# 15 union types for `A | B` annotations (canonicalized, one generated union per member set)
 * `out`/`ref` parameters as tuple returns, `**kwargs`, `match` → C# pattern matching
-* A conformance suite: run every test file under CPython and Typhon, diff the output
+* Grow the conformance suite (port relevant parts of CPython's own test suite); an insertion-ordered `dict`
+* Ship the CLI as a `dotnet tool` with platform-specific ReadyToRun packages
+* Re-run the Linux benchmark with type inference (the untyped N-body row there predates it)
+* Extend the inference to method parameters, element types of empty containers (`xs = []` followed by
+  `xs.append(1.5)`) and comprehensions
 * `sum(...)`/`any(...)` over generator expressions lowered to loops instead of LINQ
 * A fully static Typhon.NumPy API (no `dynamic` return values, e.g. for `a[i]` and `np.dot`), so every NumPy program can be compiled with Native AOT
 * Expression fusion for NumPy code: reuse or fuse the temporaries of `np.sqrt(x) * 2.0 - x / 3.0` (the RAM weak spot)

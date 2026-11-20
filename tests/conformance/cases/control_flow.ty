@@ -1,0 +1,90 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: branches, loops, exceptions."""
+
+
+class MyError(Exception):
+    pass
+
+
+def classify(n: int) -> str:
+    if n < 0:
+        return "negative"
+    elif n == 0:
+        return "zero"
+    elif n < 10:
+        return "small"
+    else:
+        return "large"
+
+
+def risky(kind: str) -> str:
+    try:
+        if kind == "value":
+            return str(int("abc"))
+        if kind == "zero":
+            return str(1 / 0)
+        if kind == "key":
+            d: dict[str, int] = {}
+            return str(d["missing"])
+        if kind == "index":
+            xs = [1, 2]
+            return str(xs[5])
+        if kind == "custom":
+            raise MyError("boom")
+        return "ok"
+    except ValueError:
+        return "ValueError"
+    except ZeroDivisionError:
+        return "ZeroDivisionError"
+    except KeyError:
+        return "KeyError"
+    except IndexError:
+        return "IndexError"
+    except MyError as e:
+        return "MyError: " + str(e)
+    finally:
+        print("finally", kind, end=" | ")
+
+
+def safe_div(a: float, b: float) -> str:
+    try:
+        r = a / b
+    except ZeroDivisionError:
+        return "div by zero"
+    else:
+        return f"{r:.2f}"
+
+
+print([classify(n) for n in [-5, 0, 3, 42]])
+total = 0
+i = 0
+while True:
+    i += 1
+    if i % 2 == 0:
+        continue
+    if i > 9:
+        break
+    total += i
+print(total, i)
+for a in range(3):
+    for b in range(3):
+        if a == b:
+            continue
+        print(a, b, end=" ")
+print()
+for v in range(10, 0, -4):
+    print(v, end=" ")
+print()
+for kind in ["value", "zero", "key", "index", "custom", "none"]:
+    print(risky(kind))
+print(safe_div(1.0, 3.0), safe_div(1.0, 0.0))
+try:
+    assert 1 + 1 == 3, "math is broken"
+except AssertionError as e:
+    print("AssertionError:", e)
+try:
+    int("12x")
+except ValueError as e:
+    print("message:", e)
