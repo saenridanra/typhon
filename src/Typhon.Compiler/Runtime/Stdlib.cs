@@ -232,7 +232,8 @@ namespace Typhon.Runtime
     internal sealed class Path : IEquatable<Path>, IPyRepr
     {
         readonly string _p;
-        public Path(string p) { _p = p.Length == 0 ? "." : p; }
+        // like CPython's WindowsPath, a path on Windows uses backslashes (Path("/tmp") / "x" is \tmp\x there)
+        public Path(string p) { _p = p.Length == 0 ? "." : OperatingSystem.IsWindows() ? p.Replace('/', '\\') : p; }
         public static implicit operator string(Path p) => p._p;
         public static Path operator /(Path a, string b) => new Path(System.IO.Path.Combine(a._p, b));
         public static Path operator /(Path a, Path b) => new Path(System.IO.Path.Combine(a._p, b._p));
@@ -259,7 +260,8 @@ namespace Typhon.Runtime
         public bool Equals(Path? o) => o is not null && _p == o._p;
         public override bool Equals(object? o) => o is Path p && Equals(p);
         public override int GetHashCode() => _p.GetHashCode();
-        public string __repr__() => $"PosixPath('{_p}')";
+        public string as_posix() => _p.Replace('\\', '/');
+        public string __repr__() => OperatingSystem.IsWindows() ? $"WindowsPath('{as_posix()}')" : $"PosixPath('{_p}')";
         public override string ToString() => _p;
     }
 
