@@ -68,6 +68,65 @@ namespace Typhon.Compiler.Semantics
 
         readonly Dictionary<string, IReadOnlyList<MemberSig>> _members = new Dictionary<string, IReadOnlyList<MemberSig>>();
 
+        MemberSig MethodSig(IMethodSymbol m)
+        {
+            var sig = new MemberSig { IsMethod = true, IsStatic = m.IsStatic, Type = Display(m.ReturnType) };
+            if (m.TypeParameters.Length > 0)
+            {
+                sig.TypeParams = m.TypeParameters.Select(tp => tp.Name).ToList();
+                sig.GenericType = GenericDisplay(m.ReturnType);
+            }
+            foreach (var p in m.Parameters)
+            {
+                var t = p.IsParams && p.Type is IArrayTypeSymbol arr ? arr.ElementType : p.Type;
+                var fit = Fit(t, out var narrowTo);
+                bool bigAccepts = BigFit(t, out var bigNarrow, out bool isBig);
+                if (p.RefKind != RefKind.None) { fit = LongFit.Other; bigAccepts = false; bigNarrow = null; isBig = false; }
+                var elem = p.IsParams && t is IArrayTypeSymbol pa ? pa.ElementType : t;
+                // (System.Delegate itself too: MapGet("/", handler) takes any function as a method group)
+                bool takesFunction = elem.TypeKind == TypeKind.Delegate || elem.TypeKind == TypeKind.TypeParameter ||
+                                     elem.SpecialType == SpecialType.System_Delegate || elem.SpecialType == SpecialType.System_MulticastDelegate ||
+                                     elem is INamedTypeSymbol en && en.Name == "Expression" && en.IsGenericType;
+                sig.Parameters.Add(new ParamSig { Name = p.Name, Fit = fit, NarrowTo = narrowTo, IsParams = p.IsParams, IsOptional = p.IsOptional,
+                                                  IsDelegateBase = elem.SpecialType == SpecialType.System_Delegate || elem.SpecialType == SpecialType.System_MulticastDelegate,
+                                                              IsArray = !p.IsParams && p.Type is IArrayTypeSymbol,
+                                                  BigAccepts = bigAccepts, BigNarrowTo = bigNarrow, IsBigInteger = isBig, TakesFunction = takesFunction,
+                                                  GenericType = m.TypeParameters.Length > 0 ? GenericDisplay(elem) : null });
+            }
+            return sig;
+        }
+
+        public IReadOnlyList<MemberSig> GetExtensionMethods(string receiverMetadataName, string name, IReadOnlyList<string> namespaces)
+        {
+            string key = receiverMetadataName + "::ext::" + name + "::" + string.Join(",", namespaces);
+            if (_members.TryGetValue(key, out var cached)) return cached;
+            var result = new List<MemberSig>();
+            var receiver = Find(receiverMetadataName);
+            if (receiver != null)
+                foreach (var dotted in namespaces.Distinct())
+                {
+                    INamespaceSymbol ns = _compilation.GlobalNamespace;
+                    foreach (var part in dotted.Split('.')) { ns = ns?.GetNamespaceMembers().FirstOrDefault(n => n.Name == part); }
+                    if (ns == null) continue;
+                    foreach (var type in ns.GetTypeMembers())
+                    {
+                        if (!type.IsStatic || !type.MightContainExtensionMethods || type.DeclaredAccessibility != Accessibility.Public) continue;
+                        foreach (var m in type.GetMembers(name).OfType<IMethodSymbol>())
+                        {
+                            if (!m.IsExtensionMethod || m.DeclaredAccessibility != Accessibility.Public) continue;
+                            // applicable to the receiver (generic ones get their type arguments from it): the parameters after 'this'
+                            if (m.ReduceExtensionMethod(receiver) is IMethodSymbol reduced)
+                            {
+                                var sig = MethodSig(reduced);
+                                sig.IsStatic = false;
+                                result.Add(sig);
+                            }
+                        }
+                    }
+                }
+            return _members[key] = result;
+        }
+
         public IReadOnlyList<MemberSig> GetMembers(string metadataName, string memberName)
         {
             string key = metadataName + "::" + memberName;
@@ -92,29 +151,8 @@ namespace Typhon.Compiler.Semantics
                     {
                         // (user-defined operators too, looked up by their metadata names: op_Division, ...)
                         case IMethodSymbol m when m.MethodKind == MethodKind.Ordinary || m.MethodKind == MethodKind.Constructor || m.MethodKind == MethodKind.UserDefinedOperator:
-                        {
-                            var sig = new MemberSig { IsMethod = true, IsStatic = m.IsStatic, Type = Display(m.ReturnType) };
-                            if (m.TypeParameters.Length > 0)
-                            {
-                                sig.TypeParams = m.TypeParameters.Select(tp => tp.Name).ToList();
-                                sig.GenericType = GenericDisplay(m.ReturnType);
-                            }
-                            foreach (var p in m.Parameters)
-                            {
-                                var t = p.IsParams && p.Type is IArrayTypeSymbol arr ? arr.ElementType : p.Type;
-                                var fit = Fit(t, out var narrowTo);
-                                bool bigAccepts = BigFit(t, out var bigNarrow, out bool isBig);
-                                if (p.RefKind != RefKind.None) { fit = LongFit.Other; bigAccepts = false; bigNarrow = null; isBig = false; }
-                                var elem = p.IsParams && t is IArrayTypeSymbol pa ? pa.ElementType : t;
-                                bool takesFunction = elem.TypeKind == TypeKind.Delegate || elem.TypeKind == TypeKind.TypeParameter ||
-                                                     elem is INamedTypeSymbol en && en.Name == "Expression" && en.IsGenericType;
-                                sig.Parameters.Add(new ParamSig { Name = p.Name, Fit = fit, NarrowTo = narrowTo, IsParams = p.IsParams, IsOptional = p.IsOptional,
-                                                                  BigAccepts = bigAccepts, BigNarrowTo = bigNarrow, IsBigInteger = isBig, TakesFunction = takesFunction,
-                                                                  GenericType = m.TypeParameters.Length > 0 ? GenericDisplay(elem) : null });
-                            }
-                            result.Add(sig);
+                            result.Add(MethodSig(m));
                             break;
-                        }
                         case IPropertySymbol prop when !prop.IsIndexer:
                             BigFit(prop.Type, out var pbn, out _);
                             result.Add(new MemberSig { IsStatic = prop.IsStatic, Type = Display(prop.Type), ValueFit = Fit(prop.Type, out var pn), ValueNarrowTo = pn, ValueBigNarrowTo = pbn });

@@ -1,0 +1,66 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""
+An ASP.NET Core minimal API written in Typhon: routes, route parameters, JSON bodies and dependency injection.
+
+    dotnet run --project samples/MinimalApi -- --urls http://localhost:5000
+    curl localhost:5000/todos
+    curl -X POST -H "Content-Type: application/json" -d '{"title": "Ship it"}' localhost:5000/todos
+    curl -X PUT localhost:5000/todos/2/done
+    curl localhost:5000/square/12
+
+Handlers are plain functions: ASP.NET Core binds their parameters by name and type (route values, the JSON body,
+services), so they need annotations. The Todo dataclasses serialize with System.Text.Json like C# classes.
+"""
+import asyncio
+import sys
+from Microsoft.AspNetCore.Builder import WebApplication
+from Microsoft.AspNetCore.Http import IResult, Results
+from Microsoft.Extensions.DependencyInjection import *
+from todos import NewTodo, Todo, TodoStore
+
+
+def hello() -> str:
+    return "Hello from Typhon!"
+
+
+def list_todos(store: TodoStore) -> list[Todo]:
+    return store.all()
+
+
+def get_todo(id: int, store: TodoStore) -> IResult:
+    todo = store.find(id)
+    if todo is None:
+        return Results.NotFound()
+    return Results.Ok(todo)
+
+
+def create_todo(body: NewTodo, store: TodoStore) -> IResult:
+    todo = store.add(body.title)
+    return Results.Created(f"/todos/{todo.id}", todo)
+
+
+def complete_todo(id: int, store: TodoStore) -> IResult:
+    return Results.NoContent() if store.complete(id) else Results.NotFound()
+
+
+async def slow_square(n: int) -> int:
+    """An async handler: a Typhon coroutine is a .NET Task."""
+    await asyncio.sleep(0.05)
+    return n * n
+
+
+if __name__ == "__main__":
+    builder = WebApplication.CreateBuilder(sys.argv[1:])
+    store = TodoStore()
+    store.add("Write a minimal API in Typhon")
+    builder.Services.AddSingleton(store)
+    app = builder.Build()
+    app.MapGet("/", hello)
+    app.MapGet("/todos", list_todos)
+    app.MapGet("/todos/{id}", get_todo)
+    app.MapPost("/todos", create_todo)
+    app.MapPut("/todos/{id}/done", complete_todo)
+    app.MapGet("/square/{n}", slow_square)
+    app.Run()

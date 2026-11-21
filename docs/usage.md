@@ -11,6 +11,9 @@ dotnet run --project samples/HelloTyphon
 # 2. A C# app using a Typhon class library *and* mixing .cs/.ty in one project
 dotnet run --project samples/CSharpApp
 
+# An ASP.NET Core minimal API written in Typhon (routes, JSON bodies, dependency injection)
+dotnet run --project samples/MinimalApi -- --urls http://localhost:5000
+
 # 3. Python-style scripting with the typhon CLI (published with ReadyToRun: compiles about twice as fast)
 dotnet publish src/Typhon.Cli -c Release -r win-x64 -o tools/typhon    # linux-x64, osx-arm64, ...
 tools/typhon/typhon run samples/scripts/tour.ty          # compile in memory and run, like `python tour.py`

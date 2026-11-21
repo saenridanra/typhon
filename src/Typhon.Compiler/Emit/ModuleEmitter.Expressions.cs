@@ -1157,6 +1157,11 @@ namespace Typhon.Compiler.Emit
                     // str.upper / str.lower / list.copy passed as a function: a lambda calling the method on its argument
                     : a.Value is AttributeExpr um && um.Target is NameExpr umt && BuiltinTypeNames.Contains(umt.Id) && !IsShadowed(umt.Id) && !BuiltinClassMethods.Contains(um.Name)
                     ? $"(__v => __v.{Esc(um.Name)}())"
+                    // a fully annotated function for a System.Delegate parameter (app.MapGet("/todos/{id}", get_todo)): the method
+                    // group itself, so the callee sees its parameter names, defaults and attributes
+                    : a.Value is NameExpr dg && paramsHere != null && paramsHere.Any(x => x.IsDelegateBase) &&
+                      FunctionRef(dg, out _, out var dgDef) && dgDef.TypeParams.Count == 0 && dgDef.Params.All(x => x.Annotation != null && x.Kind == ParamKind.Normal)
+                    ? EmitName(dg)
                     : a.Value is NameExpr fv && FunctionValueLambda(fv) is string lambda ? lambda
                     : a.Value is NameExpr mg && FunctionRef(mg, out _, out _) ? EmitName(mg) // a method group, for a delegate parameter
                     : EmitExpr(a.Value);
@@ -1166,6 +1171,10 @@ namespace Typhon.Compiler.Emit
                 else if (dynamicCall && v.StartsWith("(__v =>")) v = $"((Func<dynamic, dynamic>){v})";
                 // a Python int literal is a long at run time too (xs.index(2) on a late-bound list of longs: 2 is not 2L)
                 else if (dynamicCall && !a.Star && (IsIntLiteral(a.Value) || a.Value is UnaryExpr nu && nu.Op == "-" && IsIntLiteral(nu.Operand))) v = EmitValue(a.Value);
+                // a list for a .NET array parameter (WebApplication.CreateBuilder(sys.argv[1:])): its items as an array
+                if (!a.Star && paramsHere != null && paramsHere.Count > 0 && paramsHere.Any(x => x.IsArray) && !paramsHere.Any(x => x.TakesFunction) &&
+                    InferType(a.Value) is string lat && lat.StartsWith("List<"))
+                    v = $"{Paren(v)}.ToArray()";
                 // *xs into a params array (print(*xs), .NET params methods): spread into an array of the parameter's element type
                 if (a.Star && !(InferType(a.Value) is string at && at.EndsWith("[]"))) v = $"[.. {EmitIterable(a.Value)}]";
                 parts.Add(a.Name != null ? $"{Esc(a.Name)}: {v}" : v);
@@ -1623,7 +1632,12 @@ namespace Typhon.Compiler.Emit
                 if (fa.Target is NameExpr sn && sn.Id == "self") return null;
                 var rt = InferType(fa.Target);
                 if (ClassKeyOfType(rt, out _) != null) return null;
-                if (DotNetMeta(rt) is string im) return _r.GetMembers(im, fa.Name).Where(m => m.IsMethod && !m.IsStatic).ToList();
+                if (DotNetMeta(rt) is string im)
+                {
+                    var instance = _r.GetMembers(im, fa.Name).Where(m => m.IsMethod && !m.IsStatic).ToList();
+                    // app.MapGet(...): an extension method of an imported namespace (when the type has no such method itself)
+                    return instance.Count > 0 ? instance : _r.GetExtensionMethods(im, fa.Name, _usingNamespaces) is { Count: > 0 } ext ? ext.ToList() : instance;
+                }
                 return null;
             }
             if (c.Func is NameExpr fn && !IsShadowed(fn.Id))

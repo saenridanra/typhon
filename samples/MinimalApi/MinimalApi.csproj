@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- An ASP.NET Core minimal API whose sources are *.ty files: the Web SDK, Typhon added like in every sample. -->
+  <PropertyGroup>
+    <TargetFramework>$(TyphonTargetFramework)</TargetFramework>
+    <TyphonTypeMode>strict</TyphonTypeMode>
+  </PropertyGroup>
+
+</Project>

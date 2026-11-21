@@ -27,6 +27,8 @@ namespace Typhon.Compiler.Semantics
         /// accept a long, which need a narrowing conversion, and the C# keyword of a special result type.
         /// </summary>
         IReadOnlyList<MemberSig> GetMembers(string metadataName, string memberName);
+        /// <summary>Extension methods of that name in the namespaces that apply to the receiver type, with the receiver left out.</summary>
+        IReadOnlyList<MemberSig> GetExtensionMethods(string receiverMetadataName, string name, IReadOnlyList<string> namespaces);
     }
 
     /// <summary>How a parameter (or property) takes a value of C# type long.</summary>
@@ -48,6 +50,10 @@ namespace Typhon.Compiler.Semantics
         public string NarrowTo;
         public bool IsParams;
         public bool IsOptional;
+        /// <summary>The parameter is System.Delegate itself (ASP.NET Core's MapGet): any function, by its own signature.</summary>
+        public bool IsDelegateBase;
+        /// <summary>The parameter is an array (not a params array): a Python list is passed as list.ToArray().</summary>
+        public bool IsArray;
         /// <summary>The parameter takes a function: a delegate type, an expression tree, or a type parameter (which may bind to one).</summary>
         public bool TakesFunction;
         /// <summary>The parameter type as C# code with the method's type parameters left in ("List&lt;T&gt;", "IEnumerable&lt;T&gt;").</summary>
@@ -90,6 +96,7 @@ namespace Typhon.Compiler.Semantics
         public static readonly NullTypeResolver Instance = new NullTypeResolver();
         public bool TypeExists(string metadataName) => false;
         public bool NamespaceExists(string dottedNamespace) => false;
+        public IReadOnlyList<MemberSig> GetExtensionMethods(string receiverMetadataName, string name, IReadOnlyList<string> namespaces) => new List<MemberSig>();
         public bool HasMember(string metadataName, string memberName) => false;
         public bool IsOverridable(string metadataName, string memberName) => false;
         public IReadOnlyList<CtorSignature> GetConstructors(string metadataName) => new CtorSignature[0];
