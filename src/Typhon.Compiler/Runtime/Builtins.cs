@@ -125,6 +125,182 @@ namespace Typhon.Runtime
         }
     }
 
+    /// <summary>StopIteration: the end of an iterator; a generator's or coroutine's return value is its value.</summary>
+    internal class StopIteration : InvalidOperationException
+    {
+        public readonly object? value;
+        public StopIteration(object? value = null) : base("StopIteration") { this.value = value; }
+    }
+
+    /// <summary>GeneratorExit: raised inside a generator at its yield when close() is called.</summary>
+    internal sealed class GeneratorExit : Exception { public GeneratorExit() : base("GeneratorExit") { } }
+
+    /// <summary>
+    /// A generator that receives values: x = yield v takes what send() passes in. The function's body is an iterator that
+    /// reads the sent value (and a pending throw()/close()) from this object after each yield; return value ends it with
+    /// StopIteration(value). It is its own iterator, like a Python generator object.
+    /// </summary>
+    internal sealed class PyGenerator<T> : IEnumerable<T>, IEnumerator<T>
+    {
+        IEnumerator<T>? _body;
+        bool _started, _done;
+        public object? __sent;
+        Exception? _pending;
+        public object? __return;
+        public void __start(IEnumerable<T> body) => _body = body.GetEnumerator();
+
+        /// <summary>After a yield, in the body: the value sent in (or the exception thrown in).</summary>
+        public object? __resume()
+        {
+            if (_pending is Exception e) { _pending = null; throw e; }
+            var v = __sent; __sent = null; return v;
+        }
+
+        bool Step()
+        {
+            if (_done) return false;
+            _started = true;
+            bool more;
+            try { more = _body!.MoveNext(); }
+            catch { _done = true; throw; }
+            if (!more) _done = true;
+            return more;
+        }
+
+        public T send(object? value)
+        {
+            if (!_started && value != null) throw new InvalidCastException("can't send non-None value to a just-started generator");
+            __sent = value;
+            if (Step()) return Current;
+            throw new StopIteration(__return);
+        }
+        /// <summary>next(g) at the end: StopIteration carries the generator's return value.</summary>
+        public T __next__() { __sent = null; if (Step()) return Current; throw new StopIteration(__return); }
+        public T @throw(Exception e)
+        {
+            // not started or already finished: the exception comes straight back out
+            if (!_started || _done) { _done = true; throw e; }
+            _pending = e;
+            if (Step()) return Current;
+            throw new StopIteration(__return);
+        }
+        public void close()
+        {
+            if (!_started || _done) { _done = true; return; }
+            _pending = new GeneratorExit();
+            try { if (Step()) throw new InvalidOperationException("generator ignored GeneratorExit"); }
+            catch (GeneratorExit) { }
+            catch (StopIteration) { }
+            _done = true;
+        }
+
+        public T Current => _body!.Current;
+        object? IEnumerator.Current => Current;
+        public bool MoveNext() { __sent = null; return Step(); }
+        public void Reset() => throw new NotSupportedException();
+        public void Dispose() { }
+        public IEnumerator<T> GetEnumerator() => this;
+        IEnumerator IEnumerable.GetEnumerator() => this;
+        public override string ToString() => $"<generator object at 0x{RuntimeHelpers.GetHashCode(this):x12}>";
+    }
+
+    /// <summary>
+    /// A .NET object's method used as a value (pack = struct.Struct(">B").pack): callable with Python's arguments, the
+    /// overload chosen by their number (a params array takes the rest).
+    /// </summary>
+    internal sealed class PyBoundMethod : System.Dynamic.DynamicObject
+    {
+        readonly object _target; readonly string _name;
+        public PyBoundMethod(object target, string name) { _target = target; _name = name; }
+        public object? __call__(object?[] args)
+        {
+            foreach (var m in _target.GetType().GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public))
+            {
+                if (m.Name != _name) continue;
+                var ps = m.GetParameters();
+                bool hasParams = ps.Length > 0 && ps[^1].GetCustomAttributes(typeof(ParamArrayAttribute), false).Length > 0;
+                int fixedCount = hasParams ? ps.Length - 1 : ps.Length;
+                int required = ps.Take(fixedCount).Count(p => !p.IsOptional);
+                if (args.Length < required || !hasParams && args.Length > fixedCount) continue;
+                var call = new object?[ps.Length];
+                for (int i = 0; i < fixedCount; i++) call[i] = i < args.Length ? Convert(args[i], ps[i].ParameterType) : ps[i].DefaultValue;
+                if (hasParams)
+                {
+                    var elem = ps[^1].ParameterType.GetElementType()!;
+                    var rest = Array.CreateInstance(elem, Math.Max(0, args.Length - fixedCount));
+                    for (int i = fixedCount; i < args.Length; i++) rest.SetValue(Convert(args[i], elem), i - fixedCount);
+                    call[^1] = rest;
+                }
+                return m.Invoke(_target, call);
+            }
+            throw new InvalidCastException($"{_name}() does not take {args.Length} arguments");
+        }
+        static object? Convert(object? v, Type t) => v == null || t.IsInstanceOfType(v) || t == typeof(object) ? v : System.Convert.ChangeType(v, Nullable.GetUnderlyingType(t) ?? t, CultureInfo.InvariantCulture);
+        public override bool TryInvoke(System.Dynamic.InvokeBinder binder, object?[]? args, out object? result) { result = __call__(args ?? Array.Empty<object?>()); return true; }
+        public override string ToString() => $"<bound method {_name} of {Builtins.repr(_target)}>";
+    }
+
+    /// <summary>
+    /// obj.__dict__ / vars(obj): a live dict view of an object's attributes (its properties and fields), so
+    /// __dict__.update(state) and __dict__[k] = v set them. Names the class does not declare are kept beside the object.
+    /// </summary>
+    internal sealed class PyAttrDict : IDictionary<string, object?>, IPyRepr
+    {
+        static readonly ConditionalWeakTable<object, OrderedDictionary<string, object?>> Extra = new ConditionalWeakTable<object, OrderedDictionary<string, object?>>();
+        readonly object _o;
+        readonly List<System.Reflection.PropertyInfo> _props;
+        public PyAttrDict(object o)
+        {
+            _o = o;
+            _props = new List<System.Reflection.PropertyInfo>();
+            var seen = new HashSet<string>();
+            // base classes first: their __init__ usually runs first, so that is the order Python assigned the attributes in
+            var chain = new List<Type>();
+            for (var t = o.GetType(); t != null && t != typeof(object) && !(t.Namespace?.StartsWith("System") ?? false); t = t.BaseType) chain.Add(t);
+            chain.Reverse();
+            foreach (var t in chain)
+                foreach (var p in t.GetProperties(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
+                    if (p.GetIndexParameters().Length == 0 && p.CanRead && p.CanWrite && seen.Add(p.Name)) _props.Add(p);
+        }
+        OrderedDictionary<string, object?> Extras => Extra.GetValue(_o, _ => new OrderedDictionary<string, object?>());
+        System.Reflection.PropertyInfo? Prop(string k) => _props.Find(p => p.Name == k);
+
+        public object? this[string key]
+        {
+            get => Prop(key) is { } p ? p.GetValue(_o) : Extras.TryGetValue(key, out var v) ? v : throw new KeyNotFoundException(Builtins.repr(key));
+            set { if (Prop(key) is { } p) p.SetValue(_o, Convert(value, p.PropertyType)); else Extras[key] = value; }
+        }
+        static object? Convert(object? v, Type t) => v == null || t.IsInstanceOfType(v) ? v : t == typeof(object) ? v : System.Convert.ChangeType(v, Nullable.GetUnderlyingType(t) ?? t, CultureInfo.InvariantCulture);
+        public ICollection<string> Keys => _props.Select(p => p.Name).Concat(Extras.Keys).ToList();
+        public ICollection<object?> Values => Keys.Select(k => this[k]).ToList();
+        public int Count => _props.Count + Extras.Count;
+        public bool IsReadOnly => false;
+        public void Add(string key, object? value) => this[key] = value;
+        public void Add(KeyValuePair<string, object?> item) => this[item.Key] = item.Value;
+        public void Clear() => Extras.Clear();
+        public bool Contains(KeyValuePair<string, object?> item) => ContainsKey(item.Key) && Equals(this[item.Key], item.Value);
+        public bool ContainsKey(string key) => Prop(key) != null || Extras.ContainsKey(key);
+        public void CopyTo(KeyValuePair<string, object?>[] array, int arrayIndex) { foreach (var kv in this) array[arrayIndex++] = kv; }
+        public IEnumerator<KeyValuePair<string, object?>> GetEnumerator() { foreach (var k in Keys) yield return new KeyValuePair<string, object?>(k, this[k]); }
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+        public bool Remove(string key) => Extras.Remove(key);
+        public bool Remove(KeyValuePair<string, object?> item) => Extras.Remove(item.Key);
+        public bool TryGetValue(string key, out object? value) { if (ContainsKey(key)) { value = this[key]; return true; } value = null; return false; }
+
+        public void update(object? other)
+        {
+            if (other is IDictionary d) { var en = d.GetEnumerator(); while (en.MoveNext()) this[(string)en.Key] = en.Value; }
+            else if (other is IEnumerable<KeyValuePair<string, object?>> kvs) foreach (var kv in kvs) this[kv.Key] = kv.Value;
+        }
+        public object? get(string key, object? @default = null) => TryGetValue(key, out var v) ? v : @default;
+        public IEnumerable<(string, object?)> items() => Keys.Select(k => (k, this[k]));
+        public IEnumerable<string> keys() => Keys;
+        public IEnumerable<object?> values() => Values;
+        public OrderedDictionary<string, object?> copy() { var r = new OrderedDictionary<string, object?>(); foreach (var kv in this) r[kv.Key] = kv.Value; return r; }
+        public string __repr__() => "{" + string.Join(", ", this.Select(kv => Builtins.repr(kv.Key) + ": " + Builtins.repr(kv.Value))) + "}";
+        public override string ToString() => __repr__();
+    }
+
     internal sealed class AssertionError : Exception
     {
         public AssertionError() : base("assertion failed") { }
@@ -269,6 +445,8 @@ namespace Typhon.Runtime
         }
 
         public static PyFile open(string path, string mode = "r", string? encoding = null) => new PyFile(path, mode);
+        /// <summary>open(path, "rb"/"wb"/...): a binary file (the compiler picks it for a literal mode with 'b').</summary>
+        public static PyBinaryFile open_binary(string path, string mode = "rb") => new PyBinaryFile(path, mode);
 
         // ───────────── str / repr / format ─────────────
 
@@ -821,6 +999,7 @@ namespace Typhon.Runtime
         public static bool @bool(object? o) => truthy(o);
 
         public static long ord(string c) => char.ConvertToUtf32(c, 0);
+        public static long ord(PyBytes b) => b.Count == 1 ? b[0] : throw new InvalidCastException($"ord() expected a character, but string of length {b.Count} found");
         public static long ord(char c) => c;
         public static string chr(long i) => char.ConvertFromUtf32(checked((int)i));
         public static string chr(BigInteger i) => char.ConvertFromUtf32(checked((int)i));
@@ -1116,6 +1295,10 @@ namespace Typhon.Runtime
         }
 
         public static bool contains(string s, string sub) => s.Contains(sub, StringComparison.Ordinal);
+        public static bool contains(PyBytes b, long x) => b.__contains__(x);
+        public static bool contains(PyBytes b, PyBytes x) => b.__contains__(x);
+        public static bool contains(PyByteArray b, long x) => b.__contains__(x);
+        public static bool contains(PyByteArray b, PyBytes x) => b.__contains__(x);
         public static bool contains(string s, char c) => s.IndexOf(c) >= 0;
         public static bool contains<K, V>(Dictionary<K, V> d, K key) where K : notnull => d.ContainsKey(key);
         public static bool contains<K, V>(OrderedDictionary<K, V> d, K key) where K : notnull => d.ContainsKey(key);
@@ -1147,6 +1330,9 @@ namespace Typhon.Runtime
         public static PyRange range(long start, long stop, long step = 1) => new PyRange(start, stop, step);
         public static bool contains(PyRange r, long x) => r.Contains(x);
         public static long len(PyRange r) => r.Length;
+        // (also for a late-bound value: the runtime binder would otherwise try len<T>(T) where T is a tuple and fail)
+        public static long len(PyBytes b) => b.Count;
+        public static long len(PyByteArray b) => b.Count;
 
         // Python iterates a dict over its keys, .NET over KeyValuePairs: every iteration site whose source might be a dict
         // goes through iterable(). The overloads return lists, arrays and sets unchanged (their struct enumerators stay).
@@ -1174,8 +1360,9 @@ namespace Typhon.Runtime
 
         public static T next<T>(IEnumerable<T> xs)
         {
+            if (xs is PyGenerator<T> g) return g.__next__();
             var e = IteratorOf(xs);
-            return e.MoveNext() ? e.Current : throw new InvalidOperationException("StopIteration");
+            return e.MoveNext() ? e.Current : throw new StopIteration();
         }
         public static T next<T>(IEnumerable<T> xs, T @default) { var e = IteratorOf(xs); return e.MoveNext() ? e.Current : @default; }
 
@@ -1294,7 +1481,8 @@ namespace Typhon.Runtime
         public static double sum(IEnumerable<double> xs, double start) => start + sum(xs);
         public static float sum(IEnumerable<float> xs) { float s = 0; foreach (var x in xs) s += x; return s; }
         public static decimal sum(IEnumerable<decimal> xs) { decimal s = 0; foreach (var x in xs) s += x; return s; }
-        public static dynamic sum(IEnumerable<object> xs) { dynamic s = 0; foreach (dynamic x in xs) s += x; return s; }
+        // Python's sum: an int start, bools count as 0 / 1, list + list concatenates (add)
+        public static dynamic sum(IEnumerable<object> xs) { dynamic s = 0L; foreach (object x in xs) s = add(s, x is bool b ? (b ? 1L : 0L) : x); return s; }
 
         public static int min(int a, int b) => Math.Min(a, b);
         public static long min(long a, long b) => Math.Min(a, b);
@@ -1386,6 +1574,67 @@ namespace Typhon.Runtime
         public static List<string> list(string s) => s.Select(c => c.ToString()).ToList();
         public static HashSet<T> set<T>(IEnumerable<T> xs) => new HashSet<T>(xs);
         public static frozenset<T> frozenset<T>(IEnumerable<T> xs) => new frozenset<T>(xs);
+
+        // ───────────── bytes and bytearray ─────────────
+        /// <summary>xs + ys for lists of different item types: one list of both's items.</summary>
+        public static List<dynamic> __concat_any(IEnumerable a, IEnumerable b) => a.Cast<object?>().Concat(b.Cast<object?>()).ToList()!;
+
+        public static PyBytes bytes() => PyBytes.Empty;
+        public static PyBytes bytes(long n) => n < 0 ? throw new ArgumentException("negative count") : new PyBytes(new byte[n]);
+        public static PyBytes bytes(string s, string encoding, string errors = "strict") => s.encode(encoding, errors);
+        public static PyBytes bytes(object? source) => source is PyBytes b ? b : new PyBytes(ByteOps.From(source));
+        public static PyByteArray bytearray() => new PyByteArray();
+        public static PyByteArray bytearray(long n) => n < 0 ? throw new ArgumentException("negative count") : new PyByteArray(new byte[n]);
+        public static PyByteArray bytearray(string s, string encoding, string errors = "strict") => new PyByteArray(s.encode(encoding, errors).Data);
+        public static PyByteArray bytearray(object? source) => new PyByteArray(ByteOps.From(source));
+        public static PyBytes encode(this string s, string encoding = "utf-8", string errors = "strict")
+        {
+            try { return new PyBytes(ByteOps.EncodingOf(encoding, errors).GetBytes(s)); }
+            catch (EncoderFallbackException e) { throw new ArgumentException($"'{encoding}' codec can't encode character: {e.Message}"); }
+        }
+        public static PyBytes fromhex(string s) => PyBytes.fromhex(s);
+        public static PyBytes slice(PyBytes b, long? start, long? stop, long step = 1) => b.Slice(start, stop, step);
+        public static PyByteArray slice(PyByteArray b, long? start, long? stop, long step = 1) => b.Slice(start, stop, step);
+        /// <summary>int.from_bytes(b, "big"/"little", signed=False)</summary>
+        public static long from_bytes(object b, string byteorder = "big", bool signed = false) => (long)from_bytes_big(b, byteorder, signed);
+        public static BigInteger from_bytes_big(object b, string byteorder = "big", bool signed = false) =>
+            new BigInteger(ByteOps.From(b), isUnsigned: !signed, isBigEndian: byteorder == "big");
+        /// <summary>(n).to_bytes(length, "big"/"little", signed=False)</summary>
+        public static PyBytes to_bytes(this long n, long length = 1, string byteorder = "big", bool signed = false) => to_bytes(new BigInteger(n), length, byteorder, signed);
+        public static PyBytes to_bytes(this BigInteger n, long length = 1, string byteorder = "big", bool signed = false)
+        {
+            if (!signed && n.Sign < 0) throw new OverflowException("can't convert negative int to unsigned");
+            var raw = n.ToByteArray(isUnsigned: !signed, isBigEndian: byteorder == "big");
+            if (raw.Length > length) throw new OverflowException("int too big to convert");
+            var r = new byte[length];
+            byte fill = n.Sign < 0 ? (byte)0xff : (byte)0;
+            if (byteorder == "big") { for (int i = 0; i < length - raw.Length; i++) r[i] = fill; Array.Copy(raw, 0, r, length - raw.Length, raw.Length); }
+            else { Array.Copy(raw, r, raw.Length); for (int i = raw.Length; i < length; i++) r[i] = fill; }
+            return new PyBytes(r);
+        }
+
+        // ───────────── coroutines and generators: send() ─────────────
+        /// <summary>
+        /// coro.send(None) on an async def coroutine: Typhon runs coroutines as Tasks, so the first send runs it to completion
+        /// and ends it with StopIteration(result), as CPython does for a coroutine that never suspends on a real future.
+        /// </summary>
+        public static object? send(this Task t, object? value)
+        {
+            t.GetAwaiter().GetResult();
+            throw new StopIteration(null);
+        }
+        public static object? send<T>(this Task<T> t, object? value) => throw new StopIteration(t.GetAwaiter().GetResult());
+        /// <summary>gen.send(None) on a generator without yield expressions: the next value (what is sent is not used).</summary>
+        public static T send<T>(this IEnumerable<T> gen, object? value)
+        {
+            var e = IteratorOf(gen);
+            return e.MoveNext() ? e.Current : throw new StopIteration();
+        }
+        public static void close<T>(this IEnumerable<T> gen) { }
+
+        /// <summary>obj.__dict__ / vars(obj): a live view of the object's attributes.</summary>
+        public static PyAttrDict __dict__(object o) => new PyAttrDict(o);
+        public static PyAttrDict vars(object o) => new PyAttrDict(o);
         public static frozenset<string> frozenset(string s) => new frozenset<string>(chars(s));
         public static frozenset<object> frozenset() => new frozenset<object>();
         public static OrderedDictionary<K, V> dict<K, V>(IEnumerable<(K, V)> xs) where K : notnull { var d = new OrderedDictionary<K, V>(); foreach (var (k, v) in xs) d[k] = v; return d; }

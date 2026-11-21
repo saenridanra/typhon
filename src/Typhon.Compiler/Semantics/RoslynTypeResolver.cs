@@ -90,7 +90,8 @@ namespace Typhon.Compiler.Semantics
                     if (sym.DeclaredAccessibility != Accessibility.Public) continue;
                     switch (sym)
                     {
-                        case IMethodSymbol m when m.MethodKind == MethodKind.Ordinary || m.MethodKind == MethodKind.Constructor:
+                        // (user-defined operators too, looked up by their metadata names: op_Division, ...)
+                        case IMethodSymbol m when m.MethodKind == MethodKind.Ordinary || m.MethodKind == MethodKind.Constructor || m.MethodKind == MethodKind.UserDefinedOperator:
                         {
                             var sig = new MemberSig { IsMethod = true, IsStatic = m.IsStatic, Type = Display(m.ReturnType) };
                             if (m.TypeParameters.Length > 0)

@@ -50,7 +50,7 @@ namespace Typhon.Stdlib
         public static Match? search(string pattern, string @string, long flags = 0) => compile(pattern, flags).search(@string);
         public static Match? match(string pattern, string @string, long flags = 0) => compile(pattern, flags).match(@string);
         public static Match? fullmatch(string pattern, string @string, long flags = 0) => compile(pattern, flags).fullmatch(@string);
-        public static List<object?> findall(string pattern, string @string, long flags = 0) => compile(pattern, flags).findall(@string);
+        public static List<dynamic> findall(string pattern, string @string, long flags = 0) => compile(pattern, flags).findall(@string);
         public static List<string> __findall_s(string pattern, string @string, long flags = 0) => compile(pattern, flags).__findall_s(@string);
         public static List<PyTuple<string>> __findall_t(string pattern, string @string, long flags = 0) => compile(pattern, flags).__findall_t(@string);
         public static IEnumerable<Match> finditer(string pattern, string @string, long flags = 0) => compile(pattern, flags).finditer(@string);
@@ -62,7 +62,7 @@ namespace Typhon.Stdlib
         public static Match? search(Pattern pattern, string @string, long flags = 0) => pattern.search(@string);
         public static Match? match(Pattern pattern, string @string, long flags = 0) => pattern.match(@string);
         public static Match? fullmatch(Pattern pattern, string @string, long flags = 0) => pattern.fullmatch(@string);
-        public static List<object?> findall(Pattern pattern, string @string, long flags = 0) => pattern.findall(@string);
+        public static List<dynamic> findall(Pattern pattern, string @string, long flags = 0) => pattern.findall(@string);
         public static IEnumerable<Match> finditer(Pattern pattern, string @string, long flags = 0) => pattern.finditer(@string);
         public static string sub(Pattern pattern, string repl, string @string, long count = 0, long flags = 0) => pattern.sub(repl, @string, count);
         public static string sub(Pattern pattern, Func<Match, string> repl, string @string, long count = 0, long flags = 0) => pattern.sub(repl, @string, count);
@@ -153,9 +153,9 @@ namespace Typhon.Stdlib
             }
 
             /// <summary>findall: the matches (no group), group 1 (one group), or tuples of all groups ('' for one that did not take part).</summary>
-            public List<object?> findall(string @string, long pos = 0, long? endpos = null)
+            public List<dynamic> findall(string @string, long pos = 0, long? endpos = null)
             {
-                var result = new List<object?>();
+                var result = new List<dynamic>();
                 foreach (var m in All(@string, pos, endpos))
                 {
                     if (groups == 0) result.Add(m.Value);

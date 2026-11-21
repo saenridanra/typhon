@@ -29,8 +29,8 @@
   `collections` (`Counter`, `defaultdict`, `deque`, `OrderedDict`, `namedtuple`), `functools` (`reduce`,
   `cmp_to_key`, `@cache`/`@lru_cache`), `operator`, `string`, `fractions`, `pathlib`, `heapq` (CPython's algorithm,
   so heaps print the same), `bisect`, `copy`, `json` (CPython's output format), `re` (on .NET's regex engine, with
-  Python's syntax, group numbering and `sub`/`split`/`findall` rules), `io.StringIO`, `array`, `tempfile`, `timeit`
-  and `doctest` (`testmod()` runs no examples), compiled
+  Python's syntax, group numbering and `sub`/`split`/`findall` rules), `io.StringIO`, `array`, `struct`, `hashlib`,
+  `tempfile`, `timeit` and `doctest` (`testmod()` runs no examples), plus `bytes`, `bytearray` and binary files, compiled
   *into* every Typhon assembly as internal types — no runtime dependency. Scripts compiled in memory by `typhon run`
   reference a precompiled copy instead (`src/Typhon.Runtime`), which saves recompiling it on every run.
 * **CLI** (`src/Typhon.Cli`): `typhon run` takes the fastest way that is still exact. An unchanged script that ran

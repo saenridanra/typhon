@@ -31,6 +31,8 @@ namespace Typhon.Compiler.Emit
         public readonly Dictionary<string, string> Types = new Dictionary<string, string>();
         public string ReturnType;        // element type for generators, awaited type for async; "void" for none
         public bool IsGenerator;
+        /// <summary>A generator that receives values (x = yield v) or returns one: a PyGenerator whose body reads them.</summary>
+        public bool ReceivesValues;
         public bool IsAsync;
         public bool HasSelf;             // instance method: 'self' → 'this'
         public string ClsName;           // classmethod: 'cls' → class name
@@ -715,9 +717,12 @@ namespace Typhon.Compiler.Emit
             _w.Close();
             // conversions to the delegate types of its known signatures (a Callable[[int], int] parameter, Func<long, long>)
             var delegates = new HashSet<string>();
+            // (a generator's C# type depends on how it is emitted: no conversion; an async function returns a Task)
+            bool isGenerator = AstWalker.ContainsOutsideNestedScopes(f.Body, n => n is YieldExpr);
             void Conversion(List<string> types, string ret)
             {
-                if (types.Count > 15 || types.Concat(new[] { ret }).Any(x => x == null || x.Contains("dynamic") || x.Contains(TypeInference.Pending) || x.Contains(TypeInference.Unknown))) return;
+                if (isGenerator || types.Count > 15 || types.Concat(new[] { ret }).Any(x => x == null || x.Contains("dynamic") || x.Contains(TypeInference.Pending) || x.Contains(TypeInference.Unknown))) return;
+                if (f.IsAsync) ret = ret == "void" ? "global::System.Threading.Tasks.Task" : $"global::System.Threading.Tasks.Task<{ret}>";
                 string d = ret == "void" ? (types.Count == 0 ? "global::System.Action" : $"global::System.Action<{string.Join(", ", types)}>")
                                          : $"global::System.Func<{string.Join(", ", types.Concat(new[] { ret }))}>";
                 if (delegates.Add(d)) _w.Line($"public static implicit operator {d}({cls} _) => {Esc(f.Name)};");
@@ -1060,7 +1065,8 @@ namespace Typhon.Compiler.Emit
         /// member whose signature uses one cannot be public: it becomes internal (C# callers see everything else).
         /// </summary>
         static string SurfaceVisibility(string vis, params string[] signatureParts) =>
-            vis == "public" && signatureParts.Any(p => p != null && (p.Contains("global::Typhon.Runtime.") || p.Contains("global::Typhon.Stdlib.") || p.Contains("." + FnPrefix))) ? "internal" : vis;
+            (vis == "public" || vis == "protected internal" || vis == "protected") &&
+            signatureParts.Any(p => p != null && (p.Contains("global::Typhon.Runtime.") || p.Contains("global::Typhon.Stdlib.") || p.Contains("." + FnPrefix))) ? "internal" : vis;
 
         static string Visibility(string name, bool topLevel)
         {
@@ -1087,7 +1093,7 @@ namespace Typhon.Compiler.Emit
             public string ReturnType;      // full C# return type incl. Task/IEnumerable wrapping
             public string ElementType;     // yield element type / awaited type / plain type
             public string Params;
-            public bool IsGenerator, IsAsync;
+            public bool IsGenerator, IsAsync, ReceivesValues;
             public LocalsResult Locals;
             public Scope Scope;
             /// <summary>Statements at the start of the body (parameters falling back to definition-time defaults).</summary>
@@ -1139,9 +1145,30 @@ namespace Typhon.Compiler.Emit
         void EmitSignatureBody(List<Stmt> body, Signature sig)
         {
             foreach (var kv in sig.Renames) _renames[kv.Key] = kv.Value;
-            EmitFunctionBody(body, sig.Scope, null, sig.Locals, extraPrologue: () => { foreach (var line in sig.Prologue) _w.Line(line); });
+            if (sig.ReceivesValues)
+            {
+                // the generator object, then its body as a local iterator that reads what send() / throw() pass in
+                _w.Open();
+                _w.Line($"var {GenVar} = new {sig.ReturnType}();");
+                _w.Line($"IEnumerable<{sig.ElementType}> __body()");
+                EmitFunctionBody(body, sig.Scope, null, sig.Locals, extraPrologue: () => { foreach (var line in sig.Prologue) _w.Line(line); });
+                _w.Line($"{GenVar}.__start(__body());");
+                _w.Line($"return {GenVar};");
+                _w.Close();
+            }
+            else EmitFunctionBody(body, sig.Scope, null, sig.Locals, extraPrologue: () => { foreach (var line in sig.Prologue) _w.Line(line); });
             foreach (var kv in sig.Renames) _renames.Remove(kv.Key);
         }
+
+        const string PyGeneratorPrefix = "global::Typhon.Runtime.PyGenerator<", GenVar = "__gen";
+
+        /// <summary>
+        /// A generator that uses what is sent in (x = yield v) or returns a value: it needs the generator protocol (send,
+        /// throw, close, StopIteration.value), not just an iterator.
+        /// </summary>
+        static bool GeneratorReceivesValues(List<Stmt> body) => AstWalker.ContainsOutsideNestedScopes(body, n =>
+            n is AssignStmt a && a.Value is YieldExpr ay && !ay.From || n is AnnAssignStmt an && an.Value is YieldExpr ny && !ny.From ||
+            n is ReturnStmt r && r.Value != null && !(r.Value is ConstExpr rc && rc.Kind == ConstKind.None));
 
         Signature BuildSignature(FunctionDef f, bool dropFirst, string selfName = null, string[] paramTypes = null, string retKey = null)
         {
@@ -1150,7 +1177,8 @@ namespace Typhon.Compiler.Emit
             sig.Locals = locals;
             sig.IsGenerator = locals.HasYield;
             sig.IsAsync = f.IsAsync;
-            var scope = new Scope { Locals = locals, IsGenerator = sig.IsGenerator, IsAsync = f.IsAsync, Parent = _scope };
+            sig.ReceivesValues = sig.IsGenerator && !f.IsAsync && GeneratorReceivesValues(f.Body);
+            var scope = new Scope { Locals = locals, IsGenerator = sig.IsGenerator, IsAsync = f.IsAsync, Parent = _scope, ReceivesValues = sig.ReceivesValues };
             sig.Scope = scope;
 
             var ps = new List<string>();
@@ -1273,7 +1301,8 @@ namespace Typhon.Compiler.Emit
             else elem = "void";
 
             sig.ElementType = elem;
-            if (sig.IsGenerator)
+            if (sig.ReceivesValues) sig.ReturnType = $"{PyGeneratorPrefix}{elem}>";
+            else if (sig.IsGenerator)
             {
                 if (sig.ReturnType == null) sig.ReturnType = (f.IsAsync ? "IAsyncEnumerable<" : "IEnumerable<") + elem + ">";
             }
@@ -2080,7 +2109,7 @@ namespace Typhon.Compiler.Emit
                         foreach (var types in baseSigs)
                         {
                             var tps = it.Params.Select((p, i) => $"{(types[i] == TypeInference.Declared ? MapType(p.Annotation, init) : types[i])} {Esc(p.Name)}");
-                            _w.Line($"public {Esc(ctx.Name)}({string.Join(", ", tps)}) : base({string.Join(", ", it.Params.Select(p => Esc(p.Name)))}) {{ }}");
+                            _w.Line($"{SurfaceVisibility("public", string.Join(", ", tps))} {Esc(ctx.Name)}({string.Join(", ", tps)}) : base({string.Join(", ", it.Params.Select(p => Esc(p.Name)))}) {{ }}");
                         }
                         _w.Line();
                         if (!Ti.Fallback.Contains(it.Key)) return;
@@ -2094,7 +2123,7 @@ namespace Typhon.Compiler.Emit
                         // a constructor initializer cannot be dispatched dynamically: late-bound values go as object
                         names.Add(type == "dynamic" ? $"(object?){Esc(p.Name)}" : Esc(p.Name));
                     }
-                    _w.Line($"public {Esc(ctx.Name)}({string.Join(", ", ps)}) : base({string.Join(", ", names)}) {{ }}");
+                    _w.Line($"{SurfaceVisibility("public", string.Join(", ", ps))} {Esc(ctx.Name)}({string.Join(", ", ps)}) : base({string.Join(", ", names)}) {{ }}");
                     _w.Line();
                     return;
                 }
@@ -2202,11 +2231,11 @@ namespace Typhon.Compiler.Emit
                 if (twoPhase)
                 {
                     if (!ctx.NoInitDone) { _w.Line($"private protected {Esc(ctx.Name)}({NoInitType} _){alloc} {{ }}"); ctx.NoInitDone = true; }
-                    _w.Line($"public {Esc(ctx.Name)}({sig.Params}){alloc} {{ __init__({string.Join(", ", f.Params.Skip(1).Select(x => Esc(x.Name)))}); }}");
+                    _w.Line($"{SurfaceVisibility("public", sig.Params)} {Esc(ctx.Name)}({sig.Params}){alloc} {{ __init__({string.Join(", ", f.Params.Skip(1).Select(x => Esc(x.Name)))}); }}");
                     LineDirective(f);
                     _w.Line($"protected {(NearestInitAncestor(ctx.Def) != null ? "new " : "")}void __init__({sig.Params})");
                 }
-                else _w.Line($"public {Esc(ctx.Name)}({sig.Params}){alloc}");
+                else _w.Line($"{SurfaceVisibility("public", sig.Params)} {Esc(ctx.Name)}({sig.Params}){alloc}");
                 EmitSignatureBody(f.Body, sig);
                 return;
             }
@@ -2241,7 +2270,7 @@ namespace Typhon.Compiler.Emit
             EmitDocComment(f.Body);
             LineDirective(f);
             EmitAttributes(f.Decorators);
-            _w.Line($"{Visibility(f.Name, false).Replace("private", "public")} {Esc(ctx.Name)}({sig.Params}){baseCall}");
+            _w.Line($"{SurfaceVisibility(Visibility(f.Name, false).Replace("private", "public"), sig.Params)} {Esc(ctx.Name)}({sig.Params}){baseCall}");
             EmitSignatureBody(body, sig);
         }
 

@@ -1102,7 +1102,16 @@ namespace Typhon.Compiler.Syntax
                 pieces.Add(Cur);
                 _i++;
             }
-            if (anyBytes) throw new SyntaxError("bytes literals are not supported in Typhon yet", tok.Line, tok.Col);
+            if (anyBytes)
+            {
+                // b"..." (adjacent bytes literals concatenate; mixing them with str literals is an error, as in Python)
+                if (pieces.Exists(x => x.Prefix.IndexOf('b') < 0)) throw new SyntaxError("cannot mix bytes and nonbytes literals", tok.Line, tok.Col);
+                var bytesText = new StringBuilder();
+                foreach (var p in pieces) bytesText.Append(Lexer.Decode(p.Text, p.Prefix.IndexOf('r') >= 0));
+                foreach (char ch in bytesText.ToString())
+                    if (ch > 0xff) throw new SyntaxError("bytes can only contain ASCII literal characters", tok.Line, tok.Col);
+                return At(new ConstExpr { Kind = ConstKind.Bytes, Str = bytesText.ToString() }, tok);
+            }
             if (!anyF)
             {
                 var sb = new StringBuilder();

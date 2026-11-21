@@ -1,0 +1,35 @@
+literal: b'Hello, \x00\xff world'
+15 72 100 0 255
+slice: b'Hello'
+step: b'Hlo \xffwrd'
+[97, 98, 99]
+True True False
+upper: b'ABC'
+replace: b'a+b+c'
+split: [b'a', b'b', b'', b'c']
+join: b'x-y-z'
+strip: b'pad'
+2 3 2
+True True True
+café b'caf\xc3\xa9'
+01ab b'\x01\xab\xff'
+from list: b'Hi'
+zeros: b'\x00\x00\x00'
+256 1
+to_bytes: b'\x00\x00\x04\x03'
+b'abcd' b'ababab' True True
+{b'a': 11, b'b': 2} [b'a', b'b']
+bytearray: bytearray(b'Abcdef')
+6 98 b'Abcdef' 102 bytearray(b'Abcde')
++=: bytearray(b'Abcde!!')
+pack: b'\x01\x00\x00\x00\xfe\xff\xff'
+(1, -2, 255) 7 7
+6
+16 (1.5, -2.25) 16
+[(1,), (2,)]
+(256,)
+string: b'ab\x00\x00'
+b'A' b'\x00'
+bb8a448c1e7b1ef9400da3382fce603a
+b1fc1c68a28135561cdb827e85081055da92f15662d9c33466d153b4e8e9a7b4
+16d1e261aefff5999b17fe076c0c7765839b8e29 20

@@ -1,0 +1,75 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: bytes, bytearray, struct and hashlib (binary data with Python's semantics)."""
+
+import hashlib
+import struct
+
+
+def show(label: str, value) -> None:
+    print(f"{label}: {value!r}")
+
+
+# bytes literals, indexing, slicing, iteration
+data = b"Hello, \x00\xff world"
+show("literal", data)
+print(len(data), data[0], data[-1], data[7], data[8])
+show("slice", data[0:5])
+show("step", data[::2])
+print([b for b in b"abc"])
+print(b"lo" in data, 104 in b"hello", b"xyz" in data)
+
+# methods
+show("upper", b"abc".upper())
+show("replace", b"a-b-c".replace(b"-", b"+"))
+show("split", b"a,b,,c".split(b","))
+show("join", b"-".join([b"x", b"y", b"z"]))
+show("strip", b"  pad  ".strip())
+print(b"hello".find(b"l"), b"hello".rfind(b"l"), b"hello".count(b"l"))
+print(b"hello".startswith(b"he"), b"hello".endswith(b"lo"), b"123".isdigit())
+print(b"caf\xc3\xa9".decode("utf-8"), "café".encode("utf-8"))
+print(b"\x01\xab".hex(), bytes.fromhex("01ab ff"))
+
+# conversions
+show("from list", bytes([72, 105]))
+show("zeros", bytes(3))
+print(int.from_bytes(b"\x01\x00", "big"), int.from_bytes(b"\x01\x00", "little"))
+show("to_bytes", (1027).to_bytes(4, "big"))
+print(b"ab" + b"cd", b"ab" * 3, b"abc" == b"abc", b"abc" < b"abd")
+counts = {b"a": 1, b"b": 2}
+counts[b"a"] += 10
+print(counts, sorted({b"b", b"a", b"b"}))
+
+# bytearray: mutable
+buf = bytearray(b"abc")
+buf.append(100)
+buf.extend(b"ef")
+buf[0] = 65
+show("bytearray", buf)
+print(len(buf), buf[1], bytes(buf), buf.pop(), buf)
+buf += b"!!"
+show("+=", buf)
+
+# struct
+packed = struct.pack("<IhB", 1, -2, 255)
+show("pack", packed)
+print(struct.unpack("<IhB", packed), struct.calcsize("<IhB"), struct.calcsize("IhB"))
+a, b, c = struct.unpack(">HHH", b"\x00\x01\x00\x02\x00\x03")
+print(a + b + c)
+point = struct.Struct("<dd")
+raw = point.pack(1.5, -2.25)
+print(point.size, point.unpack(raw), len(raw))
+print(list(struct.iter_unpack("<H", b"\x01\x00\x02\x00")))
+print(struct.unpack_from(">I", b"xx\x00\x00\x01\x00", 2))
+show("string", struct.pack("4s", b"ab"))
+int2byte = struct.Struct(">B").pack
+print(int2byte(65), int2byte(0))
+
+# hashlib
+print(hashlib.md5(b"typhon").hexdigest())
+print(hashlib.sha256(b"typhon").hexdigest())
+h = hashlib.sha1()
+h.update(b"ty")
+h.update(b"phon")
+print(h.hexdigest(), len(h.digest()))

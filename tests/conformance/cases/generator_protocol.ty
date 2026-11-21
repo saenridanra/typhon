@@ -1,0 +1,104 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: the generator protocol (send, throw, close, return values), coroutines driven by send, __dict__ and vars()."""
+
+def averager():
+    total = 0.0
+    count = 0
+    average = 0.0
+    while True:
+        value = yield average
+        if value is None:
+            break
+        total += value
+        count += 1
+        average = total / count
+    return count
+
+
+def echo():
+    received = yield "ready"
+    while received != "stop":
+        received = yield f"got {received}"
+    return "stopped"
+
+
+def countdown(n):
+    while n > 0:
+        yield n
+        n -= 1
+    return "done"
+
+
+async def add(a, b):
+    return a + b
+
+
+async def total(n):
+    s = 0
+    for i in range(n):
+        s += await add(i, i)
+    return s
+
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class Labelled(Point):
+    def __init__(self, x, y, label):
+        super().__init__(x, y)
+        self.label = label
+
+
+if __name__ == "__main__":
+    avg = averager()
+    print(next(avg))
+    print(avg.send(10))
+    print(avg.send(20))
+    print(avg.send(60))
+    try:
+        avg.send(None)
+    except StopIteration as e:
+        print("count", e.value)
+    e = echo()
+    print(next(e))
+    print(e.send(1))
+    print(e.send("two"))
+    print(e.send(3))
+    try:
+        e.send("stop")
+    except StopIteration as st:
+        print(st.value)
+    g = echo()
+    next(g)
+    g.close()
+    try:
+        print(g.throw(ValueError("boom")))
+    except ValueError as err:
+        print("raised", err)
+    c = countdown(3)
+    print(list(c))
+    c2 = countdown(2)
+    print(next(c2), next(c2))
+    try:
+        next(c2)
+    except StopIteration as s:
+        print("stop", s.value)
+    print(sum(countdown(4)))
+    coro = total(4)
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        print("coroutine result", done.value)
+    p = Point(1, 2)
+    print(p.__dict__, vars(p))
+    p.__dict__["x"] = 10
+    print(p.x, sorted(p.__dict__), "y" in p.__dict__)
+    q = Labelled(3, 4, "q")
+    print(q.__dict__)
+    for name, value in vars(q).items():
+        print(name, value)

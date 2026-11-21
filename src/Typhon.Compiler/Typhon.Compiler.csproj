@@ -33,6 +33,7 @@
     <EmbeddedResource Include="Runtime/Modules.cs" LogicalName="Typhon.Compiler.Runtime.Modules.cs" />
     <EmbeddedResource Include="Runtime/Json.cs" LogicalName="Typhon.Compiler.Runtime.Json.cs" />
     <EmbeddedResource Include="Runtime/Regex.cs" LogicalName="Typhon.Compiler.Runtime.Regex.cs" />
+    <EmbeddedResource Include="Runtime/Bytes.cs" LogicalName="Typhon.Compiler.Runtime.Bytes.cs" />
     <None Include="Runtime/**" />
 
     <None Include="build/**" Pack="true" PackagePath="build/" />

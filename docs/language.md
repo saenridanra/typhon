@@ -109,15 +109,18 @@ operator overloading, any other decorator → .NET attribute (`@Obsolete("...")`
 keys), `for/while ... else`, `match`/`case` (PEP 634: literal, capture, sequence, mapping, class and or-patterns,
 guards), the walrus operator `:=`, `except A, B:` (PEP 758), starred unpacking (`a, *rest = xs`, `[*a, *b]`, `f(*args)`,
 `{**d1, **d2}`), slice assignment and `del xs[a:b]`, `del d[key]`/`del xs[i]`, `try/except/else/finally`,
-`raise`, `with` (→ `using`), `async def`/`await`/`async for`/`async with` (→ `Task`), generators (`yield`, `yield from`),
+`raise`, `with` (→ `using`), `async def`/`await`/`async for`/`async with` (→ `Task`), generators (`yield`, `yield from`;
+a generator that receives values, `x = yield v`, or returns one supports `send`, `throw`, `close` and `StopIteration.value`),
+`bytes`/`bytearray` with `struct` and `hashlib`, `obj.__dict__` and `vars(obj)` as live views of an object's attributes,
 lambdas, closures, `global`/`nonlocal`, list/dict/set comprehensions and generator expressions (→ LINQ), f-strings with
 the Python format-spec mini-language and `f"{expr = }"`, tuple unpacking, `if __name__ == "__main__":` (or a `__main__.ty` file) as the
 entry point, `asyncio.run(...)` to call async code from synchronous code.
 
 ## Not supported yet / known gaps
 
-`del` of names/attributes, bytes and `bytearray`, complex, metaclasses, `decimal`, `__dict__`, generator `.send()`,
-`eval`/`exec`/`setattr` and other runtime reflection on Python objects, multiple inheritance of classes, static methods
+`del` of names/attributes, complex, metaclasses, `decimal`, `yield` inside a `try` block that has an `except` clause
+(a C# iterator limit), `yield` inside a larger expression (`print((yield))`), `eval`/`exec`/`setattr` and other runtime
+reflection on Python objects, multiple inheritance of classes, static methods
 on generic classes need explicit type arguments (`Stack[int].of(...)`), .NET `out`/`ref` parameters (planned: tuple
 returns like IronPython), ints beyond 64 bits outside big-int mode (`OverflowError`), exact comparison of an int with a
 float past 2**53 (they compare as floats), `doctest` examples (`testmod()` runs none). Union types other than

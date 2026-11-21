@@ -1,0 +1,22 @@
+0.0
+10.0
+15.0
+30.0
+count 3
+ready
+got 1
+got two
+got 3
+stopped
+raised boom
+[3, 2, 1]
+2 1
+stop done
+10
+coroutine result 12
+{'x': 1, 'y': 2} {'x': 1, 'y': 2}
+10 ['x', 'y'] True
+{'x': 3, 'y': 4, 'label': 'q'}
+x 3
+y 4
+label q

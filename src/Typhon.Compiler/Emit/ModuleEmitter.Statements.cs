@@ -136,7 +136,7 @@ namespace Typhon.Compiler.Emit
                         string t = NewTmp("y");
                         _w.Line($"foreach (var {t} in {EmitExpr(y.Value)}) yield return {t};");
                     }
-                    else _w.Line($"yield return {(y.Value == null ? "default" : _scope?.ReturnType == "dynamic" ? EmitValue(y.Value) : EmitExpr(y.Value, targetTyped: true))};");
+                    else EmitYieldValue(y);
                     return;
                 case CallExpr _:
                 case AwaitExpr _:
@@ -181,8 +181,26 @@ namespace Typhon.Compiler.Emit
             if (_scope != null && type != null) _scope.Types[name] = type;
         }
 
+        /// <summary>yield v; in a generator that receives values, then what was sent in (or thrown in) when it resumes.</summary>
+        string EmitYieldValue(YieldExpr y)
+        {
+            _w.Line($"yield return {(y.Value == null ? "default!" : _scope?.ReturnType == "dynamic" ? EmitValue(y.Value) : EmitExpr(y.Value, targetTyped: true))};");
+            if (_scope == null || !_scope.ReceivesValues) return null;
+            string sent = NewTmp("sent");
+            _w.Line($"dynamic {sent} = {GenVar}.__resume();");
+            SetType(sent, "dynamic");
+            return sent;
+        }
+
         void EmitAssign(AssignStmt a)
         {
+            // x = yield v: the value send() passes in (late-bound: a generator can be sent anything)
+            if (a.Value is YieldExpr ay && !ay.From && _scope != null && _scope.ReceivesValues)
+            {
+                string sent = EmitYieldValue(ay);
+                foreach (var t in a.Targets) EmitAssignTo(t, new NameExpr { Id = sent, Line = a.Line, Col = a.Col }, a);
+                return;
+            }
             if (a.Value is YieldExpr) { Unsupported(a, "using 'yield' as an expression"); return; }
             if (a.Targets.Count == 1) { EmitAssignTo(a.Targets[0], a.Value, a); return; }
             string tmp = NewTmp();
@@ -222,11 +240,24 @@ namespace Typhon.Compiler.Emit
             return false;
         }
 
+        /// <summary>obj.name where obj is a .NET (or runtime) object and name one of its methods, not a property or field.</summary>
+        bool IsDotNetMethod(AttributeExpr a)
+        {
+            string t = InferType(a.Target);
+            if (t == null || t == "dynamic" || ClassKeyOfType(t, out _) != null) return false;
+            var meta = DotNetMeta(t);
+            if (meta == null) return false;
+            var members = _r.GetMembers(meta, a.Name);
+            return members.Count > 0 && members.All(m => m.IsMethod && !m.IsStatic);
+        }
+
         /// <summary>A function name being assigned to a variable (its function type is kept).</summary>
         bool _fnTypedUse;
 
         void EmitAssignToName(NameExpr n, Expr value, Stmt stmt, string rawValue)
         {
+            // f = obj.method of a .NET object: a callable bound method (a method group has no type C# can store here)
+            if (rawValue == null && value is AttributeExpr bm && IsDotNetMethod(bm)) rawValue = $"(dynamic)new global::Typhon.Runtime.PyBoundMethod((object){Paren(EmitExpr(bm.Target))}, {CsString(bm.Name)})";
             if (rawValue == null && RegexLiteral(value, out var rxPattern, out var rxFlags)) _regexLocals[n.Id] = (rxPattern, rxFlags);
             else _regexLocals.Remove(n.Id);
             {
@@ -250,7 +281,12 @@ namespace Typhon.Compiler.Emit
                             char kind = TypeInference.ContainerKind(value);
                             _emptyContainers[n.Id] = kind;
                             string t = EmptyContainerType(_scopeKey + "|" + n.Id, kind, value);
-                            if (t == null || t.Contains("dynamic") && "lsd".IndexOf(kind) >= 0) { _w.Line($"var {Esc(name)} = {EmitExpr(value)};"); SetType(n.Id, InferType(value)); }
+                            if (t == null || t.Contains("dynamic") && "lsd".IndexOf(kind) >= 0)
+                            {
+                                _w.Line($"var {Esc(name)} = {EmitExpr(value)};");
+                                // what that emits: a container of dynamic values ([] / {} / set())
+                                SetType(n.Id, InferType(value) ?? (value is ListExpr ? "List<dynamic>" : value is DictExpr ? "OrderedDictionary<dynamic, dynamic>" : null));
+                            }
                             else { _w.Line($"{t} {Esc(name)} = {EmitEmptyContainer(value, t, kind)};"); SetType(n.Id, t); }
                             if (t != null && t.Contains(TypeInference.Pending)) SetType(n.Id, t);
                         }
@@ -275,10 +311,17 @@ namespace Typhon.Compiler.Emit
                             _w.Line($"{IntT} {Esc(name)} = {EmitExpr(value)};");
                             SetType(n.Id, IntT);
                         }
+                        else if (rawValue == null && IsDynamicallyDispatched(value) && PyType(inferred) is string known && !IsUnknownType(known) && known != "object")
+                        {
+                            // a call with a late-bound argument is dynamic to C#: the variable takes the type Typhon knows
+                            _w.Line($"{known} {Esc(name)} = {EmitValue(value)};");
+                            SetType(n.Id, known);
+                        }
                         else
                         {
                             _w.Line($"var {Esc(name)} = {rawValue ?? EmitValue(value)};");
-                            SetType(n.Id, inferred);
+                            // (a call dispatched dynamically whose result Typhon does not know: dynamic, as C# sees it)
+                            SetType(n.Id, inferred ?? (rawValue == null && IsDynamicallyDispatched(value) ? "dynamic" : null));
                         }
                     }
                     else
@@ -706,7 +749,8 @@ namespace Typhon.Compiler.Emit
                 // (items of another type, e.g. List<dynamic> += List<long>: converted one by one)
                 string te = ElementTypeOf(tt), ve = a.Value is ConstExpr vs && vs.Kind == ConstKind.Str || vt == "string" ? "string" : ElementTypeOf(vt);
                 bool cast = te != null && ve != null && te != ve && ve != TypeInference.Pending && te != TypeInference.Pending;
-                _w.Line(cast ? $"{Rt("__extend_cast")}({target}, {EmitIterable(a.Value)});" : $"{target}.extend({EmitIterable(a.Value)});");
+                // the static call: an extension method cannot be dispatched dynamically (a late-bound value in the list)
+                _w.Line(cast ? $"{Rt("__extend_cast")}({target}, {EmitIterable(a.Value)});" : $"global::Typhon.Runtime.Builtins.extend({target}, {EmitIterable(a.Value)});");
             }
             else if (a.Op == "+" && tt == "dynamic" && !IsNumeric(vt)) _w.Line($"{target} = {Rt("__iadd")}({target}, {value});");
             else _w.Line($"{target} {a.Op}= {value};");
@@ -745,7 +789,12 @@ namespace Typhon.Compiler.Emit
         {
             if (_scope != null && _scope.IsGenerator)
             {
-                if (r.Value != null) Unsupported(r, "returning a value from a generator");
+                // return v: the value StopIteration carries (next(), send(), yield from)
+                if (r.Value != null && !IsNone(r.Value))
+                {
+                    if (_scope.ReceivesValues) _w.Line($"{GenVar}.__return = (object?){Paren(EmitValue(r.Value))};");
+                    else Unsupported(r, "returning a value from a generator");
+                }
                 _w.Line("yield break;");
                 return;
             }
@@ -763,13 +812,39 @@ namespace Typhon.Compiler.Emit
             {
                 if (TryTypeExpr(r.Exc, out var typeCode)) { _w.Line($"throw new {typeCode}();"); return; }
             }
+            // raise "message" (Python 2): a TypeError when it runs, as in Python 3
+            string et = InferType(r.Exc);
+            if (et == "string" || et != null && (IsIntegral(et) || et == "double" || et == "bool"))
+            {
+                _w.Line("throw new global::System.InvalidCastException(\"exceptions must derive from BaseException\");");
+                return;
+            }
             _w.Line($"throw {EmitExpr(r.Exc)};");
         }
 
         void EmitIf(IfStmt i, bool isElif)
         {
-            _w.Line($"{(isElif ? "else if" : "if")} ({Cond(i.Test)})");
-            EmitBlock(i.Body, narrowed: NarrowedBy(i.Test, whenTrue: true));
+            // if isinstance(x, C): in the block, x is a C (a pattern variable of that type)
+            if (IsInstanceNarrowing(i.Test, i.Body, out var nn, out var ncls))
+            {
+                string pv = NewTmp(nn.Id + "_");
+                _w.Line($"{(isElif ? "else if" : "if")} ((object?){Paren(EmitName(nn))} is {ncls} {pv})");
+                bool hadRename = _renames.TryGetValue(nn.Id, out var oldRename);
+                bool hadType = _scope.Types.TryGetValue(nn.Id, out var oldType);
+                _renames[nn.Id] = pv;
+                _scope.Types[nn.Id] = ncls;
+                try { EmitBlock(i.Body); }
+                finally
+                {
+                    if (hadRename) _renames[nn.Id] = oldRename; else _renames.Remove(nn.Id);
+                    if (hadType) _scope.Types[nn.Id] = oldType; else _scope.Types.Remove(nn.Id);
+                }
+            }
+            else
+            {
+                _w.Line($"{(isElif ? "else if" : "if")} ({Cond(i.Test)})");
+                EmitBlock(i.Body, narrowed: NarrowedBy(i.Test, whenTrue: true));
+            }
             if (i.OrElse.Count == 1 && i.OrElse[0] is IfStmt elif)
             {
                 LineDirective(elif);
@@ -780,6 +855,20 @@ namespace Typhon.Compiler.Emit
                 _w.Line("else");
                 EmitBlock(i.OrElse, narrowed: NarrowedBy(i.Test, whenTrue: false));
             }
+        }
+
+        /// <summary>isinstance(name, Cls) with one Typhon or .NET class, on a variable the block does not assign.</summary>
+        bool IsInstanceNarrowing(Expr test, List<Stmt> body, out NameExpr name, out string type)
+        {
+            name = null; type = null;
+            if (!(test is CallExpr c && c.Func is NameExpr f && f.Id == "isinstance" && !IsShadowed("isinstance") && c.Args.Count == 2 &&
+                  c.Args[0].Value is NameExpr n && c.Args[1].Value is NameExpr cls && IsLocal(n.Id) && !AssignsName(body, n.Id))) return false;
+            if (!TryResolveType(cls.Id, 0, out _, out var pyClass) || pyClass == null || pyClass.TypeParams.Count > 0) return false;
+            string current = KnownType(n.Id);
+            type = MapType(cls, test);
+            if (type == null || current == type) return false;
+            name = n;
+            return true;
         }
 
         /// <summary>
@@ -937,7 +1026,9 @@ namespace Typhon.Compiler.Emit
 
             // a list iterates by position, like Python's list iterator: the body may append to it or assign its items
             string iterType = f.IsAsync ? null : InferType(f.Iter);
-            if (iterType != null && iterType.StartsWith("List<") && (f.Target is NameExpr || f.Target is TupleExpr tt0 && tt0.Elts.All(e => e is NameExpr)))
+            // (items unpacked into names: only items C# can deconstruct, not late-bound ones)
+            if (iterType != null && iterType.StartsWith("List<") &&
+                (f.Target is NameExpr || f.Target is TupleExpr tt0 && tt0.Elts.All(e => e is NameExpr) && !IsUnknownType(ElementTypeOf(iterType))))
             {
                 string list = NewTmp("l"), idx = NewTmp("i");
                 _w.Line($"var {list} = {EmitExpr(f.Iter)};");

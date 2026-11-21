@@ -17,7 +17,7 @@ namespace Typhon.Compiler.Syntax
 
     public sealed class NameExpr : Expr { public string Id; }
 
-    public enum ConstKind { Int, Float, Str, Bool, None, Ellipsis }
+    public enum ConstKind { Int, Float, Str, Bool, None, Ellipsis, Bytes }
 
     public sealed class ConstExpr : Expr
     {

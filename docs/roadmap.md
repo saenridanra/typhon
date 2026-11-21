@@ -3,7 +3,7 @@
 The [status page](https://typhon-lang.com/status) explains the principles behind these and what they cost.
 
 * C# 15 union types for `A | B` annotations (canonicalized, one generated union per member set)
-* `out`/`ref` parameters as tuple returns, `**kwargs`
+* `out`/`ref` parameters as tuple returns
 * A faster big-int mode: a hybrid int (64-bit fast path, BigInteger only on overflow) instead of BigInteger everywhere
 * `decimal` with a precision context; running `doctest` examples; compiling more of CPython's pure-Python stdlib
 * Grow the conformance suite (port relevant parts of CPython's own test suite)
