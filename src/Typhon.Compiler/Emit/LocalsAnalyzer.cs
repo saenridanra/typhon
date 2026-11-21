@@ -25,6 +25,8 @@ namespace Typhon.Compiler.Emit
         public readonly Dictionary<string, List<Expr>> HoistedValues = new Dictionary<string, List<Expr>>();
         /// <summary>Hoisted variables bound inside expressions or patterns (walrus, match captures): their values, null when unknown.</summary>
         public readonly Dictionary<string, List<Expr>> HoistedCaptures = new Dictionary<string, List<Expr>>();
+        /// <summary>Hoisted variables bound only by plain assignments (name = value): their type can come from what is assigned.</summary>
+        public readonly HashSet<string> HoistedPlain = new HashSet<string>();
         public readonly Dictionary<string, Expr> Annotations = new Dictionary<string, Expr>();
         public readonly HashSet<string> AllLocals = new HashSet<string>();
         public readonly HashSet<string> Globals = new HashSet<string>();
@@ -362,6 +364,9 @@ namespace Typhon.Compiler.Emit
                                                     .Select(o => (ForStmt)o.Stmt).Distinct().ToList();
                     _r.HoistedValues[name] = occs.Where(o => (o.Kind == Kind.DeclStore || o.Kind == Kind.ExprStore) && o.Value != null).Select(o => o.Value).ToList();
                     if (occs.Any(o => o.Kind == Kind.ExprStore)) _r.HoistedCaptures[name] = occs.Where(o => o.Kind == Kind.ExprStore).Select(o => o.Value).ToList();
+                    if (ann == null && occs.All(o => o.Kind == Kind.Load || o.Kind == Kind.DeclStore && o.Value != null && o.Stmt is AssignStmt pa &&
+                                                     pa.Targets.All(t => t is NameExpr tn && tn.Id == name)))
+                        _r.HoistedPlain.Add(name);
                 }
             }
         }

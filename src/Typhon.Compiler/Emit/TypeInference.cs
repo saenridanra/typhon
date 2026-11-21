@@ -46,6 +46,36 @@ namespace Typhon.Compiler.Emit
         /// </summary>
         public readonly Dictionary<string, string> Conflicts = new Dictionary<string, string>();
 
+        /// <summary>Types assigned to locals that are declared ahead of their first assignment (assigned in a nested block): "scope|name" → types.</summary>
+        public readonly Dictionary<string, List<string>> Hoisted = new Dictionary<string, List<string>>();
+
+        /// <summary>
+        /// Attributes created from outside a class: "ClassKey|attr" (obj.attr = v on an instance) or "ClassKey|static|attr"
+        /// (Cls.ATTR = v, also for a class variable declared as None) → the assigned types.
+        /// </summary>
+        public readonly Dictionary<string, List<string>> ExternalFields = new Dictionary<string, List<string>>();
+
+        public void AddExternal(string key, string type)
+        {
+            if (!ExternalFields.TryGetValue(key, out var list)) ExternalFields[key] = list = new List<string>();
+            list.Add(TypeInference.Settled(type ?? TypeInference.Unknown));
+        }
+
+        /// <summary>Calls of a lambda bound to a local name: "scope|λname" → the argument types of each call.</summary>
+        public readonly Dictionary<string, List<string[]>> LambdaCalls = new Dictionary<string, List<string[]>>();
+
+        public void AddLambdaCall(string key, string[] types)
+        {
+            if (!LambdaCalls.TryGetValue(key, out var list)) LambdaCalls[key] = list = new List<string[]>();
+            list.Add(types);
+        }
+
+        public void AddHoisted(string key, string type)
+        {
+            if (!Hoisted.TryGetValue(key, out var list)) Hoisted[key] = list = new List<string>();
+            list.Add(TypeInference.Settled(type ?? TypeInference.Unknown));
+        }
+
         public void AddConflict(string key, string type)
         {
             if (!Conflicts.TryGetValue(key, out var t) || t != "dynamic") Conflicts[key] = type;
@@ -86,7 +116,7 @@ namespace Typhon.Compiler.Emit
         public const string NoneType = "None";
         /// <summary>Placeholder in a signature tuple for an annotated parameter (its declared type is used).</summary>
         public const string Declared = "@";
-        const int MaxPasses = 8, MaxOverloads = 6;
+        const int MaxPasses = 40, MaxOverloads = 6;
 
         public readonly Dictionary<string, InferenceTarget> Targets = new Dictionary<string, InferenceTarget>();
         public Dictionary<string, List<string[]>> Signatures = new Dictionary<string, List<string[]>>();
@@ -98,6 +128,12 @@ namespace Typhon.Compiler.Emit
         public Dictionary<string, string> Elements = new Dictionary<string, string>();
         /// <summary>Variables that need a wider type than their first value has (see Observations.Conflicts); kept across passes.</summary>
         public Dictionary<string, string> Conflicts = new Dictionary<string, string>();
+        /// <summary>The type of each local declared ahead of its first assignment, when all its assignments agree ("dynamic" otherwise).</summary>
+        public Dictionary<string, string> Hoisted = new Dictionary<string, string>();
+        /// <summary>The type of each attribute created from outside its class (see Observations.ExternalFields).</summary>
+        public Dictionary<string, string> ExternalFields = new Dictionary<string, string>();
+        /// <summary>The parameter types of a lambda bound to a local name, when all its calls agree.</summary>
+        public Dictionary<string, string[]> LambdaSigs = new Dictionary<string, string[]>();
         public Observations Obs;
         public int Passes;
         public bool Converged;
@@ -116,7 +152,7 @@ namespace Typhon.Compiler.Emit
             var ti = new TypeInference();
             p.Inference = ti;
             ti.CollectTargets(p);
-            if (ti.Targets.Count == 0 && !p.Modules.Values.Any(m => HasEmptyContainers(m) || HasRebinding(m))) { ti.Converged = true; return; }
+            if (ti.Targets.Count == 0 && !p.Modules.Values.Any(m => HasEmptyContainers(m) || HasRebinding(m) || HasLambdaLocals(m))) { ti.Converged = true; return; }
             for (int pass = 0; pass < MaxPasses; pass++)
             {
                 ti.Passes = pass + 1;
@@ -127,19 +163,50 @@ namespace Typhon.Compiler.Emit
                     try { new ModuleEmitter(m, p, new List<TyDiagnostic>(), dryRun: true).Emit(); }
                     catch (Exception) { /* the real emission reports the problem */ }
                 }
+                var before = ti.Snapshot();
                 bool changed = ti.Derive();
+#pragma warning disable RS1035
+                if (changed && Environment.GetEnvironmentVariable("TYPHON_INFER_DEBUG") == "1")
+#pragma warning restore RS1035
+                    foreach (var line in ti.Snapshot().Except(before)) Console.Error.WriteLine($"[infer] pass {pass + 1} + {line}");
                 ti.Obs = null;
                 if (!changed) { ti.Converged = true; break; }
             }
+#pragma warning disable RS1035 // a developer switch, read by the CLI process only
+            if (Environment.GetEnvironmentVariable("TYPHON_INFER_DEBUG") == "1")
+#pragma warning restore RS1035
+            {
+                Console.Error.WriteLine($"[infer] passes={ti.Passes} converged={ti.Converged}");
+                foreach (var kv in ti.Signatures) Console.Error.WriteLine($"[infer] sig {kv.Key}: {string.Join(" | ", kv.Value.Select(SigKey))}");
+                foreach (var kv in ti.Returns) Console.Error.WriteLine($"[infer] ret {kv.Key} = {kv.Value}");
+                Console.Error.WriteLine($"[infer] fallback: {string.Join(", ", ti.Fallback)}");
+                foreach (var kv in ti.Hoisted) Console.Error.WriteLine($"[infer] hoisted {kv.Key} = {kv.Value}");
+                foreach (var kv in ti.Conflicts) Console.Error.WriteLine($"[infer] conflict {kv.Key} = {kv.Value}");
+            }
             if (!ti.Converged)
             {
-                ti.Signatures.Clear(); ti.Fallback.Clear(); ti.Returns.Clear(); ti.Fields.Clear(); ti.MethodReturns.Clear(); ti.Elements.Clear();
+                ti.Signatures.Clear(); ti.Fallback.Clear(); ti.Returns.Clear(); ti.Fields.Clear(); ti.MethodReturns.Clear(); ti.Elements.Clear(); ti.Hoisted.Clear(); ti.ExternalFields.Clear(); ti.LambdaSigs.Clear();
             }
+        }
+
+        HashSet<string> Snapshot()
+        {
+            var r = new HashSet<string>();
+            foreach (var kv in Signatures) r.Add($"sig {kv.Key}: {string.Join(" | ", kv.Value.Select(SigKey).OrderBy(x => x, StringComparer.Ordinal))}");
+            foreach (var kv in Returns) r.Add($"ret {kv.Key} = {kv.Value}");
+            foreach (var kv in Elements) r.Add($"elem {kv.Key} = {kv.Value}");
+            foreach (var kv in Hoisted) r.Add($"hoisted {kv.Key} = {kv.Value}");
+            foreach (var kv in ExternalFields) r.Add($"external {kv.Key} = {kv.Value}");
+            foreach (var kv in Conflicts) r.Add($"conflict {kv.Key} = {kv.Value}");
+            foreach (var f in Fallback) r.Add($"fallback {f}");
+            foreach (var kv in Fields) foreach (var f in kv.Value) r.Add($"field {kv.Key}.{f.Key} = {f.Value}");
+            return r;
         }
 
         /// <summary>[] / {} / set() / list() / dict(): a container whose element type comes from what is added to it later.</summary>
         public static bool IsEmptyContainer(Expr e)
         {
+            if (IsNonePlaceholder(e)) return true;
             if (e is ListExpr l) return l.Elts.Count == 0;
             if (e is DictExpr d) return d.Keys.Count == 0;
             if (!(e is CallExpr c)) return false;
@@ -154,6 +221,15 @@ namespace Typhon.Compiler.Emit
                 default: return false;
             }
         }
+
+        /// <summary>[None] * n (or n * [None]): a list of placeholders, typed (nullable) by what is stored into it later.</summary>
+        public static bool IsNonePlaceholder(Expr e) =>
+            e is BinOpExpr b && b.Op == "*" && (IsNoneList(b.Left) || IsNoneList(b.Right)) ||
+            // [None for _ in range(n)]
+            e is ComprehensionExpr c && c.Kind == ComprehensionKind.List && c.Elt is ConstExpr ce && ce.Kind == ConstKind.None &&
+            c.Generators.Count == 1 && c.Generators[0].Ifs.Count == 0 && !c.Generators[0].IsAsync;
+
+        static bool IsNoneList(Expr e) => e is ListExpr l && l.Elts.Count == 1 && l.Elts[0] is ConstExpr c && c.Kind == ConstKind.None;
 
         /// <summary>The kind of an empty container: l(ist), s(et), d(ict), c(ounter), q (deque), o(rdered dict), D (defaultdict).</summary>
         public static char ContainerKind(Expr e)
@@ -198,6 +274,14 @@ namespace Typhon.Compiler.Emit
             return found;
         }
 
+        /// <summary>name = lambda ...: its parameter types come from the calls (a dry run records them).</summary>
+        static bool HasLambdaLocals(ModuleInfo m)
+        {
+            bool found = false;
+            if (m.Ast != null) AstWalker.VisitAll(m.Ast.Body, n => { if (n is AssignStmt a && a.Value is LambdaExpr) found = true; });
+            return found;
+        }
+
         static bool HasEmptyContainers(ModuleInfo m)
         {
             bool found = false;
@@ -217,9 +301,11 @@ namespace Typhon.Compiler.Emit
             }
             var known = seen.Where(x => x != Pending).ToList();
             if (known.Count == 0) return null;
-            if (known.Any(x => IsUnknown(x) || x == NoneType)) return "dynamic";
+            // None among the elements: the others' type, nullable ([None] * n filled later, xs.append(None))
+            bool none = known.RemoveAll(x => x == NoneType) > 0;
+            if (known.Count == 0 || known.Any(IsUnknown)) return "dynamic";
             var distinct = known.Distinct().ToList();
-            if (distinct.Count == 1) return distinct[0];
+            if (distinct.Count == 1) return none && IsValueType(distinct[0]) && !distinct[0].EndsWith("?") ? distinct[0] + "?" : distinct[0];
             if (distinct.All(x => x == "long" || x == "double")) return "double";
             if (distinct.All(x => x == "long" || x == BigInt)) return BigInt; // big-int mode: machine ints and Python ints
             return "dynamic";
@@ -234,7 +320,8 @@ namespace Typhon.Compiler.Emit
             {
                 if (m.ParseDiagnostics.Count > 0) continue;
                 foreach (var f in m.Ast.Body.OfType<FunctionDef>())
-                    Add(m, null, f, allowParams: !usedAsValue.Contains(f.Name) && f.Decorators.All(IsCacheDecorator));
+                    // a function used as a value has a function type: calls through it are seen (and other uses keep its dynamic version)
+                    Add(m, null, f, allowParams: (!usedAsValue.Contains(f.Name) || ModuleEmitter.IsFunctionValueCandidate(f)) && f.Decorators.All(IsCacheDecorator));
                 foreach (var c in m.Classes.Values)
                 {
                     if (IsSpecialClass(c)) continue;
@@ -377,9 +464,40 @@ namespace Typhon.Compiler.Emit
 
             var elements = new Dictionary<string, string>();
             foreach (var kv in Obs.Elements) if (UnifyElements(kv.Value) is string u) elements[kv.Key] = u;
+            var external = new Dictionary<string, string>();
+            foreach (var kv in Obs.ExternalFields) if (UnifyElements(kv.Value) is string ext) external[kv.Key] = ext;
+            var lambdaSigs = new Dictionary<string, string[]>();
+            foreach (var kv in Obs.LambdaCalls)
+            {
+                var calls = kv.Value.Where(c => c != null).ToList();
+                if (calls.Count == 0 || calls.Count != kv.Value.Count || calls.Any(c => c.Length != calls[0].Length)) continue;
+                var sig = new string[calls[0].Length];
+                bool ok = true;
+                for (int i = 0; i < sig.Length && ok; i++)
+                {
+                    var ts = calls.Select(c => c[i]).Distinct().ToList();
+                    if (ts.Any(t => IsUnknown(t) || t.Contains(Pending))) ok = false;
+                    else if (ts.Count == 1) sig[i] = ts[0];
+                    else if (ts.All(t => t == "long" || t == "double")) sig[i] = "double";
+                    else ok = false;
+                }
+                if (ok) lambdaSigs[kv.Key] = sig;
+            }
+            var hoisted = new Dictionary<string, string>();
+            foreach (var kv in Obs.Hoisted)
+            {
+                var known = kv.Value.Where(x => x != Pending).Distinct().ToList();
+                if (known.Count == 0) continue;
+                hoisted[kv.Key] = known.Count == 1 && !IsUnknown(known[0]) && known[0] != NoneType ? known[0] : "dynamic";
+            }
             bool changed = !SameSigs(sigs, Signatures) || !live.SetEquals(Fallback) || !SameMap(returns, Returns) ||
-                           !SameNested(Obs.Fields, Fields) || !SameNested(Obs.MethodReturns, MethodReturns) || !SameMap(elements, Elements);
+                           !SameNested(Obs.Fields, Fields) || !SameNested(Obs.MethodReturns, MethodReturns) || !SameMap(elements, Elements) ||
+                           !SameMap(hoisted, Hoisted) || !SameMap(external, ExternalFields) ||
+                           lambdaSigs.Count != LambdaSigs.Count || lambdaSigs.Any(kv => !LambdaSigs.TryGetValue(kv.Key, out var o) || SigKey(o) != SigKey(kv.Value));
             Elements = elements;
+            Hoisted = hoisted;
+            ExternalFields = external;
+            LambdaSigs = lambdaSigs;
             // conflicts only grow: a variable made wider stays so (else the next pass would no longer see the conflict)
             foreach (var kv in Obs.Conflicts)
                 if (!Conflicts.TryGetValue(kv.Key, out var had) || had != kv.Value && had != "dynamic") { Conflicts[kv.Key] = kv.Value; changed = true; }

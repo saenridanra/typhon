@@ -49,6 +49,7 @@ namespace Typhon.Compiler.Emit
         public readonly HashSet<string> TypeParams = new HashSet<string>();
         public string IterElementType;
         public readonly Dictionary<string, string> MethodReturnTypes = new Dictionary<string, string>();
+        public bool NoInitDone;
     }
 
     internal sealed partial class ModuleEmitter
@@ -122,6 +123,8 @@ namespace Typhon.Compiler.Emit
                 string v = kind == 'c' ? "long" : kv[1] == "dynamic" && factoryValue != null && !factoryValue.Contains(TypeInference.Pending) ? factoryValue : kv[1];
                 return ContainerOf(kv[0], v);
             }
+            // [None] * n: its items start as None, so a value type is nullable
+            if (value != null && TypeInference.IsNonePlaceholder(value) && IsValueTypeName(elem) && !elem.EndsWith("?")) elem += "?";
             return ContainerOf(elem, null);
         }
 
@@ -161,8 +164,20 @@ namespace Typhon.Compiler.Emit
                         : $"() => new {kv[1]}()";
                     return $"new {type}({make}, {CsString(name)})";
                 }
-                default: return EmitExpr(value, targetTyped: true);
+                default:
+                    if (TypeInference.IsNonePlaceholder(value)) return EmitNonePlaceholder(value, type);
+                    return EmitExpr(value, targetTyped: true);
             }
+        }
+
+        /// <summary>[None] * n as a List&lt;T&gt; of n nulls.</summary>
+        string EmitNonePlaceholder(Expr value, string listType)
+        {
+            if (value is ComprehensionExpr c)
+                return $"global::System.Linq.Enumerable.ToList(global::System.Linq.Enumerable.Select({EmitIterable(c.Generators[0].Iter)}, __x => ({GenericArg(listType)})default!))";
+            var b = (BinOpExpr)value;
+            Expr count = b.Left is ListExpr ? b.Right : b.Left;
+            return $"{Rt("__repeat")}(new {listType} {{ default! }}, {EmitExpr(count)})";
         }
 
         /// <summary>A dry run only records observations for <see cref="TypeInference"/>; its output is discarded.</summary>
@@ -277,11 +292,16 @@ namespace Typhon.Compiler.Emit
         string InferredCallType(CallExpr call)
         {
             var t = CallTarget(call, out bool isCtor);
-            if (t == null || isCtor || t.Def.Returns != null && !TypeInference.IsBareContainer(t.Def.Returns) || t.Def.IsAsync) return null;
+            return isCtor ? null : InferredCallType(t, call.Args);
+        }
+
+        string InferredCallType(InferenceTarget t, List<Arg> args)
+        {
+            if (t == null || t.Def.Returns != null && !TypeInference.IsBareContainer(t.Def.Returns) || t.Def.IsAsync) return null;
             string sig = "";
             if (t.InferParams)
             {
-                var types = ArgTypes(t, call.Args);
+                var types = ArgTypes(t, args);
                 if (types == null || types.Any(TypeInference.IsUnknown)) return null;
                 sig = TypeInference.SigKey(types);
                 if (!(Ti.Signatures.TryGetValue(t.Key, out var sigs) && sigs.Any(s => TypeInference.SigKey(s) == sig))) return _dry ? TypeInference.Pending : null;
@@ -292,6 +312,14 @@ namespace Typhon.Compiler.Emit
         }
 
         /// <summary>Typhon class key for a C# type name visible in this module (same module, or imported by name).</summary>
+        ClassDef ClassDefOfKey(string key)
+        {
+            foreach (var m in _p.Modules.Values)
+                foreach (var c in m.Classes.Values)
+                    if (TypeInference.ClassKey(m, c.Name) == key) return c;
+            return null;
+        }
+
         string ClassKeyOfType(string csType, out bool sameModule)
         {
             sameModule = false;
@@ -409,6 +437,13 @@ namespace Typhon.Compiler.Emit
             // free variables of functions/classes in this module → must be static fields, not Main locals
             var usedInDefs = new HashSet<string>();
             foreach (var s in body.Where(s => s is FunctionDef || s is ClassDef)) CollectFreeNames(s, usedInDefs);
+            // globals() reads module names by string: every module-level name is a field then
+            bool usesGlobals = false;
+            AstWalker.VisitAll(body, n => { if (n is CallExpr gc && gc.Func is NameExpr gn && gn.Id == "globals" && gc.Args.Count == 0) usesGlobals = true; });
+            if (usesGlobals)
+                foreach (var s in body)
+                    if (s is AssignStmt ga) foreach (var t in ga.Targets) foreach (var nm in NamesIn(t)) usedInDefs.Add(nm);
+                    else if (s is AnnAssignStmt gaa && gaa.Target is NameExpr gan) usedInDefs.Add(gan.Id);
 
             var fields = new Dictionary<string, string>();      // name → C# type
             var execStmts = new List<Stmt>();                     // static ctor (regular) / Main (main module)
@@ -439,12 +474,23 @@ namespace Typhon.Compiler.Emit
                 bool makeField = fieldName != null && !fields.ContainsKey(fieldName) && (!isMainModule || usedInDefs.Contains(fieldName));
                 if (makeField)
                 {
-                    string type = ann != null ? MapType(ann, s) : (PyType(InferType(value)) ?? ImplicitDynamic(s, $"module variable '{fieldName}'"));
+                    // NAMES = [] filled later (appends anywhere in the module): typed by what is added, like a local list
+                    string emptyType = null;
+                    if (ann == null && value != null && TypeInference.IsEmptyContainer(value))
+                    {
+                        char ekind = TypeInference.ContainerKind(value);
+                        _emptyModuleFields[fieldName] = ekind;
+                        emptyType = EmptyContainerType(ModuleFieldKey(fieldName), ekind, value);
+                        if (emptyType != null && (emptyType.Contains("dynamic") || emptyType.Contains(TypeInference.Pending) && !_dry)) emptyType = null;
+                    }
+                    string type = ann != null ? MapType(ann, s) : emptyType ?? (PyType(InferType(value)) ?? ImplicitDynamic(s, $"module variable '{fieldName}'"));
                     fields[fieldName] = type;
                     _moduleFieldTypes[fieldName] = type;
                     string vis = SurfaceVisibility(fieldName.StartsWith("_") ? "internal" : "public", type);
                     LineDirective(s);
-                    if (!isMainModule && value != null)
+                    // a field initializer runs before the static constructor: only while no earlier module statement had to go
+                    // there, else this assignment joins them, so the module runs top to bottom like Python's
+                    if (!isMainModule && value != null && execStmts.Count == 0)
                         _w.Line($"{vis} static {type} {Esc(fieldName)} = {Checked(type != "dynamic" ? EmitExpr(value, targetTyped: true) : EmitValue(value))};");
                     else
                     {
@@ -453,15 +499,38 @@ namespace Typhon.Compiler.Emit
                     }
                     continue;
                 }
+                // N, E, S, W = -10, 1, 10, -1 / a = b = 0: every name bound here that a def reads (or another module may
+                // import) is a field too; the statement then assigns the fields
+                if (s is AssignStmt multi && (multi.Targets.Count > 1 || multi.Targets[0] is TupleExpr || multi.Targets[0] is ListExpr))
+                {
+                    var bound = new Dictionary<string, string>();
+                    foreach (var target in multi.Targets) UnpackedTypes(target, multi.Value, PyType(InferType(multi.Value)), bound);
+                    bool declared = false;
+                    foreach (var kv in bound)
+                    {
+                        if (kv.Value != null && !_moduleFieldTypes.ContainsKey(kv.Key)) _moduleFieldTypes[kv.Key] = kv.Value;
+                        if (fields.ContainsKey(kv.Key) || (isMainModule && !usedInDefs.Contains(kv.Key))) continue;
+                        string type = kv.Value ?? ImplicitDynamic(s, $"module variable '{kv.Key}'");
+                        fields[kv.Key] = type;
+                        _moduleFieldTypes[kv.Key] = type;
+                        LineDirective(s);
+                        _w.Line($"{SurfaceVisibility(kv.Key.StartsWith("_") ? "internal" : "public", type)} static {type} {Esc(kv.Key)};");
+                        declared = true;
+                    }
+                    if (declared || bound.Keys.Any(fields.ContainsKey)) { execStmts.Add(s); continue; }
+                }
                 execStmts.Add(s);
             }
             if (fields.Count > 0) _w.Line();
+            _moduleFieldNames.UnionWith(fields.Keys);
 
             foreach (var s in body)
             {
                 if (s is FunctionDef f) { EmitFunction(f, isModuleLevel: true); _w.Line(); }
                 else if (s is ClassDef c) { EmitClass(c); _w.Line(); }
             }
+            foreach (var f in body.OfType<FunctionDef>())
+                if (FunctionValueKeys.Contains(TypeInference.FuncKey(_m, null, f.Name))) { EmitFunctionValueClass(f); _w.Line(); }
 
             if (isMainModule)
             {
@@ -479,6 +548,280 @@ namespace Typhon.Compiler.Emit
                     _w.Line();
                 }
                 if (mainBlocks.Count > 0 && (_p.MainModule == null || _p.MainModule == _m.Name)) EmitMain(mainBlocks, fields.Keys, body.First(IsMainGuard));
+            }
+        }
+
+        // ───────────────────────────── functions as values ─────────────────────────────
+        //
+        // A module function used as a value (passed, assigned, stored, returned) has its own type: a generated sealed
+        // subclass of PyFunction with a single instance. Inference sees that type like any other, so a parameter that
+        // receives the function is specialised per function (one overload each, like a template argument), and a call
+        // through a value of that type is a direct, statically typed call of the function, recorded for its signatures.
+
+        const string FnPrefix = "__fn_";
+
+        /// <summary>Module fields that start as an empty container (their element types come from what the module adds).</summary>
+        readonly Dictionary<string, char> _emptyModuleFields = new Dictionary<string, char>();
+        string ModuleFieldKey(string name) => _m.Name + "|module." + name;
+
+        /// <summary>The module's static fields (module-level variables functions can see).</summary>
+        readonly HashSet<string> _moduleFieldNames = new HashSet<string>();
+
+        /// <summary>globals(): the module's names and values (fields, classes, functions used as values), read when called.</summary>
+        string EmitGlobals()
+        {
+            var entries = new List<string> { $"[\"__name__\"] = {CsString(_m.Name)}" };
+            foreach (var f in _moduleFieldNames.OrderBy(x => x, StringComparer.Ordinal)) entries.Add($"[{CsString(f)}] = {Esc(f)}");
+            foreach (var c in _m.Classes.Keys.OrderBy(x => x, StringComparer.Ordinal)) entries.Add($"[{CsString(c)}] = typeof({Esc(c)})");
+            foreach (var fn in _m.Ast.Body.OfType<FunctionDef>())
+                if (FunctionValueKeys.Contains(TypeInference.FuncKey(_m, null, fn.Name))) entries.Add($"[{CsString(fn.Name)}] = {FunctionValueType(_m, fn.Name)}.Instance");
+            return $"new OrderedDictionary<string, object?> {{ {string.Join(", ", entries)} }}";
+        }
+
+        HashSet<string> FunctionValueKeys => _p.FunctionValueKeys ??= ComputeFunctionValueKeys(_p);
+
+        internal static bool IsFunctionValueCandidate(FunctionDef f) => f.TypeParams.Count == 0 && f.Decorators.Count == 0 && f.Params.All(p => p.Kind == ParamKind.Normal);
+
+        static HashSet<string> ComputeFunctionValueKeys(ProjectContext p)
+        {
+            var names = new HashSet<string>();
+            foreach (var m in p.Modules.Values)
+            {
+                if (m.Ast == null || m.ParseDiagnostics.Count > 0) continue;
+                var callees = new HashSet<Node>();
+                var aliases = new List<ImportAlias>();
+                AstWalker.VisitAll(m.Ast.Body, n =>
+                {
+                    if (n is CallExpr c) callees.Add(c.Func);
+                    if (n is ImportFromStmt imp) aliases.AddRange(imp.Names.Where(a => a.AsName != null));
+                });
+                AstWalker.VisitAll(m.Ast.Body, n => { if (n is NameExpr ne && !callees.Contains(ne)) names.Add(ne.Id); });
+                foreach (var a in aliases) if (names.Contains(a.AsName)) names.Add(a.Name);
+            }
+            var keys = new HashSet<string>();
+            foreach (var m in p.Modules.Values)
+                if (m.Ast != null && m.ParseDiagnostics.Count == 0)
+                    foreach (var f in m.Ast.Body.OfType<FunctionDef>())
+                        if (names.Contains(f.Name) && IsFunctionValueCandidate(f)) keys.Add(TypeInference.FuncKey(m, null, f.Name));
+            return keys;
+        }
+
+        static string ModuleClassName(ModuleInfo m) => "global::" + (string.IsNullOrEmpty(m.Namespace) ? "" : m.Namespace + ".") + Esc(m.ClassName);
+
+        /// <summary>The C# type of a module function used as a value.</summary>
+        static string FunctionValueType(ModuleInfo m, string name) => ModuleClassName(m) + "." + FnPrefix + name;
+
+        /// <summary>Does the name denote a module function that has a function type (and which)?</summary>
+        bool FunctionRef(NameExpr n, out ModuleInfo owner, out FunctionDef def)
+        {
+            owner = null; def = null;
+            if (IsLocal(n.Id) || _renames.ContainsKey(n.Id) || _moduleFieldTypes.ContainsKey(n.Id)) return false;
+            if (_m.Functions.Contains(n.Id)) owner = _m;
+            else if (_importedFromModules.TryGetValue(n.Id, out var imp) && imp.Key.Functions.Contains(imp.Value)) owner = imp.Key;
+            if (owner == null) return false;
+            string name = owner == _m ? n.Id : _importedFromModules[n.Id].Value;
+            if (!FunctionValueKeys.Contains(TypeInference.FuncKey(owner, null, name))) return false;
+            def = owner.Ast.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == name);
+            return def != null;
+        }
+
+        /// <summary>The function a function type denotes (null if the type is not one).</summary>
+        bool FunctionOfType(string t, out ModuleInfo owner, out FunctionDef def)
+        {
+            owner = null; def = null;
+            if (t == null || !t.StartsWith("global::") || !t.Contains("." + FnPrefix)) return false;
+            foreach (var m in _p.Modules.Values)
+            {
+                string prefix = ModuleClassName(m) + "." + FnPrefix;
+                if (!t.StartsWith(prefix) || m.Ast == null) continue;
+                string name = t.Substring(prefix.Length);
+                def = m.Ast.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == name);
+                if (def != null) { owner = m; return true; }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// A module function as a value: its function type's instance. Where the value goes somewhere its type is not
+        /// kept (<paramref name="typed"/> false: a list, a field, a .NET call, a return value), it may later be called with
+        /// any argument types, so the function keeps its dynamic version.
+        /// </summary>
+        string FunctionValue(NameExpr n, bool typed)
+        {
+            if (!FunctionRef(n, out var owner, out var def)) return null;
+            if (!typed && Obs != null && TargetOf(owner, null, def.Name) is InferenceTarget t && t.InferParams)
+                Obs.Calls.Add(new Observations.Call { Callee = t.Key, Types = null, Context = _ctxFallbackKey });
+            return FunctionValueType(owner, def.Name) + ".Instance";
+        }
+
+        /// <summary>A call through a value of a function type: a direct call of the function (null if the callee is not one).</summary>
+        string EmitFunctionValueCall(CallExpr c)
+        {
+            if (c.Func is NameExpr fn && !IsLocal(fn.Id) && !_moduleFieldTypes.ContainsKey(fn.Id)) return null; // a plain call by name
+            if (!FunctionOfType(InferType(c.Func), out var owner, out var def)) return null;
+            var target = TargetOf(owner, null, def.Name);
+            if (Obs != null && target != null) RecordCall(target, c.Args);
+            return $"{ModuleClassName(owner)}.{Esc(def.Name)}({EmitArgs(c.Args, typedFunctionArgs: target != null && TypedCall(target, c.Args), typhonCallee: true, paramTypeAt: (i, name) => AnnotatedParamType(def, i, name))})";
+        }
+
+        string AnnotatedParamType(FunctionDef def, int pos, string name)
+        {
+            var p = name != null ? def.Params.FirstOrDefault(x => x.Name == name) : pos >= 0 && pos < def.Params.Count ? def.Params[pos] : null;
+            return p?.Annotation != null && p.Kind == ParamKind.Normal ? MapType(p.Annotation, p) : null;
+        }
+
+        /// <summary>
+        /// Does a call reach a typed overload of an inferred function? Then a function passed to it keeps its function type;
+        /// a call with an argument of unknown type runs the dynamic version, which may call the function with anything.
+        /// </summary>
+        bool TypedCall(InferenceTarget t, List<Arg> args) =>
+            t.InferParams && ArgTypes(t, args) is string[] types && !types.Any(x => TypeInference.IsUnknown(x));
+
+        /// <summary>The type of a call through a value of a function type (null if the callee is not one).</summary>
+        string FunctionValueCallType(CallExpr c)
+        {
+            if (c.Func is NameExpr fn && !IsLocal(fn.Id) && !_moduleFieldTypes.ContainsKey(fn.Id)) return null;
+            if (!FunctionOfType(InferType(c.Func), out var owner, out var def)) return null;
+            if (TargetOf(owner, null, def.Name) is InferenceTarget t && InferredCallType(t, c.Args) is string inferred) return inferred;
+            if (def.Returns != null && !TypeInference.IsBareContainer(def.Returns))
+            {
+                string rt = MapType(def.Returns, def, isReturn: true);
+                return rt == "void" ? null : rt;
+            }
+            return null;
+        }
+
+        /// <summary>The class of a module function's function type: its instance, a call with any arguments, conversions to delegates.</summary>
+        void EmitFunctionValueClass(FunctionDef f)
+        {
+            string cls = FnPrefix + f.Name;
+            var ps = f.Params;
+            int required = ps.Count(p => p.Default == null);
+            var locals = LocalsAnalyzer.Analyze(f.Body, ps.Select(p => p.Name), null);
+            bool returnsValue = f.IsAsync || locals.HasYield || locals.HasValueReturn ||
+                                f.Returns != null && !(f.Returns is ConstExpr rc && rc.Kind == ConstKind.None);
+            _w.Line($"internal sealed class {cls} : global::Typhon.Runtime.PyFunction");
+            _w.Open();
+            _w.Line($"public static readonly {cls} Instance = new {cls}();");
+            _w.Line($"{cls}() : base({CsString(f.Name)}) {{ }}");
+            _w.Line("public override object? __call__(object?[] a)");
+            _w.Open();
+            for (int n = required; n <= ps.Count; n++)
+            {
+                string call = $"{Esc(f.Name)}({string.Join(", ", Enumerable.Range(0, n).Select(i => $"(dynamic?)a[{i}]"))})";
+                _w.Line(returnsValue ? $"if (a.Length == {n}) return {call};" : $"if (a.Length == {n}) {{ {call}; return null; }}");
+            }
+            _w.Line($"throw ArgCount({CsString(f.Name)}, {required}, {ps.Count}, a.Length);");
+            _w.Close();
+            // conversions to the delegate types of its known signatures (a Callable[[int], int] parameter, Func<long, long>)
+            var delegates = new HashSet<string>();
+            void Conversion(List<string> types, string ret)
+            {
+                if (types.Count > 15 || types.Concat(new[] { ret }).Any(x => x == null || x.Contains("dynamic") || x.Contains(TypeInference.Pending) || x.Contains(TypeInference.Unknown))) return;
+                string d = ret == "void" ? (types.Count == 0 ? "global::System.Action" : $"global::System.Action<{string.Join(", ", types)}>")
+                                         : $"global::System.Func<{string.Join(", ", types.Concat(new[] { ret }))}>";
+                if (delegates.Add(d)) _w.Line($"public static implicit operator {d}({cls} _) => {Esc(f.Name)};");
+            }
+            if (ps.All(p => p.Annotation != null) && (f.Returns != null || !returnsValue))
+                Conversion(ps.Select(p => MapType(p.Annotation, p)).ToList(), f.Returns != null ? MapType(f.Returns, f, isReturn: true) : "void");
+            if (TargetOf(_m, null, f.Name) is InferenceTarget t && t.InferParams && Ti.Signatures.TryGetValue(t.Key, out var sigs))
+                foreach (var sig in sigs)
+                {
+                    var types = sig.Select((x, i) => x == TypeInference.Declared ? MapType(ps[i].Annotation, ps[i]) : x).ToList();
+                    string ret = !returnsValue ? "void" : f.Returns != null ? MapType(f.Returns, f, isReturn: true)
+                        : Ti.Returns.TryGetValue(TypeInference.ReturnKey(t.Key, TypeInference.SigKey(sig)), out var r) ? r : null;
+                    Conversion(types, ret);
+                }
+            _w.Close();
+        }
+
+        /// <summary>A class made by namedtuple(...) / typing.NamedTuple (it deconstructs like a tuple).</summary>
+        bool IsNamedTupleType(string t) => NamedTupleOf(t) != null;
+
+        ClassDef NamedTupleOf(string t)
+        {
+            if (t == null) return null;
+            if (_cls != null && t == _cls.CsSelfType && _cls.Def.NamedTupleFields != null) return _cls.Def;
+            return ClassKeyOfType(t, out _) is string key && ClassDefOfKey(key) is ClassDef c && c.NamedTupleFields != null ? c : null;
+        }
+
+        /// <summary>The field types of a namedtuple type (dynamic where unknown).</summary>
+        List<string> NamedTupleFieldTypes(string t)
+        {
+            var c = NamedTupleOf(t);
+            return c?.NamedTupleFields.Select(f => MemberType(t, f, method: false) is string ft && ft != TypeInference.Pending ? ft : "dynamic").ToList();
+        }
+
+        /// <summary>The tuple protocol of a namedtuple class, over its fields in order.</summary>
+        void EmitNamedTupleMembers(ClassDef c, ClassContext ctx, List<FunctionDef> methods)
+        {
+            var fs = c.NamedTupleFields;
+            string self = ctx.CsSelfType;
+            string T(string f) => ctx.FieldTypes.TryGetValue(f, out var t) ? t : "dynamic";
+            string F(string f) => "this." + Esc(f);
+            bool Has(string name) => methods.Any(m => m.Name == name);
+            _w.Line();
+            if (fs.Count > 0)
+                _w.Line($"public void Deconstruct({string.Join(", ", fs.Select(f => $"out {T(f)} {Esc(f)}"))}) {{ {string.Join(" ", fs.Select(f => $"{Esc(f)} = {F(f)};"))} }}");
+            _w.Line($"int global::System.Runtime.CompilerServices.ITuple.Length => {fs.Count};");
+            _w.Line($"object? global::System.Runtime.CompilerServices.ITuple.this[int __i] => __i switch {{ {string.Join(" ", fs.Select((f, i) => $"{i} => {F(f)},"))} _ => throw new global::System.IndexOutOfRangeException(\"tuple index out of range\") }};");
+            _w.Line($"public object? this[long __i] => ((global::System.Runtime.CompilerServices.ITuple)this)[checked((int)(__i < 0 ? __i + {fs.Count} : __i))];");
+            if (!Has("__len__")) _w.Line($"public long __len__() => {fs.Count};");
+            if (!Has("__iter__"))
+            {
+                _w.Line($"public global::System.Collections.Generic.IEnumerator<object?> GetEnumerator() {{ {string.Join(" ", fs.Select(f => $"yield return {F(f)};"))} {(fs.Count == 0 ? "yield break;" : "")} }}");
+                _w.Line("global::System.Collections.IEnumerator global::System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();");
+            }
+            string repr = $"$\"{c.Name}({string.Join(", ", fs.Select(f => $"{f}={{(global::Typhon.Runtime.Builtins.repr({F(f)}))}}"))})\"";
+            if (!Has("__repr__")) _w.Line($"public string __repr__() => {repr};");
+            else _w.Line("string global::Typhon.Runtime.IPyRepr.__repr__() => __repr__();");
+            if (!Has("__repr__") && !Has("__str__")) _w.Line("public override string ToString() => __repr__();");
+            if (!Has("__eq__"))
+            {
+                string eq = fs.Count == 0 ? "true" : string.Join(" && ", fs.Select(f => $"global::Typhon.Runtime.Builtins.eq((object?){F(f)}, (object?)__o.{Esc(f)})"));
+                _w.Line($"public override bool Equals(object? __obj) => __obj is {self} __o && {eq};");
+                _w.Line($"public override int GetHashCode() {{ var __h = new global::System.HashCode(); {string.Join(" ", fs.Select(f => $"__h.Add((object?){F(f)});"))} return __h.ToHashCode(); }}");
+                _w.Line($"public static bool operator ==({self}? a, {self}? b) => a is null ? b is null : a.Equals(b);");
+                _w.Line($"public static bool operator !=({self}? a, {self}? b) => !(a == b);");
+            }
+            // tuples order field by field
+            _w.Line($"public int CompareTo(object? __obj) {{ if (__obj is not {self} __o) throw new global::System.InvalidCastException(\"'<' not supported between instances of '{c.Name}' and '\" + __obj?.GetType().Name + \"'\"); int __c; {string.Join(" ", fs.Select(f => $"if ((__c = global::Typhon.Runtime.Builtins.compare((object?){F(f)}, (object?)__o.{Esc(f)})) != 0) return __c;"))} return 0; }}");
+            if (!Has("__lt__")) _w.Line($"public static bool operator <({self} a, {self} b) => a.CompareTo(b) < 0;");
+            if (!Has("__gt__")) _w.Line($"public static bool operator >({self} a, {self} b) => a.CompareTo(b) > 0;");
+            if (!Has("__le__")) _w.Line($"public static bool operator <=({self} a, {self} b) => a.CompareTo(b) <= 0;");
+            if (!Has("__ge__")) _w.Line($"public static bool operator >=({self} a, {self} b) => a.CompareTo(b) >= 0;");
+            // _replace(field=value, ...): a copy with some fields replaced
+            if (fs.Count > 0)
+                _w.Line($"public {self} _replace({string.Join(", ", fs.Select(f => $"object? {Esc(f)} = null"))}) => new {self}({string.Join(", ", fs.Select(f => $"{Esc(f)} is null ? {F(f)} : ({T(f)})(dynamic){Esc(f)}"))});");
+            _w.Line($"public OrderedDictionary<string, object?> _asdict() => new OrderedDictionary<string, object?> {{ {string.Join(", ", fs.Select(f => $"[{CsString(f)}] = {F(f)}"))} }};");
+            _w.Line($"internal static readonly global::Typhon.Runtime.PyTuple<string> _fields = new global::Typhon.Runtime.PyTuple<string>(new string[] {{ {string.Join(", ", fs.Select(CsString))} }});");
+            if (fs.Count > 0)
+                _w.Line($"public static {self} _make(global::System.Collections.IEnumerable __items) {{ var __l = global::System.Linq.Enumerable.ToList(global::System.Linq.Enumerable.Cast<object?>(__items)); if (__l.Count != {fs.Count}) throw new global::System.ArgumentException(\"Expected {fs.Count} arguments, got \" + __l.Count); return new {self}({string.Join(", ", fs.Select((f, i) => $"({T(f)})(dynamic)__l[{i}]!"))}); }}");
+        }
+
+        /// <summary>The type each name in an assignment target gets (null: unknown): a, (b, c) = 1, (2.0, "x"); x, y = point; i, j = range(2).</summary>
+        void UnpackedTypes(Expr target, Expr value, string valueType, Dictionary<string, string> into)
+        {
+            switch (target)
+            {
+                case NameExpr n:
+                    into[n.Id] = TypeInference.IsUnknown(valueType) || valueType == TypeInference.Pending ? null : valueType;
+                    return;
+                case TupleExpr _:
+                case ListExpr _:
+                {
+                    var elts = target is TupleExpr te ? te.Elts : ((ListExpr)target).Elts;
+                    var values = value is TupleExpr vt && vt.Elts.Count == elts.Count ? vt.Elts : value is ListExpr vl && vl.Elts.Count == elts.Count ? vl.Elts : null;
+                    var parts = values?.Select(v => PyType(InferType(v))).ToList() ?? TupleElementTypes(valueType);
+                    for (int i = 0; i < elts.Count; i++)
+                    {
+                        if (elts[i] is StarredExpr st) { foreach (var name in NamesIn(st.Value)) into[name] = null; continue; }
+                        string part = parts != null && parts.Count == elts.Count ? parts[i] : valueType != null ? ElementTypeOf(valueType) : null;
+                        UnpackedTypes(elts[i], values?[i], part, into);
+                    }
+                    return;
+                }
+                default: return; // attributes / subscripts bind no names
             }
         }
 
@@ -717,7 +1060,7 @@ namespace Typhon.Compiler.Emit
         /// member whose signature uses one cannot be public: it becomes internal (C# callers see everything else).
         /// </summary>
         static string SurfaceVisibility(string vis, params string[] signatureParts) =>
-            vis == "public" && signatureParts.Any(p => p != null && p.Contains("global::Typhon.Runtime.")) ? "internal" : vis;
+            vis == "public" && signatureParts.Any(p => p != null && (p.Contains("global::Typhon.Runtime.") || p.Contains("global::Typhon.Stdlib.") || p.Contains("." + FnPrefix))) ? "internal" : vis;
 
         static string Visibility(string name, bool topLevel)
         {
@@ -818,7 +1161,16 @@ namespace Typhon.Compiler.Emit
                 var p = f.Params[i];
                 if (i == 0 && dropFirst) continue;
                 scope.Params.Add(p.Name);
-                if (p.Kind == ParamKind.KwArgs) { Unsupported(p, "**kwargs"); continue; }
+                if (p.Kind == ParamKind.KwArgs)
+                {
+                    // **kwargs: the extra keyword arguments as a dict (call sites pass it by name; omitted, it is empty)
+                    ps.Add($"OrderedDictionary<string, dynamic>? {Esc(p.Name)}");
+                    defaults.Add(" = null");
+                    scope.Types[p.Name] = "OrderedDictionary<string, dynamic>";
+                    sig.Prologue.Add($"{Esc(p.Name)} ??= new OrderedDictionary<string, dynamic>();");
+                    pi++;
+                    continue;
+                }
                 string inferred = paramTypes != null && pi < paramTypes.Length ? paramTypes[pi] : null;
                 pi++;
                 string type = p.Annotation != null && !(TypeInference.IsBareContainer(p.Annotation) && inferred != null && inferred != TypeInference.Declared) ? MapType(p.Annotation, p)
@@ -830,7 +1182,8 @@ namespace Typhon.Compiler.Emit
                 if (p.Kind == ParamKind.VarArgs)
                 {
                     if (p.Annotation == null) type = "object";
-                    decl = $"params {type}[] {Esc(p.Name)}";
+                    decl = f.Params.Any(x => x.Kind == ParamKind.KwArgs) ? $"{type}[]? {Esc(p.Name)}" : $"params {type}[] {Esc(p.Name)}";
+                    if (f.Params.Any(x => x.Kind == ParamKind.KwArgs)) { sig.Prologue.Add($"{Esc(p.Name)} ??= global::System.Array.Empty<{type}>();"); defaults.Add(" = null"); ps.Add(decl); scope.Types[p.Name] = type + "[]"; continue; }
                     scope.Types[p.Name] = type + "[]";
                 }
                 else decl = $"{type} {Esc(p.Name)}";
@@ -851,7 +1204,20 @@ namespace Typhon.Compiler.Emit
                 }
                 else
                 {
-                    if (keepDefault) defaultCode = " = " + EmitExpr(p.Default, targetTyped: true);
+                    // a late-bound parameter with a number/bool default (def f(x=0)): C# allows only null as the default of a
+                    // dynamic parameter, but honours [Optional, DefaultParameterValue(...)]
+                    if (keepDefault && (type == "dynamic" || type == "object") && p.Default is ConstExpr dc && (dc.Kind == ConstKind.Int || dc.Kind == ConstKind.Float || dc.Kind == ConstKind.Bool || dc.Kind == ConstKind.Str) ||
+                        keepDefault && (type == "dynamic" || type == "object") && p.Default is UnaryExpr du && du.Operand is ConstExpr duc && (duc.Kind == ConstKind.Int || duc.Kind == ConstKind.Float))
+                    {
+                        string constant = p.Default is ConstExpr ci && ci.Kind == ConstKind.Int || p.Default is UnaryExpr ui && ((ConstExpr)ui.Operand).Kind == ConstKind.Int
+                            ? (ConstIntValue(p.Default) is long lv ? lv + "L" : null) : EmitExpr(p.Default);
+                        if (constant != null)
+                        {
+                            decl = $"[global::System.Runtime.InteropServices.Optional, global::System.Runtime.InteropServices.DefaultParameterValue({constant})] {decl}";
+                            defaultCode = "";
+                        }
+                    }
+                    else if (keepDefault) defaultCode = " = " + EmitExpr(p.Default, targetTyped: true);
                     if (wider != null)
                     {
                         string local = p.Name + "__v";
@@ -864,10 +1230,19 @@ namespace Typhon.Compiler.Emit
                 defaults.Add(defaultCode);
             }
             // C#: optional parameters must come last
+            bool attributeOptional = false;
             for (int i = ps.Count - 1, required = 0; i >= 0; i--)
             {
                 if (defaults[i] == null) required = 1;
-                else if (required == 0) ps[i] += defaults[i];
+                else if (required == 0)
+                {
+                    // before a parameter made optional by attributes (a dynamic one with a str/number default), C# wants the
+                    // attribute form too: `= value` would make a later parameter "required"
+                    if (attributeOptional && defaults[i].StartsWith(" = "))
+                        ps[i] = $"[global::System.Runtime.InteropServices.Optional, global::System.Runtime.InteropServices.DefaultParameterValue({defaults[i].Substring(3)})] {ps[i]}";
+                    else ps[i] += defaults[i];
+                    if (defaults[i] == "") attributeOptional = true;
+                }
             }
             sig.Params = string.Join(", ", ps);
 
@@ -892,6 +1267,9 @@ namespace Typhon.Compiler.Emit
             else if (locals.HasValueReturn)
                 elem = retKey != null && Ti != null && Ti.Returns.TryGetValue(retKey, out var inferredReturn) && inferredReturn != "dynamic" ? inferredReturn
                      : ImplicitDynamic(f, $"the return type of '{f.Name}'");
+            // a method whose overrides (or the method it overrides) return values: C# needs one return type for all of them
+            // (def fn(self): raise NotImplementedError in the base, values in the subclasses)
+            else if (dropFirst && _cls != null && FamilyReturnsValue(_cls.Def, f.Name)) elem = "dynamic";
             else elem = "void";
 
             sig.ElementType = elem;
@@ -903,6 +1281,129 @@ namespace Typhon.Compiler.Emit
             else sig.ReturnType = elem;
             scope.ReturnType = elem;
             return sig;
+        }
+
+        // ───────────────────────────── attributes created from outside a class ─────────────────────────────
+
+        /// <summary>Does the class (or a Typhon base) declare the member: a method, class variable, annotation or self.x field?</summary>
+        bool DeclaresMember(ClassDef c, string name, int depth = 0)
+        {
+            if (c == null || depth > 20) return false;
+            if (c.Body.Any(st => st is FunctionDef f && f.Name == name || st is AssignStmt a && a.Targets.Any(t => t is NameExpr tn && tn.Id == name) ||
+                                 st is AnnAssignStmt aa && aa.Target is NameExpr an && an.Id == name || st is ClassDef nc && nc.Name == name)) return true;
+            if (CollectImplicitFields(c).ContainsKey(name)) return true;
+            foreach (var b in c.Bases)
+            {
+                if (!ResolveBase(b, out var py, out var meta)) continue;
+                if (py == null) return true; // a .NET base: it may well have it
+                if (DeclaresMember(py, name, depth + 1)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>obj.attr = v / Cls.ATTR = v where the class does not declare it: the attribute becomes a field (dry run).</summary>
+        void RecordExternalAttribute(AttributeExpr at, Expr value)
+        {
+            string vt = value is ConstExpr nc && nc.Kind == ConstKind.None ? TypeInference.NoneType : PyType(InferType(value)) ?? TypeInference.Unknown;
+            if (at.Target is NameExpr cn && !IsLocal(cn.Id) && cn.Id != "self" && TryResolveType(cn.Id, 0, out _, out var pyClass) && pyClass != null &&
+                _p.TryFindClass(_m, pyClass.Name, out var cls, out var owner) && cls == pyClass)
+            {
+                bool declaredNone = cls.Body.Any(st => st is AssignStmt sa && sa.Targets.Count == 1 && sa.Targets[0] is NameExpr sn && sn.Id == at.Name &&
+                                                       sa.Value is ConstExpr sc && sc.Kind == ConstKind.None);
+                if (declaredNone || !DeclaresMember(cls, at.Name)) Obs.AddExternal(TypeInference.ClassKey(owner, cls.Name) + "|static|" + at.Name, vt);
+                return;
+            }
+            if (at.Target is NameExpr self && self.Id == "self") return;
+            if (ClassKeyOfType(InferType(at.Target), out _) is string ck && ClassDefOfKey(ck) is ClassDef cd &&
+                (!DeclaresMember(cd, at.Name) || CollectImplicitFields(cd).ContainsKey(at.Name)))
+                Obs.AddExternal(ck + "|" + at.Name, vt);
+        }
+
+        string ExternalType(string key) =>
+            Ti != null && Ti.ExternalFields.TryGetValue(key, out var t) ? t : _dry ? TypeInference.Pending : null;
+
+        // ───────────────────────────── class hierarchies ─────────────────────────────
+
+        IEnumerable<ClassDef> AllClasses() => _p.Modules.Values.Where(m => m.Ast != null).SelectMany(m => m.Classes.Values);
+
+        /// <summary>The Typhon base classes of a class (resolved by name across the project).</summary>
+        IEnumerable<ClassDef> TyphonBases(ClassDef c)
+        {
+            foreach (var b in c.Bases)
+                if ((b is SubscriptExpr s ? s.Target : b) is NameExpr bn && _p.TryFindClass(_m, bn.Id, out var bc, out _) && bc != c) yield return bc;
+                else if (b is AttributeExpr ba && _p.TryFindClass(_m, ba.Name, out var bc2, out _) && bc2 != c) yield return bc2;
+        }
+
+        bool DerivesFrom(ClassDef c, ClassDef ancestor, int depth = 0) =>
+            depth < 20 && TyphonBases(c).Any(b => b == ancestor || DerivesFrom(b, ancestor, depth + 1));
+
+        static bool Defines(ClassDef c, string method) => c.Body.OfType<FunctionDef>().Any(f => f.Name == method);
+
+        /// <summary>Does any definition of the method in the class's hierarchy (its bases and subclasses) return a value?</summary>
+        bool FamilyReturnsValue(ClassDef c, string method)
+        {
+            foreach (var k in AllClasses())
+            {
+                if (!(k == c || DerivesFrom(k, c) || DerivesFrom(c, k))) continue;
+                foreach (var f in k.Body.OfType<FunctionDef>())
+                {
+                    if (f.Name != method) continue;
+                    if (f.Returns != null && !(f.Returns is ConstExpr rc && rc.Kind == ConstKind.None)) return true;
+                    var loc = LocalsAnalyzer.Analyze(f.Body, f.Params.Select(x => x.Name), null);
+                    if (loc.HasValueReturn || loc.HasYield) return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Can control reach the end of the statements (so a function returns None there)?</summary>
+        internal static bool CanFallThrough(List<Stmt> body)
+        {
+            foreach (var s in body) if (!CanComplete(s)) return false;
+            return true;
+        }
+
+        static bool CanComplete(Stmt s)
+        {
+            switch (s)
+            {
+                case ReturnStmt _: case RaiseStmt _: case BreakStmt _: case ContinueStmt _: return false;
+                case IfStmt i: return CanFallThrough(i.Body) || CanFallThrough(i.OrElse);
+                case WhileStmt w:
+                {
+                    bool forever = w.Test is ConstExpr c && (c.Kind == ConstKind.Bool && c.Raw == "True" || c.Kind == ConstKind.Int && c.Raw != "0");
+                    return HasBreak(w.Body) || !forever && CanFallThrough(w.OrElse);
+                }
+                case ForStmt f: return HasBreak(f.Body) || CanFallThrough(f.OrElse);
+                case TryStmt t:
+                    if (t.FinalBody.Count > 0 && !CanFallThrough(t.FinalBody)) return false;
+                    return CanFallThrough(t.Body) && CanFallThrough(t.OrElse) || t.Handlers.Any(h => CanFallThrough(h.Body));
+                case WithStmt w: return CanFallThrough(w.Body);
+                case MatchStmt m:
+                    // without an irrefutable case, no case may match
+                    if (!m.Cases.Any(mc => mc.Guard == null && (mc.Pattern is CapturePattern || mc.Pattern is AsPattern ap && ap.Inner is CapturePattern))) return true;
+                    return m.Cases.Any(mc => CanFallThrough(mc.Body));
+                default: return true;
+            }
+        }
+
+        /// <summary>Does the loop body contain a 'break' for this loop (not one of a nested loop or function)?</summary>
+        static bool HasBreak(List<Stmt> body)
+        {
+            foreach (var s in body)
+            {
+                switch (s)
+                {
+                    case BreakStmt _: return true;
+                    case IfStmt i: if (HasBreak(i.Body) || HasBreak(i.OrElse)) return true; break;
+                    case TryStmt t: if (HasBreak(t.Body) || HasBreak(t.OrElse) || HasBreak(t.FinalBody) || t.Handlers.Any(h => HasBreak(h.Body))) return true; break;
+                    case WithStmt w: if (HasBreak(w.Body)) return true; break;
+                    case MatchStmt m: if (m.Cases.Any(mc => HasBreak(mc.Body))) return true; break;
+                    case WhileStmt w: if (HasBreak(w.OrElse)) return true; break;   // a break in a loop's else leaves the outer loop
+                    case ForStmt f: if (HasBreak(f.OrElse)) return true; break;
+                }
+            }
+            return false;
         }
 
         /// <summary>Does the body (outside nested functions) contain 'return None'?</summary>
@@ -988,6 +1489,10 @@ namespace Typhon.Compiler.Emit
             var saved = _scope;
             var savedEmpty = _emptyContainers;
             _emptyContainers = new Dictionary<string, char>();
+            var savedRegex = new Dictionary<string, (string, long)>(_regexLocals);
+            _regexLocals.Clear();
+            var savedLambdas = new Dictionary<string, LambdaExpr>(_lambdaLocals);
+            _lambdaLocals.Clear();
             scope.Parent = saved;
             scope.Locals = locals ?? LocalsAnalyzer.Analyze(body, scope.Params, excluded);
             _scope = scope;
@@ -1010,15 +1515,20 @@ namespace Typhon.Compiler.Emit
                 else
                 {
                     scope.Locals.HoistedFirstValue.TryGetValue(h.Key, out var fv);
+                    bool observed = false;
                     if (fv != null && TypeInference.IsEmptyContainer(fv))
                     {
                         char kind = TypeInference.ContainerKind(fv);
                         _emptyContainers[h.Key] = kind;
                         type = EmptyContainerType(_scopeKey + "|" + h.Key, kind, fv);
                     }
+                    // what the assignments in the body give it (whole-program inference: the names they use exist there)
+                    else if (Ti != null && Ti.Hoisted.TryGetValue(_scopeKey + "|" + h.Key, out var hoistedType) && hoistedType != "dynamic" &&
+                             scope.Locals.HoistedPlain.Contains(h.Key))
+                    { type = hoistedType; observed = true; }
                     else type = PyType(fv != null ? InferType(fv) : LoopVariableType(scope.Locals, h.Key));
                     // a variable assigned values of different types (in different blocks) is late-bound
-                    if (type != null && scope.Locals.HoistedValues.TryGetValue(h.Key, out var values) &&
+                    if (type != null && !observed && scope.Locals.HoistedValues.TryGetValue(h.Key, out var values) &&
                         values.Select(v => PyType(InferType(v))).Where(t => t != null && t != TypeInference.Pending).Any(t => Incompatible(type, t)))
                         type = null;
                     // a capture bound from a value of unknown type (case [x, y] on an object) is not known to agree with the others
@@ -1032,10 +1542,18 @@ namespace Typhon.Compiler.Emit
             }
             // parameters count as declared by the body's top block: rebinding one there to another type gives a new variable
             EmitBlockStatements(body, preDeclared: scope.Params);
+            // falling off the end returns None (C# warns about unreachable code where the end cannot be reached; that is off)
+            if (scope.ReturnType != null && scope.ReturnType != "void" && !scope.IsGenerator)
+            {
+                if (Obs != null && _retKey != null && CanFallThrough(body)) Obs.AddReturn(_retKey, TypeInference.NoneType);
+                _w.Line("return default!;");
+            }
             _w.Close();
             _w.Close();
             _scope = saved;
             _emptyContainers = savedEmpty;
+            _regexLocals.Clear(); foreach (var kv in savedRegex) _regexLocals[kv.Key] = kv.Value;
+            _lambdaLocals.Clear(); foreach (var kv in savedLambdas) _lambdaLocals[kv.Key] = kv.Value;
             _nonNegative.Clear(); _nonNegative.UnionWith(savedNonNegative);
         }
 
@@ -1110,6 +1628,15 @@ namespace Typhon.Compiler.Emit
             // def __len__(self) -> int  ⇒  IPyLen, so len(obj) works without reflection
             if (!isInterface && c.Body.OfType<FunctionDef>().Any(f => f.Name == "__len__" && f.Params.Count == 1 && f.Returns is NameExpr rn && rn.Id == "int"))
                 baseTypes.Add("global::Typhon.Runtime.IPyLen");
+            // a namedtuple: a tuple of its fields (unpacking, indexing, iteration, len, comparison, repr)
+            if (c.NamedTupleFields != null && !isInterface)
+            {
+                baseTypes.Add("global::System.Runtime.CompilerServices.ITuple");
+                baseTypes.Add("global::Typhon.Runtime.IPyRepr");
+                baseTypes.Add("global::System.IComparable");
+                if (!baseTypes.Contains("global::Typhon.Runtime.IPyLen")) baseTypes.Add("global::Typhon.Runtime.IPyLen");
+                if (iter == null) { baseTypes.Add("global::System.Collections.Generic.IEnumerable<object?>"); ctx.IterElementType = "object"; }
+            }
             string baseList = baseTypes.Count > 0 ? " : " + string.Join(", ", baseTypes) : "";
             _w.Line($"{vis} {kind} {Esc(c.Name)}{TypeParamList(c.TypeParams)}{baseList}{TypeParamConstraints(c.TypeParams, c)}");
             _w.Open();
@@ -1270,7 +1797,12 @@ namespace Typhon.Compiler.Emit
                             if (!result.TryGetValue(at.Name, out var existing) || (existing.Key == null && ann != null) || (existing.Value.Value == null && value != null))
                                 result[at.Name] = new KeyValuePair<Expr, KeyValuePair<FunctionDef, Expr>>(ann ?? existing.Key, new KeyValuePair<FunctionDef, Expr>(f, value ?? existing.Value.Value));
                         }
-                        if (target is TupleExpr tup) foreach (var e in tup.Elts) { target = e; Check(); }
+                        if (target is TupleExpr tup)
+                        {
+                            // self.a, self.b = x, y: each field takes its own item
+                            var items = value is TupleExpr vt && vt.Elts.Count == tup.Elts.Count ? vt.Elts : null;
+                            for (int i = 0; i < tup.Elts.Count; i++) { target = tup.Elts[i]; value = items?[i]; Check(); }
+                        }
                     }
                 });
             }
@@ -1317,9 +1849,14 @@ namespace Typhon.Compiler.Emit
                     }
                     case AssignStmt a when a.Targets.Count == 1 && a.Targets[0] is NameExpr n:
                     {
-                        string type = PyType(InferType(a.Value)) ?? ImplicitDynamic(s, $"class variable '{n.Id}'");
+                        // NAME = None, assigned a value later from outside (Cls.NAME = Cls(...)): the type of those values
+                        string later = a.Value is ConstExpr cn0 && cn0.Kind == ConstKind.None ? ExternalType(TypeInference.ClassKey(_m, c.Name) + "|static|" + n.Id) : null;
+                        if (later == TypeInference.Pending || later == "dynamic") later = null;
+                        if (later != null && IsValueTypeName(later) && !later.EndsWith("?")) later += "?";
+                        string type = later ?? PyType(InferType(a.Value)) ?? ImplicitDynamic(s, $"class variable '{n.Id}'");
                         declared.Add(n.Id);
                         ctx.Members.Add(n.Id);
+                        ctx.FieldTypes[n.Id] = type; // read as self.name too (through the class)
                         LineDirective(s);
                         _w.Line($"{Visibility(n.Id, false)} static {type} {Esc(n.Id)} = {Checked(type != "dynamic" ? EmitExpr(a.Value, targetTyped: true) : EmitValue(a.Value))};");
                         break;
@@ -1373,12 +1910,33 @@ namespace Typhon.Compiler.Emit
                     type = candidates.Count == 1 ? candidates.First() : null;
                     if (TypeInference.IsUnknown(type) || type == TypeInference.Pending) type = null;
                     type = type ?? ImplicitDynamic(method, $"attribute 'self.{name}'");
+                    // assignments from outside the class (obj.attr = v) count too: an int field that gets floats is a float
+                    if (type != "dynamic" && Ti != null && _m.Classes.TryGetValue(c.Name, out var wcls) && wcls == c &&
+                        Ti.ExternalFields.TryGetValue(TypeInference.ClassKey(_m, c.Name) + "|" + name, out var outside) && outside != type)
+                        type = (type == "long" || type == "double") && (outside == "long" || outside == "double") ? "double" : ImplicitDynamic(method, $"attribute 'self.{name}'");
                 }
                 declared.Add(name);
                 ctx.Members.Add(name);
                 ctx.FieldTypes[name] = type;
                 LineDirective(method);
                 _w.Line($"{SurfaceVisibility(Visibility(name, false), type)} {type} {Esc(name)} {{ get; set; }}");
+            }
+            // 2b. attributes other code creates (obj.attr = v, Cls.ATTR = v)
+            if (Ti != null && _m.Classes.TryGetValue(c.Name, out var extCls) && extCls == c)
+            {
+                string prefix = TypeInference.ClassKey(_m, c.Name) + "|";
+                foreach (var kv in Ti.ExternalFields.Where(kv => kv.Key.StartsWith(prefix)).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                {
+                    bool isStatic = kv.Key.Substring(prefix.Length).StartsWith("static|");
+                    string name = kv.Key.Substring(prefix.Length + (isStatic ? "static|".Length : 0));
+                    if (declared.Contains(name) || ctx.Members.Contains(name) || BaseHasMember(bases, name, requireOverridable: false)) continue;
+                    string type = kv.Value == TypeInference.Pending ? "dynamic" : kv.Value;
+                    declared.Add(name);
+                    ctx.Members.Add(name);
+                    ctx.FieldTypes[name] = type;
+                    LineDirective(c);
+                    _w.Line(isStatic ? $"{SurfaceVisibility("public", type)} static {type} {Esc(name)};" : $"{SurfaceVisibility("public", type)} {type} {Esc(name)} {{ get; set; }}");
+                }
             }
             if (declared.Count > 0) _w.Line();
             if (Obs != null && _m.Classes.TryGetValue(c.Name, out var topLevel) && topLevel == c)
@@ -1426,6 +1984,7 @@ namespace Typhon.Compiler.Emit
             }
             if (!isDataclass && !methods.Any(m => m.Name == "__init__")) EmitInheritedConstructors(ctx, bases);
             EmitDunderBridges(methods, ctx);
+            if (c.NamedTupleFields != null) EmitNamedTupleMembers(c, ctx, methods);
 
             // 5. nested classes
             foreach (var nested in c.Body.OfType<ClassDef>()) EmitClass(nested);
@@ -1496,6 +2055,12 @@ namespace Typhon.Compiler.Emit
         /// </summary>
         void EmitInheritedConstructors(ClassContext ctx, List<Expr> bases, int depth = 0)
         {
+            // a subclass of a two-phase class allocates through it too
+            if (depth == 0 && NearestInitAncestor(ctx.Def) is ClassDef twoPhaseOwner && TwoPhaseClasses.Contains(twoPhaseOwner) && !ctx.NoInitDone)
+            {
+                _w.Line($"private protected {Esc(ctx.Name)}({NoInitType} _) : base(_) {{ }}");
+                ctx.NoInitDone = true;
+            }
             foreach (var b in bases)
             {
                 if (depth > 20 || !ResolveBase(b, out var py, out var meta)) continue;
@@ -1526,7 +2091,8 @@ namespace Typhon.Compiler.Emit
                         if (p.Kind != ParamKind.Normal) return; // *args/**kwargs: no faithful C# mirror, write an __init__
                         string type = p.Annotation != null ? MapType(p.Annotation, init) : "dynamic";
                         ps.Add($"{type} {Esc(p.Name)}" + (p.Default != null ? " = " + EmitExpr(p.Default, targetTyped: true) : ""));
-                        names.Add(Esc(p.Name));
+                        // a constructor initializer cannot be dispatched dynamically: late-bound values go as object
+                        names.Add(type == "dynamic" ? $"(object?){Esc(p.Name)}" : Esc(p.Name));
                     }
                     _w.Line($"public {Esc(ctx.Name)}({string.Join(", ", ps)}) : base({string.Join(", ", names)}) {{ }}");
                     _w.Line();
@@ -1567,22 +2133,107 @@ namespace Typhon.Compiler.Emit
             finally { _ctxFallbackKey = savedCtx; _scopeKey = savedScopeKey; }
         }
 
+        // ───────────────────────────── two-phase construction ─────────────────────────────
+
+        const string NoInitType = "global::Typhon.Runtime.NoInit";
+
+        static bool IsSuperInit(Stmt st) => st is ExprStmt es && es.Value is CallExpr c && c.Func is AttributeExpr a && a.Name == "__init__" &&
+                                            a.Target is CallExpr sc && sc.Func is NameExpr sn && sn.Id == "super";
+
+        /// <summary>Does __init__ run its base class's __init__ somewhere other than as its first statement?</summary>
+        static bool DefersBaseInit(FunctionDef init)
+        {
+            int first = init.Body.Count > 0 && init.Body[0] is ExprStmt ds && ds.Value is ConstExpr dc && dc.Kind == ConstKind.Str ? 1 : 0;
+            bool found = false, deferred = false;
+            AstWalker.VisitAll(init.Body, n =>
+            {
+                if (n is CallExpr c && c.Func is AttributeExpr a && a.Name == "__init__" && a.Target is CallExpr sc && sc.Func is NameExpr sn && sn.Id == "super")
+                {
+                    found = true;
+                    if (!(init.Body.Count > first && init.Body[first] is ExprStmt es && es.Value == c)) deferred = true;
+                }
+            });
+            return found && deferred;
+        }
+
+        /// <summary>The nearest Typhon ancestor (along first bases) that defines __init__; null if none (or a .NET base comes first).</summary>
+        ClassDef NearestInitAncestor(ClassDef c)
+        {
+            var k = c;
+            for (int depth = 0; depth < 50; depth++)
+            {
+                if (k.Bases.Count == 0) return null;
+                if (!ResolveBase(k.Bases[0], out var py, out _) || py == null) return null;
+                if (py.Body.OfType<FunctionDef>().Any(f => f.Name == "__init__")) return py;
+                k = py;
+            }
+            return null;
+        }
+
+        HashSet<ClassDef> TwoPhaseClasses
+        {
+            get
+            {
+                if (_p.TwoPhaseClasses != null) return _p.TwoPhaseClasses;
+                var set = new HashSet<ClassDef>();
+                foreach (var c in AllClasses())
+                {
+                    var init = c.Body.OfType<FunctionDef>().FirstOrDefault(f => f.Name == "__init__");
+                    if (init == null || !DefersBaseInit(init)) continue;
+                    for (var b = NearestInitAncestor(c); b != null && set.Add(b); b = NearestInitAncestor(b)) { }
+                }
+                return _p.TwoPhaseClasses = set;
+            }
+        }
+
         void EmitConstructorCore(FunctionDef f, ClassContext ctx, List<Expr> bases, string[] paramTypes)
         {
             var sig = BuildSignature(f, dropFirst: true, paramTypes: paramTypes);
             sig.Scope.HasSelf = true;
             sig.Scope.Params.Remove(f.Params[0].Name);
+            bool twoPhase = TwoPhaseClasses.Contains(ctx.Def) && f.Params.All(x => x.Kind == ParamKind.Normal);
+            if (twoPhase || DefersBaseInit(f))
+            {
+                // allocate with the base's allocation-only constructor; super().__init__(...) runs where the body has it
+                string alloc = NearestInitAncestor(ctx.Def) != null ? $" : base(default({NoInitType}))" : "";
+                EmitDocComment(f.Body);
+                LineDirective(f);
+                EmitAttributes(f.Decorators);
+                if (twoPhase)
+                {
+                    if (!ctx.NoInitDone) { _w.Line($"private protected {Esc(ctx.Name)}({NoInitType} _){alloc} {{ }}"); ctx.NoInitDone = true; }
+                    _w.Line($"public {Esc(ctx.Name)}({sig.Params}){alloc} {{ __init__({string.Join(", ", f.Params.Skip(1).Select(x => Esc(x.Name)))}); }}");
+                    LineDirective(f);
+                    _w.Line($"protected {(NearestInitAncestor(ctx.Def) != null ? "new " : "")}void __init__({sig.Params})");
+                }
+                else _w.Line($"public {Esc(ctx.Name)}({sig.Params}){alloc}");
+                EmitSignatureBody(f.Body, sig);
+                return;
+            }
             var body = f.Body;
             string baseCall = "";
             int first = body.Count > 0 && body[0] is ExprStmt ds && ds.Value is ConstExpr dc && dc.Kind == ConstKind.Str ? 1 : 0;
-            if (body.Count > first && body[first] is ExprStmt es && es.Value is CallExpr call && call.Func is AttributeExpr at && at.Name == "__init__" &&
-                at.Target is CallExpr sc && sc.Func is NameExpr sn && sn.Id == "super")
+            // super().__init__(args), or the older Base.__init__(self, args): the base constructor
+            List<Arg> superArgs = null;
+            if (body.Count > first && body[first] is ExprStmt es && es.Value is CallExpr call && call.Func is AttributeExpr at && at.Name == "__init__")
+            {
+                if (at.Target is CallExpr sc && sc.Func is NameExpr sn && sn.Id == "super") superArgs = call.Args;
+                else if (DottedName(at.Target) is string bname && bases.Any(b => DottedName(b is SubscriptExpr bs ? bs.Target : b) == bname) &&
+                         call.Args.Count >= 1 && call.Args[0].Value is NameExpr selfArg && selfArg.Id == f.Params[0].Name && call.Args[0].Name == null)
+                    superArgs = call.Args.Skip(1).ToList();
+            }
+            if (superArgs != null)
             {
                 var saved = _scope; _scope = sig.Scope;
-                baseCall = " : base(" + EmitArgs(call.Args) + ")";
+                // a constructor initializer cannot be dispatched dynamically: late-bound arguments go as object, which binds
+                // statically to the base's dynamic constructor
+                bool lateBound = superArgs.Any(x => InferType(x.Value) == "dynamic") && superArgs.All(x => x.Name == null && !x.Star && !x.DoubleStar);
+                var baseInit = NearestInitAncestor(ctx.Def)?.Body.OfType<FunctionDef>().FirstOrDefault(fd => fd.Name == "__init__");
+                string kwBase = superArgs.Any(x => x.Name != null || x.DoubleStar) ? KwargsCallArgs(baseInit, 1, superArgs) : null;
+                baseCall = " : base(" + (kwBase ?? (lateBound ? string.Join(", ", superArgs.Select(x => $"(object?){Paren(EmitValue(x.Value))}")) : EmitArgs(superArgs))) + ")";
                 if (Obs != null && bases.Count > 0 && ResolveBase(bases[0], out var basePy, out _) && basePy != null &&
                     _p.TryFindClass(_m, basePy.Name, out var bcls, out var bowner))
-                    RecordCall(InitTarget(bowner, bcls), call.Args);
+                    RecordCall(InitTarget(bowner, bcls), superArgs);
                 _scope = saved;
                 body = body.Where((s, i) => i != first).ToList();
                 sig.Locals = LocalsAnalyzer.Analyze(body, f.Params.Select(p => p.Name), null);

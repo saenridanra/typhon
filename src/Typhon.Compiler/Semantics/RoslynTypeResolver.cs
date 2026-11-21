@@ -93,14 +93,23 @@ namespace Typhon.Compiler.Semantics
                         case IMethodSymbol m when m.MethodKind == MethodKind.Ordinary || m.MethodKind == MethodKind.Constructor:
                         {
                             var sig = new MemberSig { IsMethod = true, IsStatic = m.IsStatic, Type = Display(m.ReturnType) };
+                            if (m.TypeParameters.Length > 0)
+                            {
+                                sig.TypeParams = m.TypeParameters.Select(tp => tp.Name).ToList();
+                                sig.GenericType = GenericDisplay(m.ReturnType);
+                            }
                             foreach (var p in m.Parameters)
                             {
                                 var t = p.IsParams && p.Type is IArrayTypeSymbol arr ? arr.ElementType : p.Type;
                                 var fit = Fit(t, out var narrowTo);
                                 bool bigAccepts = BigFit(t, out var bigNarrow, out bool isBig);
                                 if (p.RefKind != RefKind.None) { fit = LongFit.Other; bigAccepts = false; bigNarrow = null; isBig = false; }
+                                var elem = p.IsParams && t is IArrayTypeSymbol pa ? pa.ElementType : t;
+                                bool takesFunction = elem.TypeKind == TypeKind.Delegate || elem.TypeKind == TypeKind.TypeParameter ||
+                                                     elem is INamedTypeSymbol en && en.Name == "Expression" && en.IsGenericType;
                                 sig.Parameters.Add(new ParamSig { Name = p.Name, Fit = fit, NarrowTo = narrowTo, IsParams = p.IsParams, IsOptional = p.IsOptional,
-                                                                  BigAccepts = bigAccepts, BigNarrowTo = bigNarrow, IsBigInteger = isBig });
+                                                                  BigAccepts = bigAccepts, BigNarrowTo = bigNarrow, IsBigInteger = isBig, TakesFunction = takesFunction,
+                                                                  GenericType = m.TypeParameters.Length > 0 ? GenericDisplay(elem) : null });
                             }
                             result.Add(sig);
                             break;
@@ -129,6 +138,16 @@ namespace Typhon.Compiler.Semantics
             if (t == null || t.SpecialType == SpecialType.System_Void || t.SpecialType == SpecialType.System_Object || t.TypeKind == TypeKind.Dynamic) return null;
             if (Keyword(t) is string k) return k;
             if (t.IsRefLikeType || t.TypeKind == TypeKind.Pointer || t.TypeKind == TypeKind.FunctionPointer || t.TypeKind == TypeKind.Error || HasTypeParameter(t)) return null;
+            return t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::System.Collections.Generic.", "");
+        }
+
+        /// <summary>A type as C# code, type parameters included (for binding a generic method's type arguments).</summary>
+        static string GenericDisplay(ITypeSymbol t)
+        {
+            if (t == null || t.SpecialType == SpecialType.System_Void) return null;
+            if (t.SpecialType == SpecialType.System_Object || t.TypeKind == TypeKind.Dynamic) return "object";
+            if (Keyword(t) is string k) return k;
+            if (t is ITypeParameterSymbol tp) return tp.Name;
             return t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::System.Collections.Generic.", "");
         }
 

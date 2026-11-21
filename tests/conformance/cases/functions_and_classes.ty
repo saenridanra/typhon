@@ -1,0 +1,171 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: functions as values, printf-style formatting, Python class hierarchies on CLR classes."""
+
+N, E, S, W = -10, 1, 10, -1
+BLACK, WHITE = range(2)
+low = high = 3
+
+
+# functions as values: passed, stored, called through a parameter (each gets its own specialised overload)
+def eval_a(i, j):
+    return 1.0 / ((i + j) * (i + j + 1) // 2 + i + 1)
+
+
+def times_u(func, u):
+    return [func((i, u)) for i in range(len(u))]
+
+
+def part_a(i_u):
+    i, u = i_u
+    total = 0.0
+    for j, u_j in enumerate(u):
+        total += eval_a(i, j) * u_j
+    return total
+
+
+def twice(f, x):
+    return f(f(x))
+
+
+def inc(x):
+    return x + 1
+
+
+def shout(s):
+    return s.upper() + "!"
+
+
+def first_big(xs):
+    for x in xs:
+        if x > 10:
+            return x
+
+
+print([round(v, 6) for v in times_u(part_a, [1.0, 2.0, 3.0])])
+g = inc
+handlers = {"inc": inc, "shout": shout}
+print(twice(inc, 3), twice(shout, "a"), g(10), twice(g, 0.5), handlers["shout"]("x"), handlers["inc"](1))
+print(first_big([1, 20, 3]), first_big([1, 2]), N + E + S + W, BLACK, WHITE, low + high)
+
+# printf-style formatting
+name, n, v = "x", 42, 3.14159
+print("%s=%d" % (name, n), "%5.2f|%-6s|%06.1f|%+d|% d" % (v, name, -v, n, n), "%x %#X %o" % (255, 255, 8))
+print("%(a)s and %(b)r" % {"a": 1, "b": "two"}, "%c%c" % (65, "b"), "%.3s|%5s|%-5s|" % ("abcdef", "ab", "cd"), "%d%%" % 50)
+print("%e %g %.0f %*d %.3d %s %s" % (12345.678, 1e-5, 2.5, 5, 3, 5, None, True))
+
+
+# a method only subclasses define, overrides that disagree on returning a value, a method alias
+class Shape:
+    def __init__(self, name):
+        self.name = name
+
+    def describe(self):
+        return f"{self.name} with area {self.area():.1f}"
+
+    def scale(self, k):
+        raise NotImplementedError
+
+
+class Rect(Shape):
+    def __init__(self, w, h):
+        Shape.__init__(self, "rect")
+        self.w = w
+        self.h = h
+
+    def area(self):
+        return self.w * self.h
+
+    def scale(self, k):
+        return Rect(self.w * k, self.h * k)
+
+    def __mul__(self, k):
+        return self.scale(k)
+
+    __rmul__ = __mul__
+
+
+class Square(Rect):
+    def __init__(self, side):
+        super(Square, self).__init__(side, side)
+        self.name = "square"
+
+
+shapes = [Rect(2, 3), Square(2)]
+for sh in shapes:
+    print(sh.describe(), sh.scale(2).area(), (sh * 3).area(), (2 * sh).area())
+
+
+# class attributes added after the class, attributes added from outside, class variables read through self
+class Strength:
+    REQUIRED = None
+    WEAK = None
+    count = 0
+
+    def __init__(self, value, label):
+        self.value = value
+        self.label = label
+        Strength.count += 1
+
+    def weaker(self):
+        return self.__class__.WEAK if self is Strength.REQUIRED else self
+
+    def total(self):
+        return self.count
+
+
+Strength.REQUIRED = Strength(0, "required")
+Strength.WEAK = Strength(5, "weak")
+
+
+class Options:
+    pass
+
+
+opts = Options()
+opts.width = 80
+opts.verbose = False
+print(Strength.REQUIRED.label, Strength.REQUIRED.weaker().label, Strength.WEAK.weaker().label, Strength.WEAK.total())
+print(opts.width * 2, opts.verbose)
+
+
+# two-phase construction: the subclass sets what the base's __init__ needs before calling it
+class Constraint:
+    def __init__(self, strength):
+        self.strength = strength
+        self.added = []
+        self.register()
+
+    def register(self):
+        self.added.append("base")
+
+
+class Scale(Constraint):
+    def __init__(self, factor, strength):
+        self.factor = factor
+        super().__init__(strength)
+
+    def register(self):
+        self.added.append(f"scale x{self.factor}")
+
+
+c = Scale(3, "strong")
+print(c.added, c.strength, c.factor)
+
+# placeholder lists filled later
+slots = [None] * 3
+slots[1] = Rect(1, 1)
+grid = [None for _ in range(2)]
+grid[0] = 7
+print(slots[0], slots[1].area(), grid)
+
+# while 1: an infinite loop that returns
+def countdown(k):
+    while 1:
+        k -= 1
+        if k <= 0:
+            return "done"
+
+
+print(countdown(3))

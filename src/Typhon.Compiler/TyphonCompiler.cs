@@ -71,6 +71,10 @@ namespace Typhon.Compiler
         public readonly Dictionary<string, ModuleInfo> Modules = new Dictionary<string, ModuleInfo>();
         /// <summary>Whole-program inference results, computed on the first Emit (all modules must be parsed by then).</summary>
         internal TypeInference Inference;
+        /// <summary>Module functions referenced as values somewhere in the project ("module.func"); each gets a function type.</summary>
+        internal HashSet<string> FunctionValueKeys;
+        /// <summary>Classes constructed in two phases (allocation, then an __init__ method), see Typhon.Runtime.NoInit.</summary>
+        internal HashSet<Syntax.ClassDef> TwoPhaseClasses;
 
         public ModuleInfo FindModule(string dotted) => Modules.TryGetValue(dotted, out var m) ? m : null;
 
@@ -177,6 +181,7 @@ namespace Typhon.Compiler
             if (project.Inference == null)
             {
                 if (project.Modules.Values.Any(m => m.BigIntPragma)) project.BigInts = true;
+                ClassModel.Complete(project);
                 TypeInference.Run(project);
             }
             var emitter = new ModuleEmitter(module, project, diagnostics);
@@ -191,7 +196,8 @@ namespace Typhon.Compiler
                 // Builtins.cs (builtins, runtime helpers, small modules) + Stdlib.cs (itertools, collections, functools, ...)
                 var asm = typeof(TyphonCompiler).Assembly;
                 var sb = new StringBuilder();
-                foreach (var name in new[] { "Typhon.Compiler.Runtime.Builtins.cs", "Typhon.Compiler.Runtime.Stdlib.cs" })
+                foreach (var name in new[] { "Typhon.Compiler.Runtime.Builtins.cs", "Typhon.Compiler.Runtime.Stdlib.cs", "Typhon.Compiler.Runtime.Modules.cs",
+                                             "Typhon.Compiler.Runtime.Json.cs", "Typhon.Compiler.Runtime.Regex.cs" })
                     using (var s = asm.GetManifestResourceStream(name))
                     using (var r = new StreamReader(s)) sb.Append(r.ReadToEnd()).Append('\n');
                 return sb.ToString();

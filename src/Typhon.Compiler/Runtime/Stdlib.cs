@@ -409,6 +409,8 @@ namespace Typhon.Stdlib
 
         public static IEnumerable<long> count(long start = 0, long step = 1) { for (long i = start; ; i = checked(i + step)) yield return i; }
         public static IEnumerable<double> count(double start, double step = 1) { for (double i = start; ; i += step) yield return i; }
+        public static IEnumerable<BigInteger> count(BigInteger start, BigInteger step) { for (var i = start; ; i += step) yield return i; }
+        public static IEnumerable<BigInteger> count(BigInteger start) { for (var i = start; ; i++) yield return i; }
         public static IEnumerable<T> cycle<T>(IEnumerable<T> iterable)
         {
             var saved = new List<T>();

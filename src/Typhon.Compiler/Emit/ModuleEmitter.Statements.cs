@@ -196,6 +196,41 @@ namespace Typhon.Compiler.Emit
             {
                 case NameExpr n:
                 {
+                    // g = f: g keeps f's function type (calls through g are typed calls of f)
+                    _fnTypedUse = rawValue == null && value is NameExpr;
+                    try { EmitAssignToName(n, value, stmt, rawValue); }
+                    finally { _fnTypedUse = false; }
+                    return;
+                }
+                case TupleExpr _:
+                case ListExpr _:
+                    EmitAssignToSequence(target, value, stmt, rawValue);
+                    return;
+                default:
+                    EmitAssignToOther(target, value, stmt, rawValue);
+                    return;
+            }
+        }
+
+        bool IsHoistedLocal(string name)
+        {
+            for (var sc = _scope; sc != null; sc = sc.Parent)
+            {
+                if (sc.Locals == null) continue;
+                return sc.Locals.HoistedPlain.Contains(name) && !_renames.ContainsKey(name);
+            }
+            return false;
+        }
+
+        /// <summary>A function name being assigned to a variable (its function type is kept).</summary>
+        bool _fnTypedUse;
+
+        void EmitAssignToName(NameExpr n, Expr value, Stmt stmt, string rawValue)
+        {
+            if (rawValue == null && RegexLiteral(value, out var rxPattern, out var rxFlags)) _regexLocals[n.Id] = (rxPattern, rxFlags);
+            else _regexLocals.Remove(n.Id);
+            {
+                {
                     string name = _renames.TryGetValue(n.Id, out var rn) ? rn : n.Id;
                     if (IsInline(stmt, n.Id))
                     {
@@ -218,6 +253,14 @@ namespace Typhon.Compiler.Emit
                             if (t == null || t.Contains("dynamic") && "lsd".IndexOf(kind) >= 0) { _w.Line($"var {Esc(name)} = {EmitExpr(value)};"); SetType(n.Id, InferType(value)); }
                             else { _w.Line($"{t} {Esc(name)} = {EmitEmptyContainer(value, t, kind)};"); SetType(n.Id, t); }
                             if (t != null && t.Contains(TypeInference.Pending)) SetType(n.Id, t);
+                        }
+                        else if (rawValue == null && value is LambdaExpr lam)
+                        {
+                            // f = lambda x: ...: a delegate typed by the calls through f (late-bound until they are known)
+                            _lambdaLocals[n.Id] = lam;
+                            string ftype = EmitLambdaLocal(lam, _scopeKey + "|λ" + n.Id, out string lambdaCode);
+                            _w.Line($"{ftype} {Esc(name)} = {lambdaCode};");
+                            SetType(n.Id, ftype);
                         }
                         else if (rawValue == null && NeedsExplicitType(value))
                         {
@@ -242,6 +285,7 @@ namespace Typhon.Compiler.Emit
                     {
                         string known = KnownType(n.Id) ?? (!IsLocal(n.Id) && _moduleFieldTypes.TryGetValue(n.Id, out var fieldType) ? fieldType : null);
                         string valueType = rawValue == null ? PyType(InferType(value)) : null;
+                        if (Obs != null && rawValue == null && IsHoistedLocal(n.Id)) Obs.AddHoisted(_scopeKey + "|" + n.Id, valueType);
                         // rebinding to a value of another type (names = names.split(",")) in the block that declared the variable:
                         // every later use sees the new value, so it becomes a new C# variable
                         // rebinding elsewhere (a nested block, a hoisted variable): the variable needs a wider type
@@ -261,39 +305,108 @@ namespace Typhon.Compiler.Emit
                             return;
                         }
                         bool typed = known != null && known != "dynamic";
+                        // a lambda into a late-bound variable or field: a delegate of dynamic values
+                        if (rawValue == null && value is LambdaExpr dl && !typed) { string dtype = EmitLambdaLocal(dl, null, out var dcode); rawValue = $"({dtype}){dcode}"; }
                         _w.Line($"{EmitName(n)} = {rawValue ?? (typed ? EmitExpr(value, targetTyped: true) : EmitValue(value))};");
                     }
                     return;
                 }
-                case TupleExpr _:
-                case ListExpr _:
+            }
+        }
+
+        void EmitAssignToSequence(Expr target, Expr value, Stmt stmt, string rawValue)
+        {
+            {
                 {
                     var elts = target is TupleExpr te ? te.Elts : ((ListExpr)target).Elts;
                     int starIdx = elts.FindIndex(e => e is StarredExpr);
                     if (starIdx >= 0) { EmitStarredUnpack(elts, starIdx, value, stmt, rawValue); return; }
-                    // a late-bound value (C# cannot deconstruct dynamic): its items by position, checked for the count
-                    if (rawValue == null && !(value is TupleExpr) && (InferType(value) == "dynamic" || InferType(value) == "object"))
+                    // a late-bound value (C# cannot deconstruct dynamic) or any other iterable (a, b = range(2) / xs / "ab"):
+                    // its items by position, checked for the count
+                    string unpackedType = rawValue == null && !(value is TupleExpr) ? InferType(value) : null;
+                    if (rawValue == null && !(value is TupleExpr) && IsDynamicallyDispatched(value)) unpackedType = "dynamic"; // divmod(late_bound, n): C# sees dynamic
+                    // a call whose type Typhon cannot tell (it may be dynamic to C#): unpacked by position, which works for any
+                    if (rawValue == null && value is CallExpr && unpackedType == null) unpackedType = "dynamic";
+                    if (unpackedType != null && (unpackedType == "dynamic" || unpackedType == "object" ||
+                        (TupleElementTypes(unpackedType) == null && !unpackedType.StartsWith("global::Typhon.Runtime.PyTuple") && !HasDeconstruct(unpackedType))))
                     {
                         string seq = NewTmp("u");
-                        _w.Line($"var {seq} = {Rt("list")}({EmitIterable(value)});");
+                        // a late-bound value (a tuple, a list, a str, a dict at run time): its items by run-time type
+                        string items = IsUnknownType(unpackedType) || unpackedType == "object?" ? $"{Rt("__iter_dyn")}((object?){Paren(EmitExpr(value))})" : EmitIterable(value);
+                        _w.Line($"var {seq} = {Rt("list")}({items});");
                         _w.Line($"if ({seq}.Count != {elts.Count}) throw new global::System.ArgumentException(\"expected {elts.Count} values to unpack, got \" + {seq}.Count);");
-                        for (int i = 0; i < elts.Count; i++) EmitAssignTo(elts[i], value, stmt, $"{seq}[{i}]");
+                        string itemType = IsUnknownType(unpackedType) || unpackedType == "object?" ? "dynamic" : PyType(ElementTypeOf(unpackedType));
+                        for (int i = 0; i < elts.Count; i++)
+                        {
+                            EmitAssignTo(elts[i], value, stmt, $"{seq}[{i}]");
+                            if (elts[i] is NameExpr un && IsInline(stmt, un.Id)) SetType(un.Id, itemType);
+                        }
                         return;
                     }
                     bool allInline = elts.All(e => e is NameExpr ne && IsInline(stmt, ne.Id) && !(_scope.Locals.Annotations.ContainsKey(ne.Id)));
+                    // best, cand, d0 = None, None, 1: items C# cannot type in a deconstruction (None, a lambda) are assigned one by
+                    // one; when a later item reads an earlier target, through temporaries first (Python evaluates the whole tuple)
+                    // (attribute targets too: self.a, self.b = {}, 0 gives each field its typed value and records what objects
+                    // get assigned from outside their class)
+                    if (rawValue == null && value is TupleExpr nt && nt.Elts.Count == elts.Count && !nt.Elts.Any(x => x is StarredExpr) &&
+                        elts.All(e => e is NameExpr || e is AttributeExpr) && (nt.Elts.Any(NeedsExplicitType) || elts.Any(e => e is AttributeExpr)))
+                    {
+                        var targetKeys = new HashSet<string>(elts.Select(e => DottedName(e)).Where(k => k != null));
+                        bool reads = nt.Elts.Any(x => { bool r = false; AstWalker.VisitAll(x, nn => { if (nn is NameExpr rn && targetKeys.Contains(rn.Id) || nn is AttributeExpr ra && DottedName(ra) is string rk && targetKeys.Contains(rk)) r = true; }); return r; });
+                        if (!reads) { for (int i = 0; i < elts.Count; i++) EmitAssignTo(elts[i], nt.Elts[i], stmt); return; }
+                        if (elts.All(e => e is AttributeExpr))
+                        {
+                            // self.a, self.b = self.b, self.a: all values first
+                            var tmps = nt.Elts.Select(x => { string tn = NewTmp("v"); _w.Line($"var {tn} = {EmitValue(x)};"); return tn; }).ToList();
+                            for (int i = 0; i < elts.Count; i++) EmitAssignTo(elts[i], nt.Elts[i], stmt, tmps[i]);
+                            return;
+                        }
+                    }
+                    // xs[i], xs[-j] = xs[-j], xs[i]: subscript targets (positions from the end are method calls) take the
+                    // items of a temporary, left to right, after the whole value is computed (as in Python)
+                    if (elts.Any(e => e is SubscriptExpr) && elts.All(e => e is NameExpr || e is SubscriptExpr || e is AttributeExpr) &&
+                        (value is TupleExpr || TupleElementTypes(InferType(value)) != null))
+                    {
+                        string tmp = NewTmp("t");
+                        _w.Line($"var {tmp} = {rawValue ?? EmitExpr(value)};");
+                        var vparts = value is TupleExpr vtt && vtt.Elts.Count == elts.Count ? vtt.Elts.Select(x => (Expr)x).ToList() : null;
+                        for (int i = 0; i < elts.Count; i++)
+                        {
+                            EmitAssignTo(elts[i], vparts?[i], stmt, $"{tmp}.Item{i + 1}");
+                            if (elts[i] is NameExpr tn && IsInline(stmt, tn.Id) && vparts != null) SetType(tn.Id, InferType(vparts[i]));
+                        }
+                        return;
+                    }
                     string valueCode = rawValue ?? EmitExpr(value);
                     if (allInline) _w.Line($"var ({string.Join(", ", elts.Select(e => Esc(((NameExpr)e).Id)))}) = {valueCode};");
                     else _w.Line($"{DeconstructionTarget(target, stmt)} = {valueCode};");
                     if (value is TupleExpr vt && vt.Elts.Count == elts.Count)
+                    {
                         for (int i = 0; i < elts.Count; i++)
                             if (elts[i] is NameExpr ne && IsInline(stmt, ne.Id)) SetType(ne.Id, InferType(vt.Elts[i]));
+                    }
+                    else if (rawValue == null && UnpackPartTypes(InferType(value), elts.Count) is List<string> parts)
+                    {
+                        // i, u = i_u where i_u is a (long, List<double>): the names get the tuple's element types
+                        for (int i = 0; i < elts.Count; i++)
+                            if (elts[i] is NameExpr ne && IsInline(stmt, ne.Id)) SetType(ne.Id, parts[i]);
+                    }
                     return;
                 }
+            }
+        }
+
+        void EmitAssignToOther(Expr target, Expr value, Stmt stmt, string rawValue)
+        {
+            switch (target)
+            {
                 case AttributeExpr at:
                 {
+                    if (Obs != null && rawValue == null) RecordExternalAttribute(at, value);
                     string ft = null;
                     if (at.Target is NameExpr tn && tn.Id == "self" && _cls != null) _cls.FieldTypes.TryGetValue(at.Name, out ft);
-                    string code = rawValue ?? EmitExpr(value, targetTyped: ft != null && ft != "dynamic");
+                    string code = rawValue ?? (TypeInference.IsNonePlaceholder(value) && ft != null && ft.StartsWith("List<")
+                        ? EmitNonePlaceholder(value, ft) : EmitExpr(value, targetTyped: ft != null && ft != "dynamic"));
                     if (rawValue == null && NarrowingForMember(at, value) is string narrowTo) code = $"checked(({narrowTo})({code}))";
                     _w.Line($"{EmitExpr(at)} = {code};");
                     return;
@@ -314,6 +427,11 @@ namespace Typhon.Compiler.Emit
                             ? (PyType(InferType(sub.Index)) ?? TypeInference.Unknown) + "→" + (kind == 'c' ? "long" : PyType(InferType(value)) ?? TypeInference.Unknown)
                             : PyType(InferType(value)));
                     string et = InferType(sub);
+                    if (InferType(sub.Target) == "dynamic" && !(sub.Index is TupleExpr))
+                    {
+                        _w.Line($"{Rt("__setitem")}((object?){Paren(EmitExpr(sub.Target))}, (object?){Paren(EmitExpr(sub.Index))}, (object?){Paren(rawValue ?? EmitValue(value))});");
+                        return;
+                    }
                     _w.Line($"{EmitExpr(sub)} = {rawValue ?? (et == null || et == "dynamic" ? EmitValue(value) : EmitExpr(value, targetTyped: IsEmptyLiteral(value)))};");
                     return;
                 }
@@ -325,6 +443,14 @@ namespace Typhon.Compiler.Emit
                     return;
             }
         }
+
+        /// <summary>A call C# binds at run time (a late-bound argument or receiver): its C# type is dynamic.</summary>
+        bool IsDynamicallyDispatched(Expr e) =>
+            e is CallExpr c && (c.Args.Any(a => InferType(a.Value) == "dynamic") || c.Func is AttributeExpr fa && InferType(fa.Target) == "dynamic");
+
+        /// <summary>Whether a value of this C# type deconstructs into its items (C# tuple syntax); other iterables unpack by position.</summary>
+        bool HasDeconstruct(string t) =>
+            t.Contains("KeyValuePair<") || t.StartsWith("ValueTuple<") || IsNamedTupleType(t);
 
         /// <summary>first, *rest, last = xs: the sequence is materialized once, then each target takes its part (Python checks the count).</summary>
         void EmitStarredUnpack(List<Expr> elts, int starIdx, Expr value, Stmt stmt, string rawValue)
@@ -538,6 +664,17 @@ namespace Typhon.Compiler.Emit
 
         void EmitAugAssign(AugAssignStmt a)
         {
+            // d[k] += v on a late-bound container: read, combine, write back (the container and key evaluated once)
+            if (a.Target is SubscriptExpr ds && !(ds.Index is SliceExpr) && !(ds.Index is TupleExpr) && InferType(ds.Target) == "dynamic")
+            {
+                string c = NewTmp("c"), k = NewTmp("k");
+                _w.Line($"object? {c} = {EmitExpr(ds.Target)}, {k} = {EmitExpr(ds.Index)};");
+                string cur = $"{Rt("__getitem")}({c}, {k})", val = EmitExpr(a.Value);
+                string combined = a.Op == "+" ? $"{Rt("add")}({cur}, {val})" : a.Op == "*" ? $"{Rt("mul")}({cur}, {val})"
+                    : AugHelpers.TryGetValue(a.Op, out var helper) ? $"{Rt(helper)}({cur}, {val})" : $"({cur} {a.Op} {Paren(val)})";
+                _w.Line($"{Rt("__setitem")}({c}, {k}, (object?){Paren(combined)});");
+                return;
+            }
             string target = EmitExpr(a.Target);
             string value = EmitExpr(a.Value);
             string tt = InferType(a.Target), vt = InferType(a.Value);
@@ -817,8 +954,8 @@ namespace Typhon.Compiler.Emit
                     var tup0 = (TupleExpr)f.Target;
                     bool inl = tup0.Elts.All(e => IsInline(f, ((NameExpr)e).Id));
                     prologue = inl ? $"var {DeconstructionPattern(tup0)} = {item};" : $"{DeconstructionTarget(tup0, f)} = {item};";
-                    var parts0 = TupleElementTypes(ElementTypeOf(iterType));
-                    if (inl && parts0 != null && parts0.Count == tup0.Elts.Count)
+                    var parts0 = UnpackPartTypes(ElementTypeOf(iterType), tup0.Elts.Count);
+                    if (inl && parts0 != null)
                         for (int i = 0; i < parts0.Count; i++) SetType(((NameExpr)tup0.Elts[i]).Id, parts0[i]);
                 }
                 EmitBlock(f.Body, prologue);
@@ -828,7 +965,16 @@ namespace Typhon.Compiler.Emit
             string kw = f.IsAsync ? "await foreach" : "foreach";
             if (f.Target is NameExpr n)
             {
-                if (IsInline(f, n.Id)) { SetType(n.Id, IterElementType(InferType(f.Iter))); _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
+                // the body rebinds the loop variable (case = case.strip(), an inner `for _ in`): a C# foreach variable is
+                // read-only, so the item goes into an ordinary variable
+                if (IsInline(f, n.Id) && AssignsName(f.Body, n.Id))
+                {
+                    string item = NewTmp("it");
+                    SetType(n.Id, IterElementType(IterableType(f.Iter)));
+                    _w.Line($"{kw} (var {item} in {iter})");
+                    EmitBlock(f.Body, $"var {Esc(n.Id)} = {item};");
+                }
+                else if (IsInline(f, n.Id)) { SetType(n.Id, IterElementType(IterableType(f.Iter))); _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
                 else
                 {
                     string t = NewTmp();
@@ -841,7 +987,11 @@ namespace Typhon.Compiler.Emit
             {
                 bool allInline = tup.Elts.All(e => e is NameExpr ne && IsInline(f, ne.Id));
                 // late-bound items (C# cannot deconstruct dynamic): each item's values by position, checked for the count
-                if (IterElementType(InferType(f.Iter)) == "dynamic" && !tup.Elts.Any(e => e is StarredExpr))
+                // (also a call dispatched dynamically, enumerate(u) with u late-bound: its C# type is dynamic, whatever it returns)
+                string loopElem = IterElementType(IterableType(f.Iter));
+                if ((loopElem == "dynamic" || IsDynamicallyDispatched(f.Iter) || IsUnknownType(IterableType(f.Iter)) && !(f.Iter is NameExpr) ||
+                     (loopElem == null || loopElem == "object") && f.Iter is CallExpr && UnpackPartTypes(loopElem, tup.Elts.Count) == null) &&
+                    !tup.Elts.Any(e => e is StarredExpr))
                 {
                     string item = NewTmp("x"), seq = NewTmp("u");
                     _w.Line($"{kw} (var {item} in {iter})");
@@ -861,8 +1011,8 @@ namespace Typhon.Compiler.Emit
                 {
                     _w.Line($"{kw} (var {DeconstructionPattern(tup)} in {iter})");
                     // for i, x in enumerate(xs) / for k, v in d.items(): the names get the tuple's element types
-                    var parts = TupleElementTypes(ElementTypeOf(InferType(f.Iter)));
-                    if (parts != null && parts.Count == tup.Elts.Count)
+                    var parts = UnpackPartTypes(ElementTypeOf(IterableType(f.Iter)), tup.Elts.Count);
+                    if (parts != null)
                         for (int i = 0; i < parts.Count; i++) SetType(((NameExpr)tup.Elts[i]).Id, parts[i]);
                     EmitBlock(f.Body);
                 }
@@ -875,6 +1025,15 @@ namespace Typhon.Compiler.Emit
                 return;
             }
             Unsupported(f.Target, "this loop target");
+        }
+
+        /// <summary>The types n unpacked names get from a value of this type: a tuple's items, or n times the item type of a computed-length tuple.</summary>
+        List<string> UnpackPartTypes(string t, int n)
+        {
+            if (TupleElementTypes(t) is List<string> parts) return parts.Count == n ? parts : null;
+            if (NamedTupleFieldTypes(t) is List<string> nt) return nt.Count == n ? nt : null;
+            if (t != null && t.StartsWith("global::Typhon.Runtime.PyTuple<") && t.EndsWith(">")) return Enumerable.Repeat(GenericArg(t), n).ToList();
+            return null;
         }
 
         /// <summary>"(long, string)" or "(long num1, long num2)" → its element types; null if not a tuple type.</summary>

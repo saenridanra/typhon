@@ -218,6 +218,8 @@ namespace Typhon.Compiler.Syntax
         public List<Expr> Bases = new List<Expr>();
         public List<Stmt> Body = new List<Stmt>();
         public List<Expr> Decorators = new List<Expr>();
+        /// <summary>Set for a class made from namedtuple(...) / typing.NamedTuple: its fields in order (it behaves like a tuple of them).</summary>
+        public List<string> NamedTupleFields;
     }
 
     public sealed class ModuleAst

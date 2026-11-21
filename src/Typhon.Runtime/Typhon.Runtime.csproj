@@ -17,6 +17,9 @@
   <ItemGroup>
     <Compile Include="..\Typhon.Compiler\Runtime\Builtins.cs" Link="Builtins.cs" />
     <Compile Include="..\Typhon.Compiler\Runtime\Stdlib.cs" Link="Stdlib.cs" />
+    <Compile Include="..\Typhon.Compiler\Runtime\Modules.cs" Link="Modules.cs" />
+    <Compile Include="..\Typhon.Compiler\Runtime\Json.cs" Link="Json.cs" />
+    <Compile Include="..\Typhon.Compiler\Runtime\Regex.cs" Link="Regex.cs" />
   </ItemGroup>
 
 </Project>

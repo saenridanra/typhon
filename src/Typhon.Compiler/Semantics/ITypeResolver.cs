@@ -48,6 +48,10 @@ namespace Typhon.Compiler.Semantics
         public string NarrowTo;
         public bool IsParams;
         public bool IsOptional;
+        /// <summary>The parameter takes a function: a delegate type, an expression tree, or a type parameter (which may bind to one).</summary>
+        public bool TakesFunction;
+        /// <summary>The parameter type as C# code with the method's type parameters left in ("List&lt;T&gt;", "IEnumerable&lt;T&gt;").</summary>
+        public string GenericType;
         /// <summary>Big-int mode: a System.Numerics.BigInteger converts implicitly (BigInteger, object, a type parameter, ...).</summary>
         public bool BigAccepts;
         /// <summary>Big-int mode: the parameter is exactly BigInteger (an overload that keeps Python ints exact).</summary>
@@ -68,6 +72,9 @@ namespace Typhon.Compiler.Semantics
         /// <summary>Big-int mode: for properties and fields of a numeric type, what a BigInteger is converted to.</summary>
         public string ValueBigNarrowTo;
         public List<ParamSig> Parameters = new List<ParamSig>();
+        /// <summary>A generic method's type parameters, and its return type with them left in ("T", "List&lt;T&gt;"); null if not generic.</summary>
+        public List<string> TypeParams;
+        public string GenericType;
     }
 
     /// <summary>A constructor as the emitter needs it: fully qualified C# parameter types and names.</summary>
