@@ -1,0 +1,94 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: late-bound values, rebinding, optional values, positions from the end, ranges, and/or values, file lines."""
+
+import os
+import tempfile
+from math import sqrt
+from typing import Mapping
+
+
+def describe(n: int | str) -> str:
+    n = str(n)  # a parameter rebound to another type
+    return n + n[::-1]
+
+
+def first_even(xs: list[int]) -> int:
+    for x in xs:
+        if x % 2 == 0:
+            return x
+    return None
+
+
+def scale(values: list[int | float], factor: float) -> list[float]:
+    return [v * factor for v in values]
+
+
+def total(weights: Mapping[str, int]) -> int:
+    return sum(w for _, w in weights.items())
+
+
+def tally(counts: dict[str, int] = None, extra: dict[str, int] = {}) -> int:
+    counts = counts or {}
+    return len(counts) + len(extra)
+
+
+def load(path):
+    with open(path) as f:
+        rows = f.readlines()
+    return [row.strip().split(",") for row in rows]
+
+
+def window(xs, k):
+    # a value of unknown type: str/list methods and unpacking at run time
+    head, *rest = xs
+    return head, len(rest), xs[-k:], " ".join(str(x) for x in xs).upper()
+
+
+# positions from the end: computed negative indexes
+xs = [10, 20, 30, 40]
+k = 1
+for i in range(len(xs)):
+    print(xs[i - 1], end=" ")
+print(xs[-k], xs[-(k + 1)], "typhon"[-k - 1])
+
+# and/or give the deciding operand
+name = "" or "anonymous"
+items = None
+items = items or []
+items.append(3)
+print(name, items, 0 or None, 2 and "yes", [] and [1], "x" or "y")
+
+# list += iterable extends in place (aliases see it)
+a = [1]
+b = a
+a += [2, 3]
+a += (4, 5)
+print(a, b is a)
+
+# ranges are sequences
+r = range(2, 20, 3)
+print(r, r[0], r[-1], len(r), 11 in r, 12 in r, list(r)[1:3], r[1])
+
+# rebinding and optional values
+print(describe(12), describe("ab"), first_even([1, 3, 6]), first_even([1, 3]))
+lookup = {"a": 1}
+found = lookup.pop("a", None)
+if found:
+    print("found", found + 1)
+missing = lookup.get("b")
+if missing is None:
+    print("missing")
+ratio = 7 / 2
+ratio = int(ratio)
+print(ratio, scale([1, 2.5], 2.0), total({"x": 2, "y": 3}), tally(), tally({"k": 1}, extra={}))
+print(int(" 42\n"), sqrt(16), pow(2, 10), max(len("ab"), 3))
+
+# reading lines keeps exactly the newlines the file has
+path = os.path.join(tempfile.gettempdir(), "typhon_dynamic_and_flow.txt")
+with open(path, "w") as out:
+    out.write("a,b\nc,d")
+print(load(path))
+os.remove(path)
+print(window([5, 6, 7], 2), window("abc", 1))

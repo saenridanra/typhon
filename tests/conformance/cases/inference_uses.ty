@@ -1,0 +1,91 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: types come from every use (empty containers, rebinding, comprehensions, aliases, bare annotations).
+
+Compiles with --strict: nothing here may fall back to dynamic."""
+
+Pair = tuple[int, int]
+Grid = list[list[int]]
+
+
+def neighbours(p: Pair) -> list[Pair]:
+    x, y = p
+    return [(x + 1, y), (x, y + 1)]
+
+
+def grid_sum(g: Grid) -> int:
+    return sum(sum(row) for row in g)
+
+
+def total(xs: list) -> int:
+    result = 0
+    for x in xs:
+        result += x
+    return result
+
+
+def first_and_last(t: tuple) -> str:
+    return f"{t[0]}..{t[-1]}"
+
+
+class Inventory:
+    def __init__(self) -> None:
+        self.items = []
+        self.counts = {}
+
+    def add(self, name: str, count: int) -> None:
+        self.items.append(name)
+        self.counts[name] = self.counts.get(name, 0) + count
+
+    def report(self) -> str:
+        return ", ".join(f"{n}={self.counts[n]}" for n in sorted(self.items))
+
+
+def build_grid(n: int) -> Grid:
+    grid = []
+    for i in range(n):
+        row = []
+        for j in range(n):
+            row.append(i * n + j)
+        grid.append(row)
+    return grid
+
+
+def word_stats(text: str) -> str:
+    words = text
+    words = words.lower().split()
+    lengths = {}
+    seen = set()
+    order = []
+    for w in words:
+        lengths.setdefault(len(w), []).append(w)
+        if w not in seen:
+            seen.add(w)
+            order.append(w)
+    longest = max(lengths)
+    return f"{len(order)} distinct, longest {longest}: {lengths[longest]}"
+
+
+g = build_grid(3)
+print(g, grid_sum(g), neighbours((1, 2)))
+print(total([1, 2, 3]), total([10, 20]), first_and_last((1, 2, 3)), first_and_last(("a", "b")))
+inv = Inventory()
+inv.add("pear", 2)
+inv.add("apple", 5)
+inv.add("pear", 1)
+print(inv.report(), len(inv.items))
+print(word_stats("The quick brown fox jumps over the lazy dog the end"))
+
+squares = {n: n * n for n in range(5)}
+evens = {n for n in range(10) if n % 2 == 0}
+pairs = [(a, b) for a in range(3) for b in range(a)]
+lookup = {name: len(name) for name in ["ab", "cde"]}
+print(squares, sorted(evens), pairs, lookup, sum(squares.values()), max(lookup, key=lambda k: lookup[k]))
+
+value = 42
+value = str(value) + "!"
+print(value, value.upper())
+numbers = "3,1,2"
+numbers = sorted(int(x) for x in numbers.split(","))
+print(numbers, numbers[0] + numbers[-1])

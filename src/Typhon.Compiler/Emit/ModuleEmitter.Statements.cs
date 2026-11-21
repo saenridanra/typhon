@@ -15,16 +15,57 @@ namespace Typhon.Compiler.Emit
 
         bool IsInline(Node stmt, string name) => _scope?.Locals != null && _scope.Locals.IsInline(stmt, name);
 
-        void EmitBlockStatements(List<Stmt> stmts)
+        /// <summary>Per block being emitted: the names it declares, and the renames (rebinding to another type) to undo at its end.</summary>
+        sealed class BlockFrame
         {
-            foreach (var s in stmts) EmitStmt(s);
+            public readonly HashSet<string> Declared = new HashSet<string>();
+            public readonly List<KeyValuePair<string, string>> Renamed = new List<KeyValuePair<string, string>>();
         }
 
-        void EmitBlock(List<Stmt> stmts, string prologue = null)
+        readonly Stack<BlockFrame> _blocks = new Stack<BlockFrame>();
+
+        void EmitBlockStatements(List<Stmt> stmts, string nonNegativeUntilAssigned = null, IEnumerable<string> preDeclared = null, string narrowed = null)
+        {
+            var frame = new BlockFrame();
+            if (preDeclared != null) foreach (var p in preDeclared) frame.Declared.Add(p);
+            _blocks.Push(frame);
+            // a name known non-negative on entry (while i < j: ... j > i >= 0) stays so up to the first statement that rebinds it;
+            // likewise an optional value known to be there (if x is not None:)
+            bool guarding = nonNegativeUntilAssigned != null && _nonNegative.Add(nonNegativeUntilAssigned);
+            bool narrowing = narrowed != null && _narrowed.Add(narrowed);
+            foreach (var s in stmts)
+            {
+                if (guarding && BindsName(s, nonNegativeUntilAssigned)) { _nonNegative.Remove(nonNegativeUntilAssigned); guarding = false; }
+                if (narrowing && BindsName(s, narrowed)) { _narrowed.Remove(narrowed); narrowing = false; }
+                EmitStmt(s);
+            }
+            if (guarding) _nonNegative.Remove(nonNegativeUntilAssigned);
+            if (narrowing) _narrowed.Remove(narrowed);
+            _blocks.Pop();
+            for (int i = frame.Renamed.Count - 1; i >= 0; i--)
+            {
+                var kv = frame.Renamed[i];
+                if (kv.Value == null) _renames.Remove(kv.Key); else _renames[kv.Key] = kv.Value;
+            }
+        }
+
+        void Declared(string name) { if (_blocks.Count > 0) _blocks.Peek().Declared.Add(name); }
+
+        /// <summary>Can a value of type v not be stored in a variable of type t? (only clear cases: Python value types that differ)</summary>
+        internal static bool Incompatible(string t, string v)
+        {
+            if (t == null || v == null || t == v || t == "dynamic" || v == "dynamic" || t == "object" || t == TypeInference.Pending || v == TypeInference.Pending) return false;
+            if (IsIntegral(t) && IsIntegral(v) || t == "double" && IsIntegral(v) || t == v + "?") return false;
+            bool Plain(string x) => PrimitiveCsTypes.Contains(x) || x.StartsWith("List<") || x.StartsWith("HashSet<") || IsDictType(x) || x.StartsWith("(") ||
+                                    x.StartsWith("global::Typhon.Runtime.PyTuple<");
+            return Plain(t) && Plain(v);
+        }
+
+        void EmitBlock(List<Stmt> stmts, string prologue = null, string nonNegativeUntilAssigned = null, string narrowed = null)
         {
             _w.Open();
             if (prologue != null) _w.Line(prologue);
-            EmitBlockStatements(stmts);
+            EmitBlockStatements(stmts, nonNegativeUntilAssigned, narrowed: narrowed);
             _w.Close();
         }
 
@@ -38,7 +79,11 @@ namespace Typhon.Compiler.Emit
                 case AugAssignStmt a: EmitAugAssign(a); break;
                 case AnnAssignStmt a: EmitAnnAssign(a); break;
                 case PassStmt _: break;
-                case BreakStmt _: _w.Line("break;"); break;
+                case BreakStmt _:
+                    // leaving a loop that has an 'else' marks it as broken out of, so its else block is skipped
+                    if (_breakFlags.Count > 0 && _breakFlags.Peek() != null) _w.Line($"{_breakFlags.Peek()} = true;");
+                    _w.Line("break;");
+                    break;
                 case ContinueStmt _: _w.Line("continue;"); break;
                 case ReturnStmt r: EmitReturn(r); break;
                 case RaiseStmt r: EmitRaise(r); break;
@@ -51,11 +96,17 @@ namespace Typhon.Compiler.Emit
                 case DelStmt d: EmitDel(d); break;
                 case IfStmt i: EmitIf(i, isElif: false); break;
                 case WhileStmt w:
-                    if (w.OrElse.Count > 0) Unsupported(w, "'while ... else'");
+                {
+                    string flag = LoopElseFlag(w.OrElse, w.Body);
                     _w.Line($"while ({Cond(w.Test)})");
-                    EmitBlock(w.Body);
+                    _breakFlags.Push(flag);
+                    EmitBlock(w.Body, nonNegativeUntilAssigned: WhileGuardedName(w.Test), narrowed: NarrowedBy(w.Test, whenTrue: true));
+                    _breakFlags.Pop();
+                    EmitLoopElse(w.OrElse, flag);
                     break;
+                }
                 case ForStmt f: EmitFor(f); break;
+                case MatchStmt m: EmitMatch(m); break;
                 case TryStmt t: EmitTry(t); break;
                 case WithStmt w: EmitWith(w); break;
                 case FunctionDef f: EmitLocalFunction(f); break;
@@ -66,6 +117,16 @@ namespace Typhon.Compiler.Emit
 
         void EmitExprStmt(ExprStmt e)
         {
+            // d.sort() / d.append(x) on a late-bound value as a statement: the method may return nothing (void), so an if
+            // statement, not a conditional expression, chooses between the runtime's method and the object's own
+            if (e.Value is CallExpr dc && dc.Func is AttributeExpr dm && InferType(dm.Target) == "dynamic" && !dc.Args.Any(a => a.Star || a.DoubleStar) && IsRuntimeMethod(dm.Name))
+            {
+                if (Obs != null) RecordCall(CallTarget(dc, out _), dc.Args);
+                string r = NewTmp("r");
+                string rest = EmitArgs(dc.Args, dynamicCall: true);
+                _w.Line($"{{ dynamic {r} = {EmitExpr(dm.Target)}; if ({Rt("__is_pyvalue")}({r})) global::Typhon.Runtime.Builtins.{Esc(dm.Name)}({r}{(rest.Length > 0 ? ", " : "")}{rest}); else {r}.{Esc(dm.Name)}({rest}); }}");
+                return;
+            }
             switch (e.Value)
             {
                 case ConstExpr c when c.Kind == ConstKind.Str || c.Kind == ConstKind.Ellipsis: return; // docstring / ...
@@ -75,7 +136,7 @@ namespace Typhon.Compiler.Emit
                         string t = NewTmp("y");
                         _w.Line($"foreach (var {t} in {EmitExpr(y.Value)}) yield return {t};");
                     }
-                    else _w.Line($"yield return {(y.Value != null ? EmitExpr(y.Value, targetTyped: _scope?.ReturnType != "dynamic") : "default")};");
+                    else _w.Line($"yield return {(y.Value == null ? "default" : _scope?.ReturnType == "dynamic" ? EmitValue(y.Value) : EmitExpr(y.Value, targetTyped: true))};");
                     return;
                 case CallExpr _:
                 case AwaitExpr _:
@@ -95,8 +156,21 @@ namespace Typhon.Compiler.Emit
 
         // ───────────────────────────── assignment ─────────────────────────────
 
+        /// <summary>Optional value-type names known to hold a value where they are read (see NarrowedBy): read as x.Value, typed T.</summary>
+        readonly HashSet<string> _narrowed = new HashSet<string>();
+
         string KnownType(string name)
         {
+            if (_narrowed.Contains(name) && KnownTypeCore(name) is string nt && nt.EndsWith("?")) return nt.Substring(0, nt.Length - 1);
+            return KnownTypeCore(name);
+        }
+
+        string KnownTypeCore(string name)
+        {
+            // comprehension variables (innermost first) while their comprehension is emitted
+            for (int i = _comprehensionTypes.Count - 1; i >= 0; i--)
+                if (_comprehensionTypes[i].Types.TryGetValue(name, out var ct)) return ct;
+                else if (_comprehensionTypes[i].Params.Contains(name)) return null;
             for (var s = _scope; s != null; s = s.Parent)
                 if (s.Types.TryGetValue(name, out var t)) return t;
             return null;
@@ -112,7 +186,7 @@ namespace Typhon.Compiler.Emit
             if (a.Value is YieldExpr) { Unsupported(a, "using 'yield' as an expression"); return; }
             if (a.Targets.Count == 1) { EmitAssignTo(a.Targets[0], a.Value, a); return; }
             string tmp = NewTmp();
-            _w.Line($"var {tmp} = {EmitExpr(a.Value)};");
+            _w.Line($"var {tmp} = {EmitValue(a.Value)};");
             foreach (var t in a.Targets) EmitAssignTo(t, new NameExpr { Id = tmp, Line = a.Line, Col = a.Col }, a, rawValue: tmp);
         }
 
@@ -126,29 +200,68 @@ namespace Typhon.Compiler.Emit
                     if (IsInline(stmt, n.Id))
                     {
                         string declType = null;
-                        if (_scope.Locals.Annotations.TryGetValue(n.Id, out var ann)) declType = MapType(ann, stmt);
+                        if (_scope.Locals.Annotations.TryGetValue(n.Id, out var ann) && !TypeInference.IsBareContainer(ann)) declType = MapType(ann, stmt);
+                        else if (ConflictType(n.Id) is string wider) declType = wider; // rebound to other types later (in a nested block)
                         string inferred = rawValue != null ? null : InferType(value);
+                        Declared(n.Id);
                         if (declType != null)
                         {
                             _w.Line($"{declType} {Esc(name)} = {rawValue ?? EmitExpr(value, targetTyped: declType != "dynamic")};");
                             SetType(n.Id, declType);
                         }
+                        else if (rawValue == null && TypeInference.IsEmptyContainer(value))
+                        {
+                            // xs = [] / {} / set(): its element type comes from what the code adds to it later (whole-program inference)
+                            char kind = TypeInference.ContainerKind(value);
+                            _emptyContainers[n.Id] = kind;
+                            string t = EmptyContainerType(_scopeKey + "|" + n.Id, kind, value);
+                            if (t == null || t.Contains("dynamic") && "lsd".IndexOf(kind) >= 0) { _w.Line($"var {Esc(name)} = {EmitExpr(value)};"); SetType(n.Id, InferType(value)); }
+                            else { _w.Line($"{t} {Esc(name)} = {EmitEmptyContainer(value, t, kind)};"); SetType(n.Id, t); }
+                            if (t != null && t.Contains(TypeInference.Pending)) SetType(n.Id, t);
+                        }
                         else if (rawValue == null && NeedsExplicitType(value))
                         {
-                            string t = inferred ?? ImplicitDynamic(stmt, $"variable '{n.Id}'");
+                            string t = PyType(inferred) ?? ImplicitDynamic(stmt, $"variable '{n.Id}'");
                             _w.Line($"{t} {Esc(name)} = {EmitExpr(value, targetTyped: t != "dynamic")};");
                             SetType(n.Id, t);
                         }
+                        else if (rawValue == null && (IsSmallInt(inferred) || _big && IsIntegral(inferred)))
+                        {
+                            // a .NET int (len of a .NET collection, str.Length, ...) stored in a Python variable is a Python int
+                            // (in big-int mode every int variable is a BigInteger, whatever 64-bit value starts it)
+                            _w.Line($"{IntT} {Esc(name)} = {EmitExpr(value)};");
+                            SetType(n.Id, IntT);
+                        }
                         else
                         {
-                            _w.Line($"var {Esc(name)} = {rawValue ?? EmitExpr(value)};");
+                            _w.Line($"var {Esc(name)} = {rawValue ?? EmitValue(value)};");
                             SetType(n.Id, inferred);
                         }
                     }
                     else
                     {
-                        string known = KnownType(n.Id);
-                        _w.Line($"{EmitName(n)} = {rawValue ?? EmitExpr(value, targetTyped: known != null && known != "dynamic")};");
+                        string known = KnownType(n.Id) ?? (!IsLocal(n.Id) && _moduleFieldTypes.TryGetValue(n.Id, out var fieldType) ? fieldType : null);
+                        string valueType = rawValue == null ? PyType(InferType(value)) : null;
+                        // rebinding to a value of another type (names = names.split(",")) in the block that declared the variable:
+                        // every later use sees the new value, so it becomes a new C# variable
+                        // rebinding elsewhere (a nested block, a hoisted variable): the variable needs a wider type
+                        bool sameBlock = _blocks.Count > 0 && _blocks.Peek().Declared.Contains(n.Id);
+                        if (Obs != null && valueType != null && known != null && !sameBlock &&
+                            (Incompatible(known, valueType) || known == "double" && IsIntegral(valueType) && valueType != "bool" && IsIntConversion(value)))
+                            Obs.AddConflict(_scopeKey + "|" + n.Id, IsIntegral(known) && valueType == "double" ? "double" : "dynamic");
+                        // (x = int(x) on a float: from here on x is an int, so it gets a new variable too)
+                        bool narrows = known == "double" && IsIntegral(valueType) && valueType != "bool";
+                        if (valueType != null && (Incompatible(known, valueType) || narrows) && _blocks.Count > 0 && _blocks.Peek().Declared.Contains(n.Id))
+                        {
+                            string fresh = NewTmp(n.Id + "_");
+                            _w.Line($"var {fresh} = {EmitValue(value)};");
+                            _blocks.Peek().Renamed.Add(new KeyValuePair<string, string>(n.Id, _renames.TryGetValue(n.Id, out var prev) ? prev : null));
+                            _renames[n.Id] = fresh;
+                            SetType(n.Id, valueType);
+                            return;
+                        }
+                        bool typed = known != null && known != "dynamic";
+                        _w.Line($"{EmitName(n)} = {rawValue ?? (typed ? EmitExpr(value, targetTyped: true) : EmitValue(value))};");
                     }
                     return;
                 }
@@ -156,6 +269,17 @@ namespace Typhon.Compiler.Emit
                 case ListExpr _:
                 {
                     var elts = target is TupleExpr te ? te.Elts : ((ListExpr)target).Elts;
+                    int starIdx = elts.FindIndex(e => e is StarredExpr);
+                    if (starIdx >= 0) { EmitStarredUnpack(elts, starIdx, value, stmt, rawValue); return; }
+                    // a late-bound value (C# cannot deconstruct dynamic): its items by position, checked for the count
+                    if (rawValue == null && !(value is TupleExpr) && (InferType(value) == "dynamic" || InferType(value) == "object"))
+                    {
+                        string seq = NewTmp("u");
+                        _w.Line($"var {seq} = {Rt("list")}({EmitIterable(value)});");
+                        _w.Line($"if ({seq}.Count != {elts.Count}) throw new global::System.ArgumentException(\"expected {elts.Count} values to unpack, got \" + {seq}.Count);");
+                        for (int i = 0; i < elts.Count; i++) EmitAssignTo(elts[i], value, stmt, $"{seq}[{i}]");
+                        return;
+                    }
                     bool allInline = elts.All(e => e is NameExpr ne && IsInline(stmt, ne.Id) && !(_scope.Locals.Annotations.ContainsKey(ne.Id)));
                     string valueCode = rawValue ?? EmitExpr(value);
                     if (allInline) _w.Line($"var ({string.Join(", ", elts.Select(e => Esc(((NameExpr)e).Id)))}) = {valueCode};");
@@ -169,12 +293,30 @@ namespace Typhon.Compiler.Emit
                 {
                     string ft = null;
                     if (at.Target is NameExpr tn && tn.Id == "self" && _cls != null) _cls.FieldTypes.TryGetValue(at.Name, out ft);
-                    _w.Line($"{EmitExpr(at)} = {rawValue ?? EmitExpr(value, targetTyped: ft != null && ft != "dynamic")};");
+                    string code = rawValue ?? EmitExpr(value, targetTyped: ft != null && ft != "dynamic");
+                    if (rawValue == null && NarrowingForMember(at, value) is string narrowTo) code = $"checked(({narrowTo})({code}))";
+                    _w.Line($"{EmitExpr(at)} = {code};");
+                    return;
+                }
+                case SubscriptExpr sub when sub.Index is SliceExpr sl:
+                {
+                    // xs[a:b] = ys replaces that part of the list (extended slices need as many values as positions)
+                    string tgt = EmitExpr(sub.Target);
+                    if (sub.Target is ConstExpr || sub.Target is BinOpExpr || sub.Target is UnaryExpr) tgt = Paren(tgt);
+                    string lo = sl.Lower != null ? SliceBound(sl.Lower) : "null", hi = sl.Upper != null ? SliceBound(sl.Upper) : "null";
+                    _w.Line($"{Rt("setslice")}({tgt}, {lo}, {hi}, {(sl.Step != null ? SliceBound(sl.Step) : "1")}, {rawValue ?? EmitIterable(value)});");
                     return;
                 }
                 case SubscriptExpr sub:
-                    _w.Line($"{EmitExpr(sub)} = {rawValue ?? EmitExpr(value)};");
+                {
+                    if (Obs != null && rawValue == null && ElementKey(sub.Target, out char kind) is string ekey)
+                        Obs.AddElement(ekey, TypeInference.IsMappingKind(kind)
+                            ? (PyType(InferType(sub.Index)) ?? TypeInference.Unknown) + "→" + (kind == 'c' ? "long" : PyType(InferType(value)) ?? TypeInference.Unknown)
+                            : PyType(InferType(value)));
+                    string et = InferType(sub);
+                    _w.Line($"{EmitExpr(sub)} = {rawValue ?? (et == null || et == "dynamic" ? EmitValue(value) : EmitExpr(value, targetTyped: IsEmptyLiteral(value)))};");
                     return;
+                }
                 case StarredExpr _:
                     Unsupported(target, "starred assignment targets");
                     return;
@@ -182,6 +324,184 @@ namespace Typhon.Compiler.Emit
                     Error(target, "cannot assign to this expression");
                     return;
             }
+        }
+
+        /// <summary>first, *rest, last = xs: the sequence is materialized once, then each target takes its part (Python checks the count).</summary>
+        void EmitStarredUnpack(List<Expr> elts, int starIdx, Expr value, Stmt stmt, string rawValue)
+        {
+            string seq = NewTmp("u");
+            _w.Line($"var {seq} = {Rt("list")}({rawValue ?? EmitIterable(value)});");
+            int fixedCount = elts.Count - 1;
+            _w.Line($"if ({seq}.Count < {fixedCount}) throw new global::System.ArgumentException(\"not enough values to unpack (expected at least {fixedCount}, got \" + {seq}.Count + \")\");");
+            for (int i = 0; i < elts.Count; i++)
+            {
+                if (i == starIdx) EmitAssignTo(((StarredExpr)elts[i]).Value, value, stmt, $"{seq}.GetRange({starIdx}, {seq}.Count - {fixedCount})");
+                else EmitAssignTo(elts[i], value, stmt, i < starIdx ? $"{seq}[{i}]" : $"{seq}[{seq}.Count - {elts.Count - i}]");
+            }
+        }
+
+        // ───────────────────────────── match (PEP 634) ─────────────────────────────
+
+        /// <summary>
+        /// match → an if/else-if chain over a temporary holding the subject. Each case is one condition: the pattern's tests
+        /// with its captures bound inside it (__bind returns true), then the guard, so the guard sees the captures.
+        /// </summary>
+        void EmitMatch(MatchStmt m)
+        {
+            string subj = NewTmp("m");
+            string subjType = InferType(m.Subject);
+            _w.Line($"var {subj} = {EmitValue(m.Subject)};");
+            bool first = true;
+            foreach (var c in m.Cases)
+            {
+                LineDirective(c);
+                string cond = PatternTest(c.Pattern, subj, subjType);
+                if (c.Guard != null) cond = Conj(cond, Paren(Cond(c.Guard)));
+                _w.Line($"{(first ? "if" : "else if")} ({cond})");
+                EmitBlock(c.Body);
+                first = false;
+            }
+        }
+
+        static string Conj(params string[] parts)
+        {
+            var ps = parts.Where(x => x != "true").ToList();
+            if (ps.Contains("false")) return "false";
+            return ps.Count == 0 ? "true" : string.Join(" && ", ps.Select(x => x.Contains("||") && !(x.StartsWith("(") && x.EndsWith(")")) ? "(" + x + ")" : x));
+        }
+
+        string Bind(string name, string value) => $"{Rt("__bind")}(out {EmitName(new NameExpr { Id = name })}, {value})";
+
+        static readonly HashSet<string> PrimitiveCsTypes = new HashSet<string> { "long", "int", "double", "float", "bool", "string", "char", "decimal" };
+
+        /// <summary>A C# condition that is true when the value v (of C# type vt, null if unknown) matches the pattern; binds its captures.</summary>
+        string PatternTest(Pattern p, string v, string vt)
+        {
+            switch (p)
+            {
+                case CapturePattern c: return c.Name == null ? "true" : Bind(c.Name, v);
+                case AsPattern a: return Conj(PatternTest(a.Inner, v, vt), Bind(a.Name, v));
+                case OrPattern o: return "(" + string.Join(" || ", o.Alternatives.Select(alt => Paren(PatternTest(alt, v, vt)))) + ")";
+                case ValuePattern val: return ValueTest(val.Value, v, vt);
+                case SequencePattern sq: return SequenceTest(sq, v, vt);
+                case MappingPattern mp: return MappingTest(mp, v, vt);
+                case ClassPattern cp: return ClassTest(cp, v, vt);
+            }
+            Unsupported(p, "this pattern");
+            return "false";
+        }
+
+        string ValueTest(Expr value, string v, string vt)
+        {
+            if (value is ConstExpr none && none.Kind == ConstKind.None) return $"({v} is null)";
+            bool untyped = vt == null || vt == "dynamic" || vt == "object";
+            if (value is ConstExpr b && b.Kind == ConstKind.Bool) // compared by identity: 1 does not match True
+                return vt == "bool" ? (b.Raw == "True" ? v : "!" + v) : untyped ? $"({v} is {(b.Raw == "True" ? "true" : "false")})" : "false";
+            string lt = InferType(value);
+            bool primitive = vt != null && PrimitiveCsTypes.Contains(vt) && lt != null && PrimitiveCsTypes.Contains(lt);
+            if (primitive && (vt == lt || IsIntegral(vt) && IsIntegral(lt) || (vt == "double" && IsIntegral(lt))))
+                return $"({v} == {EmitValue(value)})";
+            if (primitive) return vt == "string" || lt == "string" ? "false" : $"({v} == {EmitValue(value)})";
+            return $"{Rt("eq")}({v}, {EmitValue(value)})";
+        }
+
+        string SequenceTest(SequencePattern sq, string v, string vt)
+        {
+            int n = sq.Items.Count;
+            bool star = sq.StarIndex >= 0;
+            if (vt == "string" || vt != null && PrimitiveCsTypes.Contains(vt)) return "false"; // a str is not a sequence for patterns
+            var tupleTypes = TupleElementTypes(vt);
+            if (tupleTypes != null && !star)
+                return tupleTypes.Count != n ? "false" : Conj(sq.Items.Select((it, i) => PatternTest(it, $"{v}.Item{i + 1}", tupleTypes[i])).ToArray());
+            string seqVar = v, count, et = null;
+            var parts = new List<string>();
+            if (vt != null && (vt.StartsWith("List<") || vt.StartsWith("IList<") || vt.StartsWith("IReadOnlyList<") || vt.EndsWith("[]")))
+            {
+                et = ElementTypeOf(vt);
+                count = vt.EndsWith("[]") ? $"{v}.Length" : $"{v}.Count";
+                parts.Add($"{v} is not null");
+            }
+            else
+            {
+                seqVar = NewTmp("seq");
+                parts.Add($"{Rt("__match_seq")}({v}, out var {seqVar})");
+                count = $"{seqVar}.Count";
+            }
+            parts.Add(star ? $"{count} >= {n}" : $"{count} == {n}");
+            for (int i = 0; i < n; i++)
+                parts.Add(PatternTest(sq.Items[i], !star || i < sq.StarIndex ? $"{seqVar}[{i}]" : $"{seqVar}[{count} - {n - i}]", et));
+            if (star && sq.StarName != null) parts.Add(Bind(sq.StarName, $"{Rt("slice")}({seqVar}, {sq.StarIndex}, {count} - {n - sq.StarIndex})"));
+            return Conj(parts.ToArray());
+        }
+
+        string MappingTest(MappingPattern mp, string v, string vt)
+        {
+            var parts = new List<string>();
+            bool typed = IsDictType(vt);
+            string map = v, valueType = typed ? SplitTypeArgs(GenericArg(vt))[1] : null;
+            if (typed) parts.Add($"{v} is not null");
+            else { map = NewTmp("map"); parts.Add($"{Rt("__match_map")}({v}, out var {map})"); }
+            for (int i = 0; i < mp.Keys.Count; i++)
+            {
+                string key = typed ? EmitExpr(mp.Keys[i]) : EmitValue(mp.Keys[i]);
+                if (typed) { string tv = NewTmp("mv"); parts.Add($"{map}.TryGetValue({key}, out var {tv})"); parts.Add(PatternTest(mp.Values[i], tv, valueType)); }
+                else { parts.Add($"{map}.Contains({key})"); parts.Add(PatternTest(mp.Values[i], $"{map}[{key}]", null)); }
+            }
+            if (mp.Rest != null) Unsupported(mp, "'**rest' in mapping patterns");
+            return Conj(parts.ToArray());
+        }
+
+        static readonly Dictionary<string, string> BuiltinPatternTypes = new Dictionary<string, string>
+        {
+            ["int"] = "long", ["float"] = "double", ["str"] = "string", ["bool"] = "bool",
+            ["list"] = "global::System.Collections.IList", ["dict"] = "global::System.Collections.IDictionary",
+            ["tuple"] = "global::System.Runtime.CompilerServices.ITuple",
+        };
+
+        string ClassTest(ClassPattern cp, string v, string vt)
+        {
+            string clsName = DottedName(cp.Cls);
+            bool builtin = clsName != null && !IsShadowed(clsName) && BuiltinPatternTypes.ContainsKey(clsName);
+            string type = builtin ? BuiltinPatternTypes[clsName] : MapType(cp.Cls, cp);
+            bool untyped = vt == null || vt == "dynamic" || vt == "object";
+            string tmp = NewTmp("c");
+            var parts = new List<string>();
+            if (!untyped && vt == type) { parts.Add($"{v} is not null"); tmp = v; }
+            else if (!untyped && clsName == "int" && IsIntegral(vt)) tmp = $"((long){v})";
+            else if (!untyped && (PrimitiveCsTypes.Contains(vt) || PrimitiveCsTypes.Contains(type))) return "false";
+            else parts.Add($"{v} is {type} {tmp}");
+            if (builtin)
+            {
+                // int(x), str(s): one positional pattern matches the subject itself
+                if (cp.Positional.Count > 1) Error(cp, $"{clsName}() accepts at most one positional sub-pattern");
+                if (cp.Positional.Count == 1) parts.Add(PatternTest(cp.Positional[0], tmp, type));
+            }
+            else
+            {
+                var names = MatchArgs(cp.Cls);
+                for (int i = 0; i < cp.Positional.Count; i++)
+                {
+                    if (names == null || i >= names.Count) { Error(cp, $"{clsName}() accepts {names?.Count ?? 0} positional sub-patterns (__match_args__)"); break; }
+                    parts.Add(PatternTest(cp.Positional[i], $"{tmp}.{Esc(names[i])}", MemberType(type, names[i], method: false)));
+                }
+            }
+            for (int i = 0; i < cp.KeywordNames.Count; i++)
+                parts.Add(PatternTest(cp.KeywordPatterns[i], $"{tmp}.{Esc(cp.KeywordNames[i])}", builtin ? null : MemberType(type, cp.KeywordNames[i], method: false)));
+            return Conj(parts.ToArray());
+        }
+
+        /// <summary>The attribute names positional sub-patterns refer to: __match_args__, or a dataclass's fields in order.</summary>
+        List<string> MatchArgs(Expr cls)
+        {
+            string dotted = DottedName(cls);
+            if (dotted == null || !TryResolveType(dotted, 0, out _, out var pyClass) || pyClass == null) return null;
+            foreach (var st in pyClass.Body)
+                if (st is AssignStmt a && a.Targets.Count == 1 && a.Targets[0] is NameExpr n && n.Id == "__match_args__" && a.Value is TupleExpr t)
+                    return t.Elts.OfType<ConstExpr>().Where(c => c.Kind == ConstKind.Str).Select(c => c.Str).ToList();
+            if (HasDecorator(pyClass.Decorators, "dataclass"))
+                return pyClass.Body.OfType<AnnAssignStmt>().Where(a => a.Target is NameExpr && !(a.Annotation is SubscriptExpr sub && DottedName(sub.Target)?.EndsWith("ClassVar") == true))
+                              .Select(a => ((NameExpr)a.Target).Id).ToList();
+            return null;
         }
 
         /// <summary>'var x = null' / 'var x = []' have no natural type in C#.</summary>
@@ -211,29 +531,67 @@ namespace Typhon.Compiler.Emit
             }
         }
 
-        static readonly Dictionary<string, string> AugHelpers = new Dictionary<string, string> { ["/"] = "truediv", ["//"] = "floordiv", ["**"] = "pow", ["%"] = "mod" };
+        static readonly Dictionary<string, string> AugHelpers = new Dictionary<string, string>
+        {
+            ["/"] = "truediv", ["//"] = "floordiv", ["**"] = "pow", ["%"] = "mod", ["<<"] = "lshift", [">>"] = "rshift",
+        };
 
         void EmitAugAssign(AugAssignStmt a)
         {
             string target = EmitExpr(a.Target);
             string value = EmitExpr(a.Value);
-            if (AugHelpers.TryGetValue(a.Op, out var helper)) _w.Line($"{target} = {helper}({target}, {value});");
+            string tt = InferType(a.Target), vt = InferType(a.Value);
+            // n += 0.5 / n /= 2 on an int variable: it becomes a float
+            if (Obs != null && a.Target is NameExpr an && IsIntegral(tt) && tt != "bool" && (a.Op == "/" || vt == "double" && ArithmeticOps.Contains(a.Op)))
+                Obs.AddConflict(_scopeKey + "|" + an.Id, "double");
+            // sets and dicts update in place: s |= t, s -= t, s &= t, s ^= t, d |= e
+            if (IsSetType(tt) && (a.Op == "|" || a.Op == "-" || a.Op == "&" || a.Op == "^"))
+            {
+                string method = a.Op == "|" ? "update" : a.Op == "-" ? "difference_update" : a.Op == "&" ? "intersection_update" : "symmetric_difference_update";
+                _w.Line($"{target}.{method}({EmitIterable(a.Value)});");
+                return;
+            }
+            if (IsDictType(tt) && a.Op == "|") { _w.Line($"{target}.update({value});"); return; }
+            // xs += [...] on a list that started empty: its element types
+            if (Obs != null && a.Op == "+" && ElementKey(a.Target, out char lkind) is string lkey && (lkind == 'l' || lkind == 'q'))
+                Obs.AddElement(lkey, a.Value is ConstExpr ls && ls.Kind == ConstKind.Str || vt == "string" ? "string" : PyType(ElementTypeOf(vt)) ?? TypeInference.Unknown);
+            // d[k] += x / counts[word] += 1 on a container that started empty: the key (and value) types
+            if (Obs != null && a.Target is SubscriptExpr asub && ElementKey(asub.Target, out char akind) is string akey && TypeInference.IsMappingKind(akind))
+                Obs.AddElement(akey, (PyType(InferType(asub.Index)) ?? TypeInference.Unknown) + "→" + (akind == 'c' ? "long" : PyType(vt) ?? TypeInference.Unknown));
+            if (vt == "bool" && ArithmeticOps.Contains(a.Op)) value = $"({Paren(value)} ? 1L : 0L)";
+            if ((a.Op == "//" || a.Op == "%") && PowerOfTwoExponent(a.Value) > 0 && IsIntegral(InferType(a.Target)))
+                _w.Line($"{target} = {EmitBinOp(new BinOpExpr { Left = a.Target, Op = a.Op, Right = a.Value, Line = a.Line, Col = a.Col })};");
+            else if (AugHelpers.TryGetValue(a.Op, out var helper)) _w.Line($"{target} = {Rt(helper)}({target}, {value});");
             else if (a.Op == "@") _w.Line($"{target} = {target}.__matmul__({value});");
-            else if (a.Op == "+" && IsListy(a.Target)) _w.Line($"{target}.extend({value});"); // list += iterable mutates in place
+            // list += iterable mutates the list in place (aliases see it), whatever the iterable is
+            else if (a.Op == "+" && (IsListy(a.Target) || tt != null && tt.StartsWith("List<")))
+            {
+                // (items of another type, e.g. List<dynamic> += List<long>: converted one by one)
+                string te = ElementTypeOf(tt), ve = a.Value is ConstExpr vs && vs.Kind == ConstKind.Str || vt == "string" ? "string" : ElementTypeOf(vt);
+                bool cast = te != null && ve != null && te != ve && ve != TypeInference.Pending && te != TypeInference.Pending;
+                _w.Line(cast ? $"{Rt("__extend_cast")}({target}, {EmitIterable(a.Value)});" : $"{target}.extend({EmitIterable(a.Value)});");
+            }
+            else if (a.Op == "+" && tt == "dynamic" && !IsNumeric(vt)) _w.Line($"{target} = {Rt("__iadd")}({target}, {value});");
             else _w.Line($"{target} {a.Op}= {value};");
         }
 
         void EmitAnnAssign(AnnAssignStmt a)
         {
+            // x: list = [] / freq: defaultdict = defaultdict(int): a bare container annotation adds nothing, the value decides
+            if (a.Target is NameExpr bn && a.Value != null && TypeInference.IsBareContainer(a.Annotation))
+            {
+                EmitAssignTo(a.Target, a.Value, a);
+                return;
+            }
             if (a.Target is NameExpr n)
             {
                 string type = MapType(a.Annotation, a);
                 if (IsInline(a, n.Id))
                 {
-                    _w.Line($"{type} {Esc(n.Id)} = {(a.Value != null ? EmitExpr(a.Value, targetTyped: type != "dynamic") : "default")};");
+                    _w.Line($"{type} {Esc(n.Id)} = {(a.Value is ComprehensionExpr ac ? EmitComprehension(ac, type) : a.Value != null ? EmitExpr(a.Value, targetTyped: type != "dynamic") : "default")};");
                     SetType(n.Id, type);
                 }
-                else if (a.Value != null) _w.Line($"{EmitName(n)} = {EmitExpr(a.Value, targetTyped: type != "dynamic")};");
+                else if (a.Value != null) _w.Line($"{EmitName(n)} = {(a.Value is ComprehensionExpr ac2 ? EmitComprehension(ac2, type) : EmitExpr(a.Value, targetTyped: type != "dynamic"))};");
                 return;
             }
             if (a.Target is AttributeExpr at)
@@ -255,7 +613,7 @@ namespace Typhon.Compiler.Emit
                 return;
             }
             if (Obs != null && _retKey != null)
-                Obs.AddReturn(_retKey, r.Value == null || (r.Value is ConstExpr rc && rc.Kind == ConstKind.None) ? TypeInference.NoneType : (InferType(r.Value) ?? TypeInference.Unknown));
+                Obs.AddReturn(_retKey, r.Value == null || (r.Value is ConstExpr rc && rc.Kind == ConstKind.None) ? TypeInference.NoneType : (PyType(InferType(r.Value)) ?? TypeInference.Unknown));
             if (r.Value == null) { _w.Line("return;"); return; }
             string rt = _scope?.ReturnType;
             _w.Line($"return {EmitExpr(r.Value, targetTyped: rt != null && rt != "dynamic" && rt != "void")};");
@@ -274,7 +632,7 @@ namespace Typhon.Compiler.Emit
         void EmitIf(IfStmt i, bool isElif)
         {
             _w.Line($"{(isElif ? "else if" : "if")} ({Cond(i.Test)})");
-            EmitBlock(i.Body);
+            EmitBlock(i.Body, narrowed: NarrowedBy(i.Test, whenTrue: true));
             if (i.OrElse.Count == 1 && i.OrElse[0] is IfStmt elif)
             {
                 LineDirective(elif);
@@ -283,8 +641,24 @@ namespace Typhon.Compiler.Emit
             else if (i.OrElse.Count > 0)
             {
                 _w.Line("else");
-                EmitBlock(i.OrElse);
+                EmitBlock(i.OrElse, narrowed: NarrowedBy(i.Test, whenTrue: false));
             }
+        }
+
+        /// <summary>
+        /// if x: / if x is not None: / while x: (and the else of if x is None:) on an optional value (int | None → long?):
+        /// in that block x holds a value. Returns the name, or null.
+        /// </summary>
+        string NarrowedBy(Expr test, bool whenTrue)
+        {
+            if (test is BoolOpExpr b && b.Op == "and" && whenTrue) test = b.Values[0];
+            string name = null; bool positive = true;
+            if (test is NameExpr n) name = n.Id;
+            else if (test is CompareExpr c && c.Ops.Count == 1 && c.Left is NameExpr cn && IsNone(c.Comparators[0]) && (c.Ops[0] == "is not" || c.Ops[0] == "is"))
+            { name = cn.Id; positive = c.Ops[0] == "is not"; }
+            if (name == null || positive != whenTrue) return null;
+            string t = KnownType(name);
+            return t != null && t.EndsWith("?") && IsValueTypeName(t.Substring(0, t.Length - 1)) ? name : null;
         }
 
         bool IsBuiltinRange(Expr iter, out List<Expr> args)
@@ -316,16 +690,80 @@ namespace Typhon.Compiler.Emit
             return found;
         }
 
+        /// <summary>Per enclosing loop: the flag a 'break' sets (loops with an 'else' block that a break can skip), or null.</summary>
+        readonly Stack<string> _breakFlags = new Stack<string>();
+
+        /// <summary>Declares the "broke out" flag of a loop with an else block, if a break can skip it; returns its name or null.</summary>
+        string LoopElseFlag(List<Stmt> orElse, List<Stmt> body)
+        {
+            if (orElse.Count == 0 || !BreaksOutOf(body)) return null;
+            string flag = NewTmp("broke");
+            _w.Line($"var {flag} = false;");
+            return flag;
+        }
+
+        /// <summary>while/for ... else: the else block runs when the loop ends without 'break'.</summary>
+        void EmitLoopElse(List<Stmt> orElse, string flag)
+        {
+            if (orElse.Count == 0) return;
+            if (flag != null) _w.Line($"if (!{flag})");
+            EmitBlock(orElse);
+        }
+
+        /// <summary>Does a 'break' in these statements leave this loop? (Breaks in nested loop bodies leave those; their else blocks count.)</summary>
+        static bool BreaksOutOf(List<Stmt> stmts)
+        {
+            foreach (var st in stmts)
+            {
+                switch (st)
+                {
+                    case BreakStmt _: return true;
+                    case WhileStmt w: if (BreaksOutOf(w.OrElse)) return true; break;
+                    case ForStmt f: if (BreaksOutOf(f.OrElse)) return true; break;
+                    case IfStmt i: if (BreaksOutOf(i.Body) || BreaksOutOf(i.OrElse)) return true; break;
+                    case TryStmt t:
+                        if (BreaksOutOf(t.Body) || BreaksOutOf(t.OrElse) || BreaksOutOf(t.FinalBody) || t.Handlers.Any(h => BreaksOutOf(h.Body))) return true;
+                        break;
+                    case WithStmt wi: if (BreaksOutOf(wi.Body)) return true; break;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>while i &lt; j / j &gt; i / j &gt; 0 (i non-negative): j is non-negative when the body starts; its name, or null.</summary>
+        string WhileGuardedName(Expr test)
+        {
+            if (!(test is CompareExpr c) || c.Ops.Count != 1) return null;
+            string op = c.Ops[0];
+            if ((op == "<" || op == "<=") && c.Comparators[0] is NameExpr r && IsNonNegative(c.Left) && IsIntegral(InferType(r))) return r.Id;
+            if ((op == ">" || op == ">=") && c.Left is NameExpr l && IsNonNegative(c.Comparators[0]) && IsIntegral(InferType(l))) return l.Id;
+            return null;
+        }
+
+        /// <summary>int(x) / round(x) / math.floor(x): an explicit conversion to int (a float variable assigned one becomes an int).</summary>
+        bool IsIntConversion(Expr e) => e is CallExpr c && (c.Func is NameExpr n && (n.Id == "int" || n.Id == "round" && c.Args.Count == 1) && !IsShadowed(n.Id) ||
+                                                            c.Func is AttributeExpr a && IsMathModule(a.Target) && (a.Name == "floor" || a.Name == "ceil" || a.Name == "trunc"));
+
         void EmitFor(ForStmt f)
         {
-            if (f.OrElse.Count > 0) Unsupported(f, "'for ... else'");
+            string flag = LoopElseFlag(f.OrElse, f.Body);
+            _breakFlags.Push(flag);
+            EmitForLoop(f);
+            _breakFlags.Pop();
+            EmitLoopElse(f.OrElse, flag);
+        }
+
+        void EmitForLoop(ForStmt f)
+        {
 
             // Fast path: for i in range(...) → a plain counting loop (no enumerator allocation).
             if (!f.IsAsync && f.Target is NameExpr tn && IsBuiltinRange(f.Iter, out var args))
             {
-                string start = args.Count >= 2 ? EmitExpr(args[0]) : "0";
-                string stop = EmitExpr(args.Count >= 2 ? args[1] : args[0]);
-                string step = args.Count == 3 ? EmitExpr(args[2]) : "1";
+                // big-int mode: the counter stays a long (a range cannot have 2**63 steps); BigInteger bounds are narrowed
+                string Bound(Expr e) => _big && InferType(e) == TypeInference.BigInt && !IsIntLiteral(e) ? $"checked((long)({EmitExpr(e)}))" : EmitExpr(e);
+                string start = args.Count >= 2 ? Bound(args[0]) : "0";
+                string stop = Bound(args.Count >= 2 ? args[1] : args[0]);
+                string step = args.Count == 3 ? Bound(args[2]) : "1";
                 bool inline = IsInline(f, tn.Id);
                 bool direct = inline && !AssignsName(f.Body, tn.Id);
                 string iv = direct ? Esc(tn.Id) : NewTmp("i");
@@ -341,26 +779,56 @@ namespace Typhon.Compiler.Emit
                 {
                     // unknown step sign: precompute the trip count like Python's range does, keeping the loop test trivial
                     string st = NewTmp("step"), first = NewTmp("start"), k = NewTmp("k");
-                    _w.Line($"int {first} = {start}, {st} = {step};");
-                    _w.Line($"for (int {k} = 0, {end} = range_len({first}, {stop}, {st}), {iv} = {first}; {k} < {end}; {k}++, {iv} += {st})");
+                    _w.Line($"long {first} = {start}, {st} = {step};");
+                    _w.Line($"for (long {k} = 0, {end} = {Rt("range_len")}({first}, {stop}, {st}), {iv} = {first}; {k} < {end}; {k}++, {iv} += {st})");
                     cond = null; incr = null;
                 }
-                if (cond != null) _w.Line($"for (int {iv} = {start}, {end} = {stop}; {cond}; {incr})");
-                if (direct) { SetType(tn.Id, "int"); EmitBlock(f.Body); }
+                // Python ints are longs: the loop variable is too (indexing narrows it, see EmitPosition)
+                if (cond != null) _w.Line($"for (long {iv} = {start}, {end} = {stop}; {cond}; {incr})");
+                bool counts = direct && (stepConst ?? 0) > 0 && (args.Count < 2 || IsNonNegative(args[0])) && !_nonNegative.Contains(tn.Id);
+                if (counts) _nonNegative.Add(tn.Id);
+                if (direct) { SetType(tn.Id, "long"); EmitBlock(f.Body); }
                 else
                 {
                     string prologue = inline ? $"var {Esc(tn.Id)} = {iv};" : $"{EmitName(tn)} = {iv};";
-                    if (inline) SetType(tn.Id, "int");
+                    if (inline) SetType(tn.Id, "long");
                     EmitBlock(f.Body, prologue);
                 }
+                if (counts) _nonNegative.Remove(tn.Id);
                 return;
             }
 
+            // a list iterates by position, like Python's list iterator: the body may append to it or assign its items
+            string iterType = f.IsAsync ? null : InferType(f.Iter);
+            if (iterType != null && iterType.StartsWith("List<") && (f.Target is NameExpr || f.Target is TupleExpr tt0 && tt0.Elts.All(e => e is NameExpr)))
+            {
+                string list = NewTmp("l"), idx = NewTmp("i");
+                _w.Line($"var {list} = {EmitExpr(f.Iter)};");
+                _w.Line($"for (int {idx} = 0; {idx} < {list}.Count; {idx}++)");
+                string item = $"{list}[{idx}]";
+                string prologue;
+                if (f.Target is NameExpr ln)
+                {
+                    if (IsInline(f, ln.Id)) { prologue = $"var {Esc(ln.Id)} = {item};"; SetType(ln.Id, IterElementType(iterType)); }
+                    else prologue = $"{EmitName(ln)} = {item};";
+                }
+                else
+                {
+                    var tup0 = (TupleExpr)f.Target;
+                    bool inl = tup0.Elts.All(e => IsInline(f, ((NameExpr)e).Id));
+                    prologue = inl ? $"var {DeconstructionPattern(tup0)} = {item};" : $"{DeconstructionTarget(tup0, f)} = {item};";
+                    var parts0 = TupleElementTypes(ElementTypeOf(iterType));
+                    if (inl && parts0 != null && parts0.Count == tup0.Elts.Count)
+                        for (int i = 0; i < parts0.Count; i++) SetType(((NameExpr)tup0.Elts[i]).Id, parts0[i]);
+                }
+                EmitBlock(f.Body, prologue);
+                return;
+            }
             string iter = f.IsAsync ? EmitExpr(f.Iter) : EmitIterable(f.Iter);
             string kw = f.IsAsync ? "await foreach" : "foreach";
             if (f.Target is NameExpr n)
             {
-                if (IsInline(f, n.Id)) { SetType(n.Id, ElementTypeOf(InferType(f.Iter))); _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
+                if (IsInline(f, n.Id)) { SetType(n.Id, IterElementType(InferType(f.Iter))); _w.Line($"{kw} (var {Esc(n.Id)} in {iter})"); EmitBlock(f.Body); }
                 else
                 {
                     string t = NewTmp();
@@ -372,9 +840,30 @@ namespace Typhon.Compiler.Emit
             if (f.Target is TupleExpr tup)
             {
                 bool allInline = tup.Elts.All(e => e is NameExpr ne && IsInline(f, ne.Id));
+                // late-bound items (C# cannot deconstruct dynamic): each item's values by position, checked for the count
+                if (IterElementType(InferType(f.Iter)) == "dynamic" && !tup.Elts.Any(e => e is StarredExpr))
+                {
+                    string item = NewTmp("x"), seq = NewTmp("u");
+                    _w.Line($"{kw} (var {item} in {iter})");
+                    _w.Open();
+                    _w.Line($"var {seq} = {Rt("list")}({Rt("__iter_dyn")}((object){item}));");
+                    _w.Line($"if ({seq}.Count != {tup.Elts.Count}) throw new global::System.ArgumentException(\"expected {tup.Elts.Count} values to unpack, got \" + {seq}.Count);");
+                    for (int i = 0; i < tup.Elts.Count; i++)
+                    {
+                        EmitAssignTo(tup.Elts[i], null, f, $"{seq}[{i}]");
+                        if (tup.Elts[i] is NameExpr un && IsInline(f, un.Id)) SetType(un.Id, "dynamic");
+                    }
+                    EmitBlockStatements(f.Body);
+                    _w.Close();
+                    return;
+                }
                 if (allInline)
                 {
                     _w.Line($"{kw} (var {DeconstructionPattern(tup)} in {iter})");
+                    // for i, x in enumerate(xs) / for k, v in d.items(): the names get the tuple's element types
+                    var parts = TupleElementTypes(ElementTypeOf(InferType(f.Iter)));
+                    if (parts != null && parts.Count == tup.Elts.Count)
+                        for (int i = 0; i < parts.Count; i++) SetType(((NameExpr)tup.Elts[i]).Id, parts[i]);
                     EmitBlock(f.Body);
                 }
                 else
@@ -386,6 +875,28 @@ namespace Typhon.Compiler.Emit
                 return;
             }
             Unsupported(f.Target, "this loop target");
+        }
+
+        /// <summary>"(long, string)" or "(long num1, long num2)" → its element types; null if not a tuple type.</summary>
+        static List<string> TupleElementTypes(string t)
+        {
+            if (t != null && t.StartsWith("ValueTuple<") && t.EndsWith(">") && SplitTypeArgs(GenericArg(t)).Count == 1) return new List<string> { GenericArg(t) };
+            if (t == null || !t.StartsWith("(") || !t.EndsWith(")")) return null;
+            var parts = SplitTypeArgs(t.Substring(1, t.Length - 2));
+            for (int i = 0; i < parts.Count; i++)
+            {
+                // drop an element name: the last space outside <...> and (...)
+                int depth = 0, cut = -1;
+                for (int j = 0; j < parts[i].Length; j++)
+                {
+                    char ch = parts[i][j];
+                    if (ch == '<' || ch == '(') depth++;
+                    else if (ch == '>' || ch == ')') depth--;
+                    else if (ch == ' ' && depth == 0) cut = j;
+                }
+                if (cut > 0) parts[i] = parts[i].Substring(0, cut);
+            }
+            return parts;
         }
 
         string DeconstructionPattern(Expr e)
@@ -411,7 +922,9 @@ namespace Typhon.Compiler.Emit
         {
             foreach (var t in d.Targets)
             {
-                if (t is SubscriptExpr s && !(s.Index is SliceExpr)) _w.Line($"delitem({EmitExpr(s.Target)}, {EmitExpr(s.Index)});");
+                if (t is SubscriptExpr s && !(s.Index is SliceExpr)) _w.Line($"{Rt("delitem")}({EmitExpr(s.Target)}, {EmitExpr(s.Index)});");
+                else if (t is SubscriptExpr ss && ss.Index is SliceExpr sl)
+                    _w.Line($"{Rt("delslice")}({EmitExpr(ss.Target)}, {(sl.Lower != null ? SliceBound(sl.Lower) : "null")}, {(sl.Upper != null ? SliceBound(sl.Upper) : "null")}, {(sl.Step != null ? SliceBound(sl.Step) : "1")});");
                 else Unsupported(t, "'del' of a name, attribute or slice");
             }
         }
@@ -485,7 +998,7 @@ namespace Typhon.Compiler.Emit
                 if (item.Var == null) _w.Line($"{kw} ({ctx})");
                 else if (item.Var is NameExpr n)
                 {
-                    if (IsInline(w, n.Id)) _w.Line($"{kw} (var {Esc(n.Id)} = {ctx})");
+                    if (IsInline(w, n.Id)) { _w.Line($"{kw} (var {Esc(n.Id)} = {ctx})"); SetType(n.Id, InferType(item.Context)); } // with open(p) as f: f is the file
                     else _w.Line($"{kw} ({EmitName(n)} = {ctx})");
                 }
                 else Unsupported(item.Var, "this 'with ... as' target");
@@ -498,12 +1011,20 @@ namespace Typhon.Compiler.Emit
             if (f.Decorators.Count > 0) Unsupported(f, "decorators on nested functions");
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Add(tp.Name);
             var savedRet = _retKey; _retKey = null; // a nested function's returns are its own
+            // definition-time defaults of a nested function are evaluated each time its def runs: locals before it
+            foreach (var p in f.Params)
+                if (p.Default != null && p.Kind == ParamKind.Normal && !IsConstantDefault(p.Default))
+                {
+                    string tmp = NewTmp("default");
+                    _w.Line($"var {tmp} = {EmitValue(p.Default)};");
+                    _defaultSources[p] = tmp;
+                }
             var sig = BuildSignature(f, dropFirst: false);
             sig.Scope.HasSelf = false;
             if (!f.IsAsync && !sig.IsGenerator) _funcReturnTypes[f.Name] = sig.ReturnType;
             string asyncKw = f.IsAsync ? "async " : "";
             _w.Line($"{asyncKw}{sig.ReturnType} {Esc(f.Name)}{TypeParamList(f.TypeParams)}({sig.Params}){TypeParamConstraints(f.TypeParams, f)}");
-            EmitFunctionBody(f.Body, sig.Scope, null, sig.Locals);
+            EmitSignatureBody(f.Body, sig);
             foreach (var tp in f.TypeParams) _currentFuncTypeParams.Remove(tp.Name);
             _retKey = savedRet;
         }

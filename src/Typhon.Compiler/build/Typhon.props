@@ -3,6 +3,8 @@
   <PropertyGroup>
     <!-- strict | warn | permissive : what happens when the compiler has to fall back to 'dynamic' -->
     <TyphonTypeMode Condition="'$(TyphonTypeMode)' == ''">warn</TyphonTypeMode>
+    <!-- int64 | bigint : Python's int as a checked 64-bit long (fast, OverflowError beyond 64 bits) or an unbounded BigInteger -->
+    <TyphonIntMode Condition="'$(TyphonIntMode)' == ''">int64</TyphonIntMode>
     <!-- Include **/*.ty automatically (like **/*.cs). Set to false and add <TyphonCompile Include="..."/> items yourself. -->
     <EnableDefaultTyphonItems Condition="'$(EnableDefaultTyphonItems)' == ''">true</EnableDefaultTyphonItems>
     <!-- Properties reach the generator through a generated .editorconfig where '#' and ';' start comments.
@@ -14,6 +16,7 @@
     <CompilerVisibleProperty Include="RootNamespace" />
     <CompilerVisibleProperty Include="TyphonProjectDir" />
     <CompilerVisibleProperty Include="TyphonTypeMode" />
+    <CompilerVisibleProperty Include="TyphonIntMode" />
     <CompilerVisibleProperty Include="TyphonMainModule" />
   </ItemGroup>
 </Project>

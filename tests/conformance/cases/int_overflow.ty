@@ -1,0 +1,12 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance (known difference): beyond 64 bits CPython switches to arbitrary precision, Typhon raises OverflowError."""
+
+
+def factorial(n: int) -> int:
+    return 1 if n < 2 else n * factorial(n - 1)
+
+
+print(factorial(25))
+print(2 ** 64, 1 << 100)

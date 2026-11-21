@@ -11,7 +11,8 @@ using Typhon.Cli;
 //   typhon build <file.ty> [-o dir]    compile to disk: dir/<name>.dll, run it with `dotnet dir/<name>.dll`
 //   typhon build <file.ty> --aot       Native AOT: a self-contained native executable (needs the C++ build tools)
 //   typhon server start|stop|status    the background compile server (started automatically by `typhon run`)
-// Options: --strict | --permissive (type mode), --time (print compile/run timings to stderr),
+// Options: --strict | --permissive (type mode), --bigint (Python ints are unbounded BigIntegers instead of checked 64-bit
+//          longs; also TyphonIntMode=bigint in a project or a "# typhon: int=bigint" comment), --time (timings to stderr),
 //          --no-cache / TYPHON_CACHE=0 (always compile), --no-server / TYPHON_SERVER=0 (compile in this process)
 //
 // `typhon run` takes the fastest way that is still exact: a cached build of the unchanged script (ScriptCache), else
@@ -26,6 +27,8 @@ int mode = 1; // Typhon.Compiler.TypeMode: 0 = Strict, 1 = Warn, 2 = Permissive
 string modeName = "warn";
 if (argList.Remove("--strict")) { mode = 0; modeName = "strict"; }
 if (argList.Remove("--permissive")) { mode = 2; modeName = "permissive"; }
+// big-int mode travels with the type mode (one int to the compile server, one cache slot per combination)
+if (argList.Remove("--bigint")) { mode |= 0x10; modeName += "+bigint"; }
 bool timing = argList.Remove("--time");
 bool aot = argList.Remove("--aot");
 bool useCache = !argList.Remove("--no-cache") && ScriptCache.Enabled;
@@ -36,7 +39,7 @@ if (oIndex >= 0 && oIndex + 1 < argList.Count) { outDir = Path.GetFullPath(argLi
 
 if (argList.Count < 2 || argList[0] is not ("run" or "emit" or "check" or "build"))
 {
-    Console.Error.WriteLine("usage: typhon (run|emit|check|build) <file.ty> [args...] [-o dir] [--strict|--permissive] [--time] [--no-cache] [--no-server]");
+    Console.Error.WriteLine("usage: typhon (run|emit|check|build) <file.ty> [args...] [-o dir] [--strict|--permissive] [--bigint] [--time] [--no-cache] [--no-server]");
     Console.Error.WriteLine("       typhon server (start|stop|status)");
     return 2;
 }

@@ -1,0 +1,131 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: match, walrus, starred unpacking, slice assignment, except A, B, __file__, definition-time defaults."""
+
+import os
+from dataclasses import dataclass
+
+
+@dataclass
+class Point:
+    x: int
+    y: int
+
+
+LIMIT = 4
+SEP = "-" * 3
+
+
+def describe(value: object) -> str:
+    match value:
+        case None:
+            return "nothing"
+        case True | False:
+            return "a bool"
+        case 0:
+            return "zero"
+        case int(n) if n < 0:
+            return f"negative {n}"
+        case int(n):
+            return f"int {n}"
+        case "hi" | "hello":
+            return "a greeting"
+        case str(s):
+            return f"str of {len(s)}"
+        case Point(x=0, y=0):
+            return "origin"
+        case Point(0, y):
+            return f"on the y axis at {y}"
+        case Point(x, y) if x == y:
+            return f"diagonal {x}"
+        case Point():
+            return "a point"
+        case [x, y]:
+            return f"pair {x}, {y}"
+        case [first, *rest]:
+            return f"starts with {first}, {len(rest)} more"
+        case {"name": name, "age": age}:
+            return f"{name} is {age}"
+        case _:
+            return "something else"
+
+
+def roman(n: int) -> str:
+    result = ""
+    for value, numeral in [(10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")]:
+        while n >= value:
+            result += numeral
+            n -= value
+    match len(result):
+        case 0:
+            return "nulla"
+        case 1 | 2 | 3:
+            return result + " (short)"
+        case _:
+            return result
+
+
+def total(a: int, b: int, c: int) -> int:
+    return a * 100 + b * 10 + c
+
+
+def clipped(xs: list[int], limit: int = LIMIT, sep: str = SEP) -> str:
+    return sep.join(str(x) for x in xs[:limit])
+
+
+def collect(item: int, bucket: list[int] = []) -> list[int]:
+    bucket.append(item)
+    return bucket
+
+
+def parse(text: str) -> int:
+    try:
+        return int(text)
+    except ValueError, TypeError:
+        return -1
+
+
+for v in [None, True, 0, -5, 7, "hi", "typhon", Point(0, 0), Point(0, 3), Point(2, 2), Point(1, 5), [1, 2], [1, 2, 3, 4], {"name": "Ada", "age": 36}, 2.5]:
+    print(describe(v))
+print(roman(0), roman(3), roman(14))
+
+# walrus
+data = [3, 8, 1, 9, 4]
+if (n := len(data)) > 3:
+    print("long list of", n)
+big = [y for x in data if (y := x * 10) > 40]
+print(big, y)
+chunks = iter(["a", "b", ""])
+while (chunk := next(chunks)) != "":
+    print("chunk", chunk)
+
+# starred unpacking
+head, *tail = data
+*init, last = data
+a, *middle, z = "python"
+print(head, tail, init, last, a, middle, z)
+merged = [*data, 100, *range(2)]
+print(merged, (*data, 0), sorted({*data, 3, 42}))
+defaults = {"color": "red", "size": 1}
+print({**defaults, "size": 2, **{"shape": "round"}})
+args = (1, 2, 3)
+print(total(*args), total(*[4, 5, 6]), total(7, *[8, 9]))
+print(*data, sep=", ")
+
+# slice assignment and deletion
+xs = list(range(10))
+xs[2:5] = [20, 30]
+xs[-1:] = [90, 91, 92]
+del xs[0:2]
+print(xs)
+ys = list(range(8))
+ys[::2] = [0, 0, 0, 0]
+del ys[1::3]
+print(ys)
+
+# defaults are evaluated once, when the def runs
+print(clipped([1, 2, 3, 4, 5, 6]), clipped([1, 2, 3], 2), clipped([7, 8], sep="+"))
+print(collect(1), collect(2), collect(3, []))
+print(parse("12"), parse("x"))
+print(os.path.basename(__file__))

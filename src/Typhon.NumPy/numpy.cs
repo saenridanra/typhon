@@ -233,6 +233,7 @@ public static partial class numpy
     }
 
     public static ndarray array(IEnumerable<IEnumerable<int>> @object, object dtype = null) => ApplyDtype(FromObject(@object), dtype);
+    public static ndarray array(IEnumerable<IEnumerable<long>> @object, object dtype = null) => ApplyDtype(FromObject(@object), dtype);
 
     /// <summary>Like array() but returns the argument itself when it already is an ndarray.</summary>
     public static ndarray asarray(object a, object dtype = null)

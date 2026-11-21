@@ -29,6 +29,7 @@
     <!-- The runtime is C# source that gets compiled into each Typhon assembly, not into the compiler -->
     <Compile Remove="Runtime/**" />
     <EmbeddedResource Include="Runtime/Builtins.cs" LogicalName="Typhon.Compiler.Runtime.Builtins.cs" />
+    <EmbeddedResource Include="Runtime/Stdlib.cs" LogicalName="Typhon.Compiler.Runtime.Stdlib.cs" />
     <None Include="Runtime/**" />
 
     <None Include="build/**" Pack="true" PackagePath="build/" />

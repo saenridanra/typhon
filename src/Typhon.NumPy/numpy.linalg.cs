@@ -8,6 +8,9 @@ namespace Typhon.Stdlib;
 
 public static partial class numpy
 {
+    /// <summary>numpy.typing: annotations only (NDArray[...] is an ndarray, see the Typhon compiler's MapType).</summary>
+    public static class typing { }
+
     /// <summary>numpy.linalg (subset): norm, det, inv, solve, matrix_power.</summary>
     public static class linalg
     {

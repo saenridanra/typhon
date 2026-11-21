@@ -16,6 +16,7 @@
 
   <ItemGroup>
     <Compile Include="..\Typhon.Compiler\Runtime\Builtins.cs" Link="Builtins.cs" />
+    <Compile Include="..\Typhon.Compiler\Runtime\Stdlib.cs" Link="Stdlib.cs" />
   </ItemGroup>
 
 </Project>

@@ -95,6 +95,9 @@ namespace Typhon.Compiler.Syntax
 
     public sealed class StarredExpr : Expr { public Expr Value; }
 
+    /// <summary>Assignment expression (walrus): <c>(name := value)</c>.</summary>
+    public sealed class NamedExpr : Expr { public NameExpr Target; public Expr Value; }
+
     // ───────────────────────────── Statements ─────────────────────────────
 
     public abstract class Stmt : Node { }
@@ -155,6 +158,41 @@ namespace Typhon.Compiler.Syntax
     public sealed class WithItem { public Expr Context; public Expr Var; }
 
     public sealed class WithStmt : Stmt { public List<WithItem> Items = new List<WithItem>(); public List<Stmt> Body = new List<Stmt>(); public bool IsAsync; }
+
+    /// <summary>match subject: case pattern [if guard]: body ...</summary>
+    public sealed class MatchStmt : Stmt { public Expr Subject; public List<MatchCase> Cases = new List<MatchCase>(); }
+
+    public sealed class MatchCase : Node { public Pattern Pattern; public Expr Guard; public List<Stmt> Body = new List<Stmt>(); }
+
+    /// <summary>Structural pattern of a match case (PEP 634).</summary>
+    public abstract class Pattern : Node { }
+
+    /// <summary>A literal or a dotted constant (Color.RED): matches when equal. Also None/True/False (compared by identity).</summary>
+    public sealed class ValuePattern : Pattern { public Expr Value; }
+
+    /// <summary>A bare name binds the subject; '_' (Name == null) matches anything without binding.</summary>
+    public sealed class CapturePattern : Pattern { public string Name; }
+
+    /// <summary>pattern as name</summary>
+    public sealed class AsPattern : Pattern { public Pattern Inner; public string Name; }
+
+    /// <summary>p1 | p2 | ...</summary>
+    public sealed class OrPattern : Pattern { public List<Pattern> Alternatives = new List<Pattern>(); }
+
+    /// <summary>[p1, p2, *rest] or (p1, p2): a sequence of that length; StarIndex marks the *rest element (-1 if none).</summary>
+    public sealed class SequencePattern : Pattern { public List<Pattern> Items = new List<Pattern>(); public int StarIndex = -1; public string StarName; }
+
+    /// <summary>{key: pattern, **rest}</summary>
+    public sealed class MappingPattern : Pattern { public List<Expr> Keys = new List<Expr>(); public List<Pattern> Values = new List<Pattern>(); public string Rest; }
+
+    /// <summary>Cls(p1, attr=p2): an instance of Cls whose attributes match.</summary>
+    public sealed class ClassPattern : Pattern
+    {
+        public Expr Cls;
+        public List<Pattern> Positional = new List<Pattern>();
+        public List<string> KeywordNames = new List<string>();
+        public List<Pattern> KeywordPatterns = new List<Pattern>();
+    }
 
     public enum ParamKind { Normal, VarArgs, KwArgs }
 

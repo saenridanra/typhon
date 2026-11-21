@@ -334,6 +334,16 @@ public static partial class numpy
         }
 
         /// <summary>a[r1, r2], e.g. a[1:3, 1:3] (copy).</summary>
+        // Typhon's int is a 64-bit long: the same indexers for positions written as Python ints
+        static int Pos(long i) => checked((int)i);
+        public dynamic this[long i] { get => this[Pos(i)]; set => this[Pos(i)] = value; }
+        public double this[long i, long j] { get => this[Pos(i), Pos(j)]; set => this[Pos(i), Pos(j)] = value; }
+        public double this[long i, Index j] { get => this[Pos(i), j]; set => this[Pos(i), j] = value; }
+        public double this[Index i, long j] { get => this[i, Pos(j)]; set => this[i, Pos(j)] = value; }
+        public double this[long i, long j, long k] { get => this[Pos(i), Pos(j), Pos(k)]; set => this[Pos(i), Pos(j), Pos(k)] = value; }
+        public ndarray this[Range r, long j] { get => this[r, Pos(j)]; set => this[r, Pos(j)] = value; }
+        public ndarray this[long i, Range r] { get => this[Pos(i), r]; set => this[Pos(i), r] = value; }
+
         public ndarray this[Range r1, Range r2]
         {
             get { RequireRank(2, null); var (s1, n1) = RangeOf(r1, 0); var (s2, n2) = RangeOf(r2, 1); return GetBasic(new[] { s1, s2 }, new[] { n1, n2 }, new[] { false, false }); }
@@ -530,6 +540,7 @@ public static partial class numpy
         public static implicit operator ndarray(List<object> list) => FromObject(list);
         public static implicit operator ndarray(List<List<double>> list) => FromObject(list);
         public static implicit operator ndarray(List<List<int>> list) => FromObject(list);
+        public static implicit operator ndarray(List<List<long>> list) => FromObject(list);
         public static implicit operator ndarray(double[] values) => new((double[])values.Clone(), new[] { values.Length });
 
         /// <summary>float(a) for a size-1 array.</summary>
@@ -639,6 +650,22 @@ public static partial class numpy
         public ndarray cumprod() => Kernels.Cumulative(this, null, true);
         public ndarray cumprod(int axis) => Kernels.Cumulative(this, axis, true);
 
+        // Typhon's int is a 64-bit long: the same reductions for axes written as Python ints
+        static int Ax(long axis) => checked((int)axis);
+        public ndarray sum(long axis) => sum(Ax(axis));
+        public ndarray mean(long axis) => mean(Ax(axis));
+        public ndarray prod(long axis) => prod(Ax(axis));
+        public ndarray min(long axis) => min(Ax(axis));
+        public ndarray max(long axis) => max(Ax(axis));
+        public ndarray argmax(long axis) => argmax(Ax(axis));
+        public ndarray argmin(long axis) => argmin(Ax(axis));
+        public ndarray std(long axis) => std(Ax(axis));
+        public ndarray var(long axis) => var(Ax(axis));
+        public ndarray any(long axis) => any(Ax(axis));
+        public ndarray all(long axis) => all(Ax(axis));
+        public ndarray cumsum(long axis) => cumsum(Ax(axis));
+        public ndarray cumprod(long axis) => cumprod(Ax(axis));
+
         internal dynamic Reduce(int? axis, bool keepdims, RedOp op)
         {
             if (axis.HasValue) return Kernels.ReduceAxis(this, axis.Value, op, keepdims);
@@ -666,6 +693,7 @@ public static partial class numpy
         public ndarray reshape(params int[] shape) => ReshapeImpl(shape);
 
         public ndarray reshape(NumPyShape shape) => ReshapeImpl(shape.Dims);
+        public ndarray reshape(params long[] shape) => ReshapeImpl(Array.ConvertAll(shape, Ax));
 
         internal ndarray ReshapeImpl(int[] shape)
         {
@@ -711,6 +739,10 @@ public static partial class numpy
         }
 
         public ndarray transpose(params int[] axes) => axes == null || axes.Length == 0 ? transpose() : Kernels.Permute(this, axes);
+        public ndarray transpose(params long[] axes) => transpose(Array.ConvertAll(axes ?? Array.Empty<long>(), Ax));
+        public ndarray swapaxes(long axis1, long axis2) => swapaxes(Ax(axis1), Ax(axis2));
+        public double item(long index) => item(Ax(index));
+        public ndarray round(long decimals) => round(Ax(decimals));
 
         public ndarray swapaxes(int axis1, int axis2)
         {

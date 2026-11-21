@@ -19,7 +19,7 @@ namespace Typhon.Cli;
 internal static class CompileServer
 {
     const int Magic = 0x54595048; // "TYPH"
-    const int ProtocolVersion = 1;
+    const int ProtocolVersion = 2;
     const byte KindCompile = 1, KindPing = 2, KindStop = 3;
 
     public static bool Enabled => Environment.GetEnvironmentVariable("TYPHON_SERVER") != "0";
@@ -269,10 +269,10 @@ internal static class CompileServer
             case KindCompile:
             {
                 string path = r.ReadString();
-                var mode = (Typhon.Compiler.TypeMode)r.ReadInt32();
+                int modeBits = r.ReadInt32();
                 var sw = Stopwatch.StartNew();
                 CompileOutput output;
-                try { output = CliCompiler.Compile(path, mode, CompileTarget.Script, refs); }
+                try { output = CliCompiler.Compile(path, CliCompiler.TypeModeOf(modeBits), CompileTarget.Script, refs, bigInts: CliCompiler.BigIntsOf(modeBits)); }
                 catch (Exception) { w.Write((byte)1); w.Flush(); return; }
                 Interlocked.Increment(ref _compiles);
                 w.Write((byte)0);

@@ -1,0 +1,93 @@
+# Copyright (c) 2026 The Typhon contributors.
+# Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+"""Conformance: for ... else and while ... else (the else block runs when the loop ends without break)."""
+
+
+def primes_below(n: int) -> list[int]:
+    found: list[int] = []
+    for candidate in range(2, n):
+        for p in found:
+            if candidate % p == 0:
+                break
+        else:
+            found.append(candidate)
+    return found
+
+
+def find(xs: list[str], target: str) -> int:
+    i = 0
+    while i < len(xs):
+        if xs[i] == target:
+            break
+        i += 1
+    else:
+        return -1
+    return i
+
+
+def first_pair(rows: list[list[int]], total: int) -> str:
+    for r, row in enumerate(rows):
+        for c in range(len(row) - 1):
+            if row[c] + row[c + 1] == total:
+                break
+        else:
+            continue
+        return f"row {r}, column {c}"
+    return "none"
+
+
+def parse_all(texts: list[str]) -> str:
+    for t in texts:
+        try:
+            int(t)
+        except ValueError:
+            print("bad:", t)
+            break
+    else:
+        return "all numbers"
+    return "stopped"
+
+
+def countdown(n: int):
+    while n > 0:
+        yield n
+        n -= 1
+    else:
+        yield 0
+
+
+print(primes_below(30))
+print(find(["a", "b", "c"], "b"), find(["a", "b"], "z"))
+print(first_pair([[1, 2, 3], [4, 6, 1], [5, 5]], 7), first_pair([[1, 1]], 9))
+print(parse_all(["1", "2"]), parse_all(["1", "x", "3"]))
+print(list(countdown(3)))
+
+for i in range(3):
+    pass
+else:
+    print("for finished, i =", i)
+
+for word in []:
+    print("never")
+else:
+    print("empty loop runs else")
+
+n = 10
+while n > 1:
+    n //= 2
+    if n == 3:
+        break
+else:
+    print("while finished, n =", n)
+
+for x in [1, 2, 3]:
+    for y in [10, 20]:
+        if x * y == 40:
+            break
+    else:
+        continue
+    print("outer break at", x, y)
+    break
+else:
+    print("not reached")

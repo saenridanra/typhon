@@ -23,7 +23,106 @@ namespace Typhon.Runtime
     /// <summary>Implemented by Typhon classes that define __len__, so len() needs no reflection (Native AOT).</summary>
     internal interface IPyLen
     {
-        int __len__();
+        long __len__();
+    }
+
+    /// <summary>
+    /// A Python iterator (iter(x)): it remembers its position, next() advances it, and iterating it (for, list(), ...)
+    /// continues from there.
+    /// </summary>
+    internal sealed class PyIterator<T> : IEnumerable<T>, IEnumerator<T>
+    {
+        readonly IEnumerator<T> _e;
+        public PyIterator(IEnumerator<T> e) { _e = e; }
+        public T Current => _e.Current;
+        object? IEnumerator.Current => _e.Current;
+        public bool MoveNext() => _e.MoveNext();
+        public void Reset() => throw new NotSupportedException();
+        public void Dispose() { }
+        public IEnumerator<T> GetEnumerator() => this;
+        IEnumerator IEnumerable.GetEnumerator() => this;
+    }
+
+    /// <summary>A Python tuple of any length (implemented by PyTuple&lt;T&gt;), seen without its element type.</summary>
+    internal interface IPyTuple
+    {
+        int Count { get; }
+        object? this[int index] { get; }
+    }
+
+    /// <summary>
+    /// A tuple of computed length: tuple(xs), (*a, b), itertools results. Immutable; compares, hashes and orders by contents
+    /// (so it works as a dict key and in sets, and sorts like Python); prints as (a, b).
+    /// Tuples of a fixed shape written in the source, (a, b), stay C# ValueTuples.
+    /// </summary>
+    internal sealed class PyTuple<T> : IReadOnlyList<T>, IPyTuple, ITuple, IEquatable<PyTuple<T>>, IComparable<PyTuple<T>>, IComparable
+    {
+        int ITuple.Length => _items.Length;
+        object? ITuple.this[int index] => _items[index];
+        readonly T[] _items;
+        public static readonly PyTuple<T> Empty = new PyTuple<T>(Array.Empty<T>());
+        public PyTuple(IEnumerable<T> items) { _items = items as T[] ?? items.ToArray(); }
+        // a, b = t / for (a, b), (c, d) in combinations(...): unpacking checks the length like Python
+        T At(int i, int n) => _items.Length == n ? _items[i] : throw new ArgumentException($"expected {n} values to unpack, got {_items.Length}");
+        public void Deconstruct(out T a, out T b) { a = At(0, 2); b = At(1, 2); }
+        public void Deconstruct(out T a, out T b, out T c) { a = At(0, 3); b = At(1, 3); c = At(2, 3); }
+        public void Deconstruct(out T a, out T b, out T c, out T d) { a = At(0, 4); b = At(1, 4); c = At(2, 4); d = At(3, 4); }
+        public void Deconstruct(out T a, out T b, out T c, out T d, out T e) { a = At(0, 5); b = At(1, 5); c = At(2, 5); d = At(3, 5); e = At(4, 5); }
+        public T this[int index] => _items[index];
+        object? IPyTuple.this[int index] => _items[index];
+        public int Count => _items.Length;
+        public IEnumerator<T> GetEnumerator() => ((IEnumerable<T>)_items).GetEnumerator();
+        IEnumerator IEnumerable.GetEnumerator() => _items.GetEnumerator();
+        public bool Equals(PyTuple<T>? other)
+        {
+            if (other is null || other._items.Length != _items.Length) return false;
+            for (int i = 0; i < _items.Length; i++) if (!Builtins.eq(_items[i], other._items[i])) return false;
+            return true;
+        }
+        public override bool Equals(object? obj) => obj is PyTuple<T> t && Equals(t);
+        public override int GetHashCode()
+        {
+            var h = new HashCode();
+            foreach (var x in _items) h.Add(Builtins.PyEqualityComparer.Instance.GetHashCode(x));
+            return h.ToHashCode();
+        }
+        public int CompareTo(PyTuple<T>? other)
+        {
+            if (other is null) return 1;
+            var cmp = typeof(T) == typeof(string) ? (IComparer<T>)(object)StringComparer.Ordinal : Comparer<T>.Default;
+            for (int i = 0; i < Math.Min(_items.Length, other._items.Length); i++) { int c = cmp.Compare(_items[i], other._items[i]); if (c != 0) return c; }
+            return _items.Length.CompareTo(other._items.Length);
+        }
+        int IComparable.CompareTo(object? obj) => CompareTo(obj as PyTuple<T>);
+        public static bool operator ==(PyTuple<T>? a, PyTuple<T>? b) => a is null ? b is null : a.Equals(b);
+        public static bool operator !=(PyTuple<T>? a, PyTuple<T>? b) => !(a == b);
+        public static bool operator <(PyTuple<T> a, PyTuple<T> b) => a.CompareTo(b) < 0;
+        public static bool operator >(PyTuple<T> a, PyTuple<T> b) => a.CompareTo(b) > 0;
+        public static bool operator <=(PyTuple<T> a, PyTuple<T> b) => a.CompareTo(b) <= 0;
+        public static bool operator >=(PyTuple<T> a, PyTuple<T> b) => a.CompareTo(b) >= 0;
+        public static PyTuple<T> operator +(PyTuple<T> a, PyTuple<T> b) => new PyTuple<T>(a._items.Concat(b._items).ToArray());
+        public override string ToString() => Builtins.repr(this);
+    }
+
+    /// <summary>The characters of a str as Python sees them: one-character strs. A struct, so foreach allocates nothing.</summary>
+    internal readonly struct StrChars : IEnumerable<string>
+    {
+        readonly string _s;
+        public StrChars(string s) { _s = s; }
+        public Enumerator GetEnumerator() => new Enumerator(_s);
+        IEnumerator<string> IEnumerable<string>.GetEnumerator() => GetEnumerator();
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+
+        public struct Enumerator : IEnumerator<string>
+        {
+            readonly string _s; int _i;
+            public Enumerator(string s) { _s = s; _i = -1; }
+            public bool MoveNext() => ++_i < _s.Length;
+            public string Current => Builtins.CharStr(_s[_i]);
+            object IEnumerator.Current => Current;
+            public void Reset() => _i = -1;
+            public void Dispose() { }
+        }
     }
 
     internal sealed class AssertionError : Exception
@@ -42,14 +141,61 @@ namespace Typhon.Runtime
             else if (mode.Contains('a')) _writer = new System.IO.StreamWriter(path, append: true, Encoding.UTF8);
             else _reader = new System.IO.StreamReader(path, Encoding.UTF8);
         }
-        public string read() => _reader!.ReadToEnd();
-        public string readline() { var l = _reader!.ReadLine(); return l == null ? "" : l + "\n"; }
+        // text mode reads with universal newlines like Python: \r\n and \r become \n, and a line keeps its \n only if it has one
+        public string read() => _reader!.ReadToEnd().Replace("\r\n", "\n").Replace('\r', '\n');
+        public string readline()
+        {
+            var sb = new StringBuilder();
+            int c;
+            while ((c = _reader!.Read()) != -1)
+            {
+                if (c == '\r') { if (_reader.Peek() == '\n') _reader.Read(); sb.Append('\n'); break; }
+                sb.Append((char)c);
+                if (c == '\n') break;
+            }
+            return sb.ToString();
+        }
         public List<string> readlines() => this.ToList();
-        public int write(string s) { _writer!.Write(s); return s.Length; }
+        public long write(string s) { _writer!.Write(s); return s.Length; }
         public void close() => Dispose();
         public void Dispose() { _reader?.Dispose(); _writer?.Dispose(); }
-        public IEnumerator<string> GetEnumerator() { string? l; while ((l = _reader!.ReadLine()) != null) yield return l + "\n"; }
+        public IEnumerator<string> GetEnumerator() { string l; while ((l = readline()).Length > 0) yield return l; }
         IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>Python's range: an immutable sequence (indexing with negative positions, len, O(1) 'in'), iterated lazily.</summary>
+    internal sealed class PyRange : IReadOnlyList<long>, ICollection<long>, IPyRepr
+    {
+        public readonly long Start, Stop, Step;
+        readonly long _count;
+        public PyRange(long start, long stop, long step)
+        {
+            if (step == 0) throw new ArgumentException("range() arg 3 must not be zero");
+            Start = start; Stop = stop; Step = step; _count = Builtins.range_len(start, stop, step);
+        }
+        public long Length => _count;
+        public long this[long i]
+        {
+            get
+            {
+                long k = i < 0 ? i + _count : i;
+                if ((ulong)k >= (ulong)_count) throw new ArgumentOutOfRangeException(nameof(i), "range object index out of range");
+                return Start + k * Step;
+            }
+        }
+        public long this[Index i] => this[i.IsFromEnd ? -(long)i.Value : i.Value];
+        public long this[int i] => this[(long)i]; // (an int argument would otherwise be ambiguous between long and Index)
+        public int Count => checked((int)_count);
+        public bool Contains(long x) => Step > 0 ? x >= Start && x < Stop && (x - Start) % Step == 0 : x <= Start && x > Stop && (Start - x) % -Step == 0;
+        public IEnumerator<long> GetEnumerator() { for (long k = 0, i = Start; k < _count; k++, i += Step) yield return i; }
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+        bool ICollection<long>.IsReadOnly => true;
+        void ICollection<long>.Add(long x) => throw new NotSupportedException("range is immutable");
+        void ICollection<long>.Clear() => throw new NotSupportedException("range is immutable");
+        bool ICollection<long>.Remove(long x) => throw new NotSupportedException("range is immutable");
+        public void CopyTo(long[] a, int at) { long i = Start; for (long k = 0; k < _count; k++, i += Step) a[at + k] = i; }
+        public string __repr__() => Step == 1 ? $"range({Start}, {Stop})" : $"range({Start}, {Stop}, {Step})";
+        public override string ToString() => __repr__();
     }
 
     internal static class Builtins
@@ -87,6 +233,7 @@ namespace Typhon.Runtime
                 case char c: return c.ToString();
                 case Enum en: return en.GetType().Name + "." + en.ToString();
                 case Exception e: return e.Message;
+                case IPyRepr own: return own.ToString() ?? own.__repr__(); // str(): Fraction → 1/2, Path → /tmp/x
                 case IFormattable fmt when o is int || o is long || o is short || o is byte || o is sbyte || o is uint || o is ulong || o is ushort || o is decimal || o is BigInteger:
                     return fmt.ToString(null, Inv);
                 default: return CollectionRepr(o) ?? Convert.ToString(o, Inv) ?? "";
@@ -97,6 +244,7 @@ namespace Typhon.Runtime
         {
             string s => Quote(s),
             char c => Quote(c.ToString()),
+            IPyRepr own => own.__repr__(), // repr(): Fraction(1, 2), PosixPath('/tmp/x')
             _ => str(o),
         };
 
@@ -204,6 +352,11 @@ namespace Typhon.Runtime
                 var items = Enumerable.Range(0, t.Length).Select(i => repr(t[i])).ToList();
                 return "(" + string.Join(", ", items) + (items.Count == 1 ? ",)" : ")");
             }
+            if (o is IPyTuple pt)
+            {
+                var items = Enumerable.Range(0, pt.Count).Select(i => repr(pt[i])).ToList();
+                return "(" + string.Join(", ", items) + (items.Count == 1 ? ",)" : ")");
+            }
             if (o is IDictionary d)
             {
                 var parts = new List<string>();
@@ -236,7 +389,8 @@ namespace Typhon.Runtime
             if (i < spec.Length && spec[i] == '.') { i++; precision = 0; while (i < spec.Length && char.IsDigit(spec[i])) precision = precision * 10 + (spec[i++] - '0'); }
             if (i < spec.Length) type = spec[i];
 
-            bool isNumber = value is int || value is long || value is double || value is float || value is decimal || value is short || value is byte || value is BigInteger;
+            bool isInt = value is int || value is long || value is short || value is byte || value is sbyte || value is ushort || value is uint || value is ulong || value is BigInteger;
+            bool isNumber = isInt || value is double || value is float || value is decimal;
             // .NET types keep their own format strings: f"{DateTime.Now:yyyy-MM-dd}", f"{guid:N}"
             if (!isNumber && value is IFormattable custom) return custom.ToString(spec, Inv);
             string body;
@@ -248,36 +402,46 @@ namespace Typhon.Runtime
             }
             else
             {
-                double d = Convert.ToDouble(value, Inv);
-                bool isInt = value is int || value is long || value is short || value is byte || value is BigInteger;
-                bool neg = d < 0 || (d == 0 && double.IsNegative(d));
-                double a = Math.Abs(d);
-                string g = grouping == '\0' ? "" : ",";
-                switch (type)
+                bool neg;
+                if (isInt && "dnxXobc\0".IndexOf(type) >= 0)
                 {
-                    case 'f': case 'F': body = a.ToString((g == "" ? "F" : "N") + (precision < 0 ? 6 : precision), Inv); break;
-                    case '%': body = (a * 100).ToString((g == "" ? "F" : "N") + (precision < 0 ? 6 : precision), Inv) + "%"; break;
-                    case 'e': case 'E':
-                    {
-                        string s = a.ToString((type == 'e' ? "e" : "E") + (precision < 0 ? 6 : precision), Inv);
-                        int ei = s.IndexOfAny(new[] { 'e', 'E' });
-                        int exp = int.Parse(s.Substring(ei + 1), Inv);
-                        body = s.Substring(0, ei + 1) + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString("00", Inv);
-                        break;
-                    }
-                    case 'd': case 'n': body = Convert.ToInt64(a).ToString(g == "" ? "D" : "N0", Inv); break;
-                    case 'x': body = Convert.ToInt64(a).ToString("x", Inv); break;
-                    case 'X': body = Convert.ToInt64(a).ToString("X", Inv); break;
-                    case 'o': body = Convert.ToString(Convert.ToInt64(a), 8); break;
-                    case 'b': body = Convert.ToString(Convert.ToInt64(a), 2); break;
-                    case 'g': case 'G': body = isInt && precision < 0 ? Convert.ToInt64(a).ToString(Inv) : FormatGeneral(a, precision, type == 'G', false, alternate); break;
-                    default:
-                        if (isInt) body = g == "" ? Convert.ToInt64(a).ToString(Inv) : Convert.ToInt64(a).ToString("N0", Inv);
-                        else if (precision >= 0) body = FormatGeneral(a, precision, false, true, alternate);
-                        else body = FormatFloat(a);
-                        break;
+                    // integers are formatted exactly (a double would lose digits above 2**53)
+                    BigInteger v = value is BigInteger big ? big : value is ulong ul ? new BigInteger(ul) : new BigInteger(Convert.ToInt64(value, Inv));
+                    neg = v.Sign < 0;
+                    body = IntDigits(BigInteger.Abs(v), type, grouping);
+                    if (alternate && "xXob".IndexOf(type) >= 0) body = "0" + (type == 'X' ? 'X' : type) + body;
                 }
-                if (grouping == '_') body = body.Replace(',', '_');
+                else
+                {
+                    double d = Convert.ToDouble(value, Inv);
+                    neg = d < 0 || (d == 0 && double.IsNegative(d));
+                    double a = Math.Abs(d);
+                    string g = grouping == '\0' ? "" : ",";
+                    switch (type)
+                    {
+                        case 'f': case 'F': body = a.ToString((g == "" ? "F" : "N") + (precision < 0 ? 6 : precision), Inv); break;
+                        case '%': body = (a * 100).ToString((g == "" ? "F" : "N") + (precision < 0 ? 6 : precision), Inv) + "%"; break;
+                        case 'e': case 'E':
+                        {
+                            string s = a.ToString((type == 'e' ? "e" : "E") + (precision < 0 ? 6 : precision), Inv);
+                            int ei = s.IndexOfAny(new[] { 'e', 'E' });
+                            int exp = int.Parse(s.Substring(ei + 1), Inv);
+                            body = s.Substring(0, ei + 1) + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString("00", Inv);
+                            break;
+                        }
+                        case 'd': case 'n': body = Convert.ToInt64(a).ToString(g == "" ? "D" : "N0", Inv); break;
+                        case 'x': body = Convert.ToInt64(a).ToString("x", Inv); break;
+                        case 'X': body = Convert.ToInt64(a).ToString("X", Inv); break;
+                        case 'o': body = Convert.ToString(Convert.ToInt64(a), 8); break;
+                        case 'b': body = Convert.ToString(Convert.ToInt64(a), 2); break;
+                        case 'g': case 'G': body = FormatGeneral(a, precision, type == 'G', false, alternate); break;
+                        default:
+                            if (precision >= 0) body = FormatGeneral(a, precision, false, true, alternate);
+                            else body = FormatFloat(a);
+                            break;
+                    }
+                    if (grouping == '_') body = body.Replace(',', '_');
+                }
                 string signStr = neg ? "-" : sign == '+' ? "+" : sign == ' ' ? " " : "";
                 if (zero && align == '\0') { fill = '0'; align = '='; }
                 if (align == '\0') align = '>';
@@ -296,6 +460,28 @@ namespace Typhon.Runtime
                 case '^': return new string(fill, total / 2) + body + new string(fill, total - total / 2);
                 default: return new string(fill, total) + body;
             }
+        }
+
+        /// <summary>Digits of a non-negative integer for the d/n/x/X/o/b presentations, grouped like Python (3 decimal, 4 other digits).</summary>
+        static string IntDigits(BigInteger mag, char type, char grouping)
+        {
+            int radix = type == 'x' || type == 'X' ? 16 : type == 'o' ? 8 : type == 'b' ? 2 : 10;
+            string digits;
+            if (radix == 10) digits = mag.ToString(Inv);
+            else if (mag.IsZero) digits = "0";
+            else
+            {
+                var sb = new StringBuilder();
+                while (!mag.IsZero) { sb.Insert(0, "0123456789abcdef"[(int)(mag % radix)]); mag /= radix; }
+                digits = type == 'X' ? sb.ToString().ToUpperInvariant() : sb.ToString();
+            }
+            if (grouping == '\0') return digits;
+            int size = radix == 10 ? 3 : 4;
+            var grouped = new StringBuilder();
+            int first = digits.Length % size == 0 ? size : digits.Length % size;
+            grouped.Append(digits, 0, Math.Min(first, digits.Length));
+            for (int i = first; i < digits.Length; i += size) grouped.Append(grouping).Append(digits, i, size);
+            return grouped.ToString();
         }
 
         /// <summary>"{} and {:.2f}".format(a, b)</summary>
@@ -338,6 +524,7 @@ namespace Typhon.Runtime
             string s => s.Length > 0,
             int i => i != 0,
             long l => l != 0,
+            BigInteger big => !big.IsZero,
             double d => d != 0,
             float f => f != 0,
             decimal m => m != 0,
@@ -346,15 +533,29 @@ namespace Typhon.Runtime
             _ => true,
         };
 
-        public static int @int(string s) => int.TryParse(s.Trim().Replace("_", ""), NumberStyles.Integer, Inv, out var v) ? v
-            : throw new ArgumentException($"invalid literal for int() with base 10: {repr(s)}");
-        public static int @int(string s, int @base) => Convert.ToInt32(s.Trim().Replace("_", ""), @base);
-        public static int @int(double d) => checked((int)Math.Truncate(d));
-        public static int @int(int i) => i;
+        public static long @int(string s)
+        {
+            var t = s.Trim().Replace("_", "");
+            if (long.TryParse(t, NumberStyles.AllowLeadingSign, Inv, out var v)) return v;
+            // all digits, but beyond 64 bits: Python's int would hold it (big-int mode does)
+            if (t.Length > 1 && t.TrimStart('-', '+').Length > 0 && t.TrimStart('-', '+').All(char.IsAsciiDigit))
+                throw new OverflowException($"int too large for 64 bits: {t} (use big-int mode: typhon --bigint)");
+            throw new ArgumentException($"invalid literal for int() with base 10: {repr(s)}");
+        }
+        public static long @int(string s, long @base) => Convert.ToInt64(s.Trim().Replace("_", ""), checked((int)@base));
+        public static long @int(char c) => @int(c.ToString());
+        public static long @int(double d) => double.IsNaN(d) ? throw new ArgumentException("cannot convert float NaN to integer")
+            : double.IsInfinity(d) ? throw new OverflowException("cannot convert float infinity to integer") : checked((long)Math.Truncate(d));
+        public static long @int(int i) => i;
         public static long @int(long i) => i;
-        public static int @int(bool b) => b ? 1 : 0;
-        public static int @int(decimal m) => (int)Math.Truncate(m);
-        public static int @int(object o) => Convert.ToInt32(o, Inv);
+        public static long @int(bool b) => b ? 1 : 0;
+        public static long @int(decimal m) => checked((long)Math.Truncate(m));
+        /// <summary>int() of a late-bound value: the conversion its run-time type has (str parses, float truncates).</summary>
+        public static long @int(object o) => o switch
+        {
+            string s => @int(s), double d => @int(d), float f => @int((double)f), bool b => b ? 1 : 0, decimal m => @int(m),
+            BigInteger big => checked((long)big), char c => @int(c), _ => Convert.ToInt64(o, Inv),
+        };
 
         public static double @float(string s)
         {
@@ -368,17 +569,17 @@ namespace Typhon.Runtime
             }
         }
         public static double @float(double d) => d;
-        public static double @float(object o) => Convert.ToDouble(o, Inv);
+        public static double @float(object o) => o is BigInteger b ? (double)b : Convert.ToDouble(o, Inv); // (no BigInteger overload: float(1) would be ambiguous)
 
         public static bool @bool(object? o) => truthy(o);
 
-        public static int ord(string c) => char.ConvertToUtf32(c, 0);
-        public static int ord(char c) => c;
-        public static string chr(int i) => char.ConvertFromUtf32(i);
+        public static long ord(string c) => char.ConvertToUtf32(c, 0);
+        public static long ord(char c) => c;
+        public static string chr(long i) => char.ConvertFromUtf32(checked((int)i));
         public static string hex(long i) => (i < 0 ? "-0x" : "0x") + Math.Abs(i).ToString("x", Inv);
         public static string bin(long i) => (i < 0 ? "-0b" : "0b") + Convert.ToString(Math.Abs(i), 2);
         public static string oct(long i) => (i < 0 ? "-0o" : "0o") + Convert.ToString(Math.Abs(i), 8);
-        public static int hash(object? o) => o?.GetHashCode() ?? 0;
+        public static long hash(object? o) => o?.GetHashCode() ?? 0;
         public static long id(object o) => RuntimeHelpers.GetHashCode(o);
         public static bool callable(object? o) => o is Delegate;
 
@@ -393,41 +594,183 @@ namespace Typhon.Runtime
         public static T truediv<T>(T a, double b) where T : IDivisionOperators<T, double, T> => a / b;
         public static dynamic truediv(object a, object b) => (dynamic)a / (dynamic)b;
 
-        public static int floordiv(int a, int b) { int q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
-        public static long floordiv(long a, long b) { long q = a / b; if ((a % b != 0) && ((a < 0) != (b < 0))) q--; return q; }
+        // floor division / modulo: inlined, so the JIT turns constant divisors into multiplications; values that fit in 32 bits
+        // divide in 32 bits (a 64-bit hardware division is several times slower on many CPUs)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int floordiv(int a, int b) { int q = a / b; return (a - q * b != 0 && (a ^ b) < 0) ? q - 1 : q; }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long floordiv(long a, long b)
+        {
+            if ((int)a == a && (int)b == b && b != -1)
+            {
+                int ia = (int)a, ib = (int)b, q = ia / ib;
+                return (ia - q * ib != 0 && (ia ^ ib) < 0) ? q - 1 : q;
+            }
+            return FloorDiv64(a, b);
+        }
+        static long FloorDiv64(long a, long b) { long q = a / b; return (a - q * b != 0 && (a ^ b) < 0) ? q - 1 : q; }
         public static double floordiv(double a, double b) => Math.Floor(a / b);
-        public static dynamic floordiv(object a, object b) => Math.Floor((dynamic)a / (dynamic)b);
+        public static dynamic floordiv(object a, object b) => AsInt(a, out var x) && AsInt(b, out var y) ? floordiv(x, y) : Math.Floor((dynamic)a / (dynamic)b);
 
-        public static int mod(int a, int b) { int r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
-        public static long mod(long a, long b) { long r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int mod(int a, int b) { if (b == -1) return 0; int r = a % b; return (r != 0 && (r ^ b) < 0) ? r + b : r; }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static long mod(long a, long b)
+        {
+            if ((int)a == a && (int)b == b && b != -1)
+            {
+                int ia = (int)a, ib = (int)b, r = ia % ib;
+                return (r != 0 && (r ^ ib) < 0) ? r + ib : r;
+            }
+            return Mod64(a, b);
+        }
+        static long Mod64(long a, long b) { if (b == -1) return 0; long r = a % b; return (r != 0 && (r ^ b) < 0) ? r + b : r; }
         public static double mod(double a, double b) { double r = a % b; return (r != 0 && ((r < 0) != (b < 0))) ? r + b : r; }
         public static T mod<T>(T a, T b) where T : IModulusOperators<T, T, T> => a % b;
-        public static dynamic mod(object a, object b) => (dynamic)a % (dynamic)b;
+        public static dynamic mod(object a, object b) => AsInt(a, out var x) && AsInt(b, out var y) ? mod(x, y)
+            : a is IConvertible && b is IConvertible && !(a is string) ? mod(Convert.ToDouble(a, Inv), Convert.ToDouble(b, Inv)) : (dynamic)a % (dynamic)b;
 
         public static (int, int) divmod(int a, int b) => (floordiv(a, b), mod(a, b));
         public static (long, long) divmod(long a, long b) => (floordiv(a, b), mod(a, b));
         public static (double, double) divmod(double a, double b) => (floordiv(a, b), mod(a, b));
 
-        public static int pow(int a, int b)
-        {
-            if (b < 0) throw new ArgumentException("negative integer exponent: use a float base, e.g. 2.0 ** -1");
-            int r = 1;
-            while (b > 0) { if ((b & 1) != 0) r = checked(r * a); b >>= 1; if (b > 0) a = checked(a * a); }
-            return r;
-        }
         public static long pow(long a, long b)
         {
-            if (b < 0) throw new ArgumentException("negative integer exponent: use a float base");
+            if (b < 0) throw new ArgumentException("negative integer exponent: use a float base, e.g. 2.0 ** -1");
             long r = 1;
             while (b > 0) { if ((b & 1) != 0) r = checked(r * a); b >>= 1; if (b > 0) a = checked(a * a); }
             return r;
         }
         public static double pow(double a, double b) => b == 2 ? a * a : Math.Pow(a, b);
+        /// <summary>pow(base, exp, mod): modular exponentiation (a negative exponent takes the modular inverse, as in Python 3.8+).</summary>
+        public static long pow(long b, long e, long m)
+        {
+            if (m == 0) throw new ArgumentException("pow() 3rd argument cannot be 0");
+            var bm = new BigInteger(m);
+            BigInteger r = e >= 0 ? BigInteger.ModPow(b, e, BigInteger.Abs(bm)) : BigInteger.ModPow(ModInverse(b, BigInteger.Abs(bm)), -(BigInteger)e, BigInteger.Abs(bm));
+            if (r != 0 && (r.Sign < 0) != (m < 0)) r += m; // the result takes the sign of the modulus
+            return (long)r;
+        }
+        static BigInteger ModInverse(BigInteger a, BigInteger m)
+        {
+            BigInteger g = m, x = 0, x1 = 1, a1 = ((a % m) + m) % m;
+            while (a1 != 0) { var q = g / a1; (g, a1) = (a1, g - q * a1); (x, x1) = (x1, x - q * x1); }
+            if (g != 1) throw new ArgumentException("base is not invertible for the given modulus");
+            return ((x % m) + m) % m;
+        }
         public static dynamic pow(object a, object b)
         {
+            if (AsInt(a, out var x) && AsInt(b, out var y) && y >= 0) return pow(x, y);
             if (a is IConvertible && b is IConvertible) return Math.Pow(Convert.ToDouble(a, Inv), Convert.ToDouble(b, Inv));
             return ((dynamic)a).__pow__((dynamic)b);
         }
+
+        // ───────────── big-int mode (typhon --bigint / TyphonIntMode=bigint / # typhon: int=bigint): int is a BigInteger ─────────────
+
+        public static BigInteger __bigint(BigInteger x) => x;
+        public static BigInteger __bigint(long x) => x;
+        public static BigInteger __bigint(bool b) => b ? 1 : 0;
+        public static BigInteger __bigint(double d) => double.IsNaN(d) ? throw new ArgumentException("cannot convert float NaN to integer")
+            : double.IsInfinity(d) ? throw new OverflowException("cannot convert float infinity to integer") : new BigInteger(Math.Truncate(d));
+        public static BigInteger __bigint(string s)
+        {
+            var t = s.Trim().Replace("_", "");
+            return BigInteger.TryParse(t, NumberStyles.AllowLeadingSign, Inv, out var v) ? v : throw new ArgumentException($"invalid literal for int() with base 10: {repr(s)}");
+        }
+        public static BigInteger __bigint(string s, long @base)
+        {
+            var t = s.Trim().Replace("_", "").ToLowerInvariant();
+            bool neg = t.StartsWith("-"); if (neg || t.StartsWith("+")) t = t.Substring(1);
+            if (t.StartsWith("0x") || t.StartsWith("0o") || t.StartsWith("0b")) t = t.Substring(2);
+            BigInteger v = 0;
+            foreach (char c in t)
+            {
+                int d = char.IsDigit(c) ? c - '0' : c >= 'a' && c <= 'z' ? c - 'a' + 10 : 99;
+                if (d >= @base) throw new ArgumentException($"invalid literal for int() with base {@base}: {repr(s)}");
+                v = v * @base + d;
+            }
+            return neg ? -v : v;
+        }
+        public static BigInteger __bigint(char c) => __bigint(c.ToString());
+        public static BigInteger __bigint(decimal m) => new BigInteger(Math.Truncate(m));
+        public static BigInteger __bigint(object o) => o switch { BigInteger b => b, string s => __bigint(s), double d => __bigint(d), bool b => __bigint(b), _ => new BigInteger(Convert.ToInt64(o, Inv)) };
+
+        public static BigInteger floordiv(BigInteger a, BigInteger b) { var q = BigInteger.DivRem(a, b, out var r); return !r.IsZero && (r.Sign < 0) != (b.Sign < 0) ? q - 1 : q; }
+        public static BigInteger mod(BigInteger a, BigInteger b) { var r = BigInteger.Remainder(a, b); return !r.IsZero && (r.Sign < 0) != (b.Sign < 0) ? r + b : r; }
+        public static BigInteger pow(BigInteger a, BigInteger b)
+        {
+            if (b.Sign < 0) throw new ArgumentException("negative integer exponent: use a float base, e.g. 2.0 ** -1");
+            return BigInteger.Pow(a, checked((int)b));
+        }
+        public static BigInteger pow(BigInteger b, BigInteger e, BigInteger m)
+        {
+            if (m.IsZero) throw new ArgumentException("pow() 3rd argument cannot be 0");
+            var r = BigInteger.ModPow(e.Sign >= 0 ? b : ModInverse(b, BigInteger.Abs(m)), BigInteger.Abs(e), BigInteger.Abs(m));
+            return !r.IsZero && (r.Sign < 0) != (m.Sign < 0) ? r + m : r;
+        }
+        public static double truediv(BigInteger a, BigInteger b) => b.IsZero ? throw new DivideByZeroException("division by zero") : (double)a / (double)b;
+        public static BigInteger lshift(BigInteger a, BigInteger n) => n.Sign < 0 ? throw new ArgumentException("negative shift count") : a << checked((int)n);
+        public static BigInteger rshift(BigInteger a, BigInteger n) => n.Sign < 0 ? throw new ArgumentException("negative shift count") : n > int.MaxValue ? (a.Sign < 0 ? -1 : 0) : a >> (int)n;
+        public static (BigInteger, BigInteger) divmod(BigInteger a, BigInteger b) => (floordiv(a, b), mod(a, b));
+        public static BigInteger abs(BigInteger x) => BigInteger.Abs(x);
+        public static BigInteger min(BigInteger a, BigInteger b) => BigInteger.Min(a, b);
+        public static BigInteger max(BigInteger a, BigInteger b) => BigInteger.Max(a, b);
+        public static BigInteger round(BigInteger x) => x;
+        public static BigInteger sum(IEnumerable<BigInteger> xs) { BigInteger s = 0; foreach (var x in xs) s += x; return s; }
+        public static BigInteger sum(IEnumerable<BigInteger> xs, BigInteger start) => start + sum(xs);
+        public static bool truthy(BigInteger x) => !x.IsZero;
+        public static bool eq(BigInteger a, BigInteger b) => a == b;
+        public static string hex(BigInteger i) => (i.Sign < 0 ? "-0x" : "0x") + IntDigits(BigInteger.Abs(i), 'x', '\0');
+        public static string bin(BigInteger i) => (i.Sign < 0 ? "-0b" : "0b") + IntDigits(BigInteger.Abs(i), 'b', '\0');
+        public static string oct(BigInteger i) => (i.Sign < 0 ? "-0o" : "0o") + IntDigits(BigInteger.Abs(i), 'o', '\0');
+        public static long bit_length(this BigInteger x) => (long)BigInteger.Abs(x).GetBitLength();
+        public static long bit_count(this BigInteger x) { long n = 0; var a = BigInteger.Abs(x); while (!a.IsZero) { if (!a.IsEven) n++; a >>= 1; } return n; }
+        public static string __repeat(string s, BigInteger n) => __repeat(s, n.Sign <= 0 ? 0 : checked((long)n));
+        public static List<T> __repeat<T>(List<T> l, BigInteger n) => __repeat(l, n.Sign <= 0 ? 0 : checked((long)n));
+
+        // ───────────── integers: Python's int is a 64-bit long; going beyond 64 bits raises OverflowError ─────────────
+
+        /// <summary>A boxed integer as a long (late-bound arithmetic keeps Python's integer semantics).</summary>
+        static bool AsInt(object? o, out long v)
+        {
+            switch (o)
+            {
+                case long l: v = l; return true;
+                case int i: v = i; return true;
+                case short s: v = s; return true;
+                case byte b: v = b; return true;
+                case sbyte sb: v = sb; return true;
+                case ushort us: v = us; return true;
+                case uint ui: v = ui; return true;
+                default: v = 0; return false;
+            }
+        }
+
+        static OverflowException IntOverflow() => new OverflowException("integer overflow: Typhon's int is 64-bit (CPython would switch to arbitrary precision)");
+
+        /// <summary>a &lt;&lt; n: C# would take the shift count modulo 64; Python shifts by n and never loses bits.</summary>
+        public static long lshift(long a, long n)
+        {
+            if (n < 0) throw new ArgumentException("negative shift count");
+            if (a == 0) return 0;
+            if (n >= 64) throw IntOverflow();
+            long r = a << (int)n;
+            if (r >> (int)n != a) throw IntOverflow();
+            return r;
+        }
+        /// <summary>a &gt;&gt; n: arithmetic shift (floor division by 2**n), any count.</summary>
+        public static long rshift(long a, long n)
+        {
+            if (n < 0) throw new ArgumentException("negative shift count");
+            return n >= 64 ? (a < 0 ? -1 : 0) : a >> (int)n;
+        }
+        public static dynamic lshift(object a, object b) => AsInt(a, out var x) && AsInt(b, out var y) ? lshift(x, y) : checked((dynamic)a << (dynamic)b);
+        public static dynamic rshift(object a, object b) => AsInt(a, out var x) && AsInt(b, out var y) ? rshift(x, y) : checked((dynamic)a >> (dynamic)b);
+
+        /// <summary>A Typhon __hash__ returns a (64-bit) int; .NET hash codes are 32-bit.</summary>
+        public static int __hash32(long h) => unchecked((int)(h ^ (h >> 32)));
+        public static int __hash32(int h) => h;
+        public static int __hash32(object? h) => h is long l ? __hash32(l) : h is int i ? i : h?.GetHashCode() ?? 0;
 
         public static int abs(int x) => Math.Abs(x);
         public static long abs(long x) => Math.Abs(x);
@@ -435,53 +778,58 @@ namespace Typhon.Runtime
         public static decimal abs(decimal x) => Math.Abs(x);
         public static dynamic abs(object x) => ((dynamic)x).__abs__();
 
-        public static int round(double x) => (int)Math.Round(x, MidpointRounding.ToEven);
-        public static double round(double x, int ndigits) => Math.Round(x, ndigits, MidpointRounding.ToEven);
+        public static long round(double x) => @int(Math.Round(x, MidpointRounding.ToEven));
+        public static long round(long x) => x;
+        public static double round(double x, long ndigits) => Math.Round(x, checked((int)ndigits), MidpointRounding.ToEven);
 
-        public static string repeat(string s, int n) => n <= 0 ? "" : new StringBuilder(s.Length * n).Insert(0, s, n).ToString();
-        public static string repeat(int n, string s) => repeat(s, n);
-        public static List<T> repeat<T>(List<T> l, int n)
+        public static string __repeat(string s, long n) => n <= 0 || s.Length == 0 ? "" : new StringBuilder(checked(s.Length * (int)n)).Insert(0, s, (int)n).ToString();
+        public static string __repeat(long n, string s) => __repeat(s, n);
+        public static List<T> __repeat<T>(List<T> l, long n)
         {
-            if (l.Count == 1 && n > 0)
+            int count = n <= 0 ? 0 : checked((int)n);
+            if (l.Count == 1 && count > 0)
             {
                 // [x] * n — the common "preallocate" idiom
-                var filled = new List<T>(n);
-                System.Runtime.InteropServices.CollectionsMarshal.SetCount(filled, n);
+                var filled = new List<T>(count);
+                System.Runtime.InteropServices.CollectionsMarshal.SetCount(filled, count);
                 System.Runtime.InteropServices.CollectionsMarshal.AsSpan(filled).Fill(l[0]);
                 return filled;
             }
-            var r = new List<T>(l.Count * Math.Max(n, 0));
-            for (int i = 0; i < n; i++) r.AddRange(l);
+            var r = new List<T>(checked(l.Count * count));
+            for (int i = 0; i < count; i++) r.AddRange(l);
             return r;
         }
-        public static List<T> repeat<T>(int n, List<T> l) => repeat(l, n);
+        public static List<T> __repeat<T>(long n, List<T> l) => __repeat(l, n);
         /// <summary>a * b with late-bound operands: sequence repetition when one side is a str or list.</summary>
         public static dynamic mul(dynamic a, dynamic b)
         {
-            if (a is string s1 && b is int n1) return repeat(s1, n1);
-            if (b is string s2 && a is int n2) return repeat(s2, n2);
-            if (a is IList l1 && b is int n3) return RepeatList(l1, n3);
-            if (b is IList l2 && a is int n4) return RepeatList(l2, n4);
-            return a * b;
+            object oa = a, ob = b;
+            if (oa is string s1 && AsInt(ob, out var n1)) return __repeat(s1, n1);
+            if (ob is string s2 && AsInt(oa, out var n2)) return __repeat(s2, n2);
+            if (oa is IList l1 && AsInt(ob, out var n3)) return RepeatList(l1, n3);
+            if (ob is IList l2 && AsInt(oa, out var n4)) return RepeatList(l2, n4);
+            if (AsInt(oa, out var x) && AsInt(ob, out var y)) return checked(x * y);
+            return checked(a * b);
         }
 
         /// <summary>a + b with late-bound operands: list concatenation (str and numbers bind normally).</summary>
         public static dynamic add(dynamic a, dynamic b)
         {
-            if (a is IList la && b is IList lb && !(a is string))
+            if (a is IList la && b is IList lb && !(a is string) && !(a is IDictionary))
             {
                 var r = (IList)Activator.CreateInstance(((object)a).GetType())!;
                 foreach (var x in la) r.Add(x);
                 foreach (var x in lb) r.Add(x);
                 return r;
             }
-            return a + b;
+            if (AsInt((object)a, out var ia) && AsInt((object)b, out var ib)) return checked(ia + ib);
+            return checked(a + b);
         }
 
-        static IList RepeatList(IList l, int n)
+        static IList RepeatList(IList l, long n)
         {
             var r = (IList)Activator.CreateInstance(l.GetType())!;
-            for (int i = 0; i < n; i++) foreach (var x in l) r.Add(x);
+            for (long i = 0; i < n; i++) foreach (var x in l) r.Add(x);
             return r;
         }
 
@@ -491,30 +839,30 @@ namespace Typhon.Runtime
 
         // ───────────── containers ─────────────
 
-        public static int len(string s) => s.Length;
-        public static int len<T>(List<T> l) => l.Count;
-        public static int len<T>(T[] a) => a.Length;
-        public static int len<T>(T t) where T : struct, ITuple => t.Length;
+        public static long len(string s) => s.Length;
+        public static long len<T>(List<T> l) => l.Count;
+        public static long len<T>(T[] a) => a.Length;
+        public static long len<T>(T t) where T : struct, ITuple => t.Length;
 
         /// <summary>del d[key] / del xs[i]</summary>
         public static void delitem<K, V>(IDictionary<K, V> d, K key) { if (!d.Remove(key)) throw new KeyNotFoundException(repr(key)); }
-        public static void delitem<T>(List<T> xs, int i)
+        public static void delitem<T>(List<T> xs, long i)
         {
             if (i < 0) i += xs.Count;
-            if ((uint)i >= (uint)xs.Count) throw new ArgumentOutOfRangeException(nameof(i), "list assignment index out of range");
-            xs.RemoveAt(i);
+            if ((ulong)i >= (ulong)xs.Count) throw new ArgumentOutOfRangeException(nameof(i), "list assignment index out of range");
+            xs.RemoveAt((int)i);
         }
         public static void delitem(object container, object? key) => ((dynamic)container).__delitem__((dynamic?)key);
-        public static int len(object o)
+        public static long len(object o)
         {
             if (o is IPyLen pl) return pl.__len__();
             if (o is ICollection c) return c.Count;
             if (o is ITuple tuple) return tuple.Length;
             var t = o.GetType();
             var p = t.GetProperty("Count") ?? t.GetProperty("Length");
-            if (p != null && p.PropertyType == typeof(int)) return (int)p.GetValue(o)!;
+            if (p != null && (p.PropertyType == typeof(int) || p.PropertyType == typeof(long))) return Convert.ToInt64(p.GetValue(o)!, Inv);
             var m = t.GetMethod("__len__");
-            if (m != null) return Convert.ToInt32(m.Invoke(o, null), Inv);
+            if (m != null) return Convert.ToInt64(m.Invoke(o, null), Inv);
             if (o is IEnumerable e) return e.Cast<object>().Count();
             throw new InvalidCastException($"object of type '{t.Name}' has no len()");
         }
@@ -522,10 +870,15 @@ namespace Typhon.Runtime
         public static bool contains(string s, string sub) => s.Contains(sub, StringComparison.Ordinal);
         public static bool contains(string s, char c) => s.IndexOf(c) >= 0;
         public static bool contains<K, V>(Dictionary<K, V> d, K key) where K : notnull => d.ContainsKey(key);
+        public static bool contains<K, V>(OrderedDictionary<K, V> d, K key) where K : notnull => d.ContainsKey(key);
         public static bool contains<K, V>(IDictionary<K, V> d, K key) => d.ContainsKey(key);
         public static bool contains<T>(HashSet<T> s, T x) => s.Contains(x);
         public static bool contains<T>(ICollection<T> c, T x) => c.Contains(x);
         public static bool contains<T>(IEnumerable<T> c, T x) => c.Contains(x);
+        /// <summary>The items of a tuple of fixed shape (a C# ValueTuple), for iteration and `in`.</summary>
+        public static IEnumerable<T> tuple_items<T>(ITuple t) { for (int i = 0; i < t.Length; i++) yield return (T)t[i]!; }
+        public static T tuple_at<T>(ITuple t, long i) => (T)t[checked((int)(i < 0 ? i + t.Length : i))]!;
+        public static bool contains(ITuple t, object? x) { for (int i = 0; i < t.Length; i++) if (eq(t[i], x)) return true; return false; }
         public static bool contains(object c, object x)
         {
             if (c is IDictionary d) return d.Contains(x);
@@ -534,45 +887,127 @@ namespace Typhon.Runtime
         }
 
         /// <summary>Number of values in range(start, stop, step) — used by the compiler's counting-loop lowering.</summary>
-        public static int range_len(int start, int stop, int step)
+        public static long range_len(long start, long stop, long step)
         {
-            if (step > 0) return start < stop ? (int)(((long)stop - start - 1) / step + 1) : 0;
-            if (step < 0) return start > stop ? (int)(((long)start - stop - 1) / -(long)step + 1) : 0;
+            // in decimal: the span can exceed long when start and stop have opposite signs (no wrap-around)
+            if (step > 0) return start < stop ? (long)(((decimal)stop - start - 1) / step + 1) : 0;
+            if (step < 0) return start > stop ? (long)(((decimal)start - stop - 1) / -(decimal)step + 1) : 0;
             throw new ArgumentException("range() arg 3 must not be zero");
         }
 
-        public static IEnumerable<int> range(int stop) => range(0, stop, 1);
-        public static IEnumerable<int> range(int start, int stop, int step = 1)
-        {
-            if (step == 0) throw new ArgumentException("range() arg 3 must not be zero");
-            if (step > 0) for (int i = start; i < stop; i += step) yield return i;
-            else for (int i = start; i > stop; i += step) yield return i;
-        }
+        public static PyRange range(long stop) => new PyRange(0, stop, 1);
+        public static PyRange range(long start, long stop, long step = 1) => new PyRange(start, stop, step);
+        public static bool contains(PyRange r, long x) => r.Contains(x);
+        public static long len(PyRange r) => r.Length;
 
         // Python iterates a dict over its keys, .NET over KeyValuePairs: every iteration site whose source might be a dict
         // goes through iterable(). The overloads return lists, arrays and sets unchanged (their struct enumerators stay).
         public static Dictionary<K, V>.KeyCollection iterable<K, V>(Dictionary<K, V> d) where K : notnull => d.Keys;
+        public static OrderedDictionary<K, V>.KeyCollection iterable<K, V>(OrderedDictionary<K, V> d) where K : notnull => d.Keys;
         public static IEnumerable<K> iterable<K, V>(IDictionary<K, V> d) => d.Keys;
         public static IEnumerable<K> iterable<K, V>(IReadOnlyDictionary<K, V> d) => d.Keys;
         public static List<T> iterable<T>(List<T> xs) => xs;
         public static T[] iterable<T>(T[] xs) => xs;
         public static HashSet<T> iterable<T>(HashSet<T> xs) => xs;
         public static IEnumerable<T> iterable<T>(IEnumerable<T> xs) => xs is IDictionary d ? d.Keys.Cast<T>() : xs;
-        public static string iterable(string s) => s;
+        public static StrChars iterable(string s) => new StrChars(s);
         public static IEnumerable iterable(IEnumerable xs) => xs is IDictionary d ? d.Keys : xs;
 
-        public static IEnumerable<(int, T)> enumerate<T>(IEnumerable<T> xs, int start = 0)
+        // ───────────── iteration protocol: iter(), next() ─────────────
+
+        public static PyIterator<T> iter<T>(IEnumerable<T> xs) => xs as PyIterator<T> ?? new PyIterator<T>(xs.GetEnumerator());
+        public static PyIterator<string> iter(string s) => new PyIterator<string>(s.Select(c => c.ToString()).GetEnumerator());
+        public static PyIterator<object?> iter(IEnumerable xs) => new PyIterator<object?>(xs.Cast<object?>().GetEnumerator());
+
+        /// <summary>A generator object is its own iterator in Python: repeated next(gen) continue where the last one stopped.</summary>
+        static class Iterators<T> { public static readonly ConditionalWeakTable<object, IEnumerator<T>> Of = new ConditionalWeakTable<object, IEnumerator<T>>(); }
+
+        static IEnumerator<T> IteratorOf<T>(IEnumerable<T> xs) => xs is PyIterator<T> it ? it : Iterators<T>.Of.GetValue(xs, k => ((IEnumerable<T>)k).GetEnumerator());
+
+        public static T next<T>(IEnumerable<T> xs)
         {
-            int i = start;
-            foreach (var x in xs) yield return (i++, x);
+            var e = IteratorOf(xs);
+            return e.MoveNext() ? e.Current : throw new InvalidOperationException("StopIteration");
+        }
+        public static T next<T>(IEnumerable<T> xs, T @default) { var e = IteratorOf(xs); return e.MoveNext() ? e.Current : @default; }
+
+        // ───────────── str elements are str ─────────────
+
+        static readonly string[] Latin1 = Enumerable.Range(0, 256).Select(c => ((char)c).ToString()).ToArray();
+        /// <summary>A character as a Python str (cached for Latin-1).</summary>
+        public static string CharStr(char c) => c < 256 ? Latin1[c] : c.ToString();
+        public static StrChars chars(string s) => new StrChars(s);
+        /// <summary>Iterating a late-bound value: dict → keys, str → one-character strs, any other iterable → its items.</summary>
+        public static IEnumerable<dynamic> __iter_dyn(object? o) => o switch
+        {
+            string s => new StrChars(s),
+            IDictionary d => d.Keys.Cast<object>(),
+            ITuple t => Enumerable.Range(0, t.Length).Select(i => t[i]!),
+            IEnumerable e => e.Cast<object>(),
+            _ => throw new InvalidCastException($"'{o?.GetType().Name}' object is not iterable"),
+        };
+        public static string str_at(string s, int i) => CharStr(s[i < 0 ? i + s.Length : i]);
+
+        // ───────────── positions: a negative index counts from the end (xs[-k], xs[i - 1] at i == 0) ─────────────
+        // fast path: one unsigned compare (0 <= i < count); the rest (negative, or out of range: the indexer raises IndexError)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int __pos(long i, int count) => (ulong)i < (ulong)count ? (int)i : __pos_slow(i, count);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static int __pos(int i, int count) => (uint)i < (uint)count ? i : __pos_slow(i, count);
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static int __pos_slow(long i, int count) => i < 0 ? (int)Math.Max(i + count, int.MinValue) : (int)Math.Min(i, int.MaxValue);
+        public static int __pos(BigInteger i, int count) => __pos(checked((long)i), count);
+        public static int __pos(object i, int count) => i is BigInteger b ? __pos(b, count) : __pos(Convert.ToInt64(i, Inv), count);
+        /// <summary>xs[i] of a list that is not a plain variable (evaluated once); assignable: __at(f(), i) = v.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ref T __at<T>(List<T> xs, long i)
+        {
+            var items = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(xs);
+            // 0 <= i < Count, checked once: no second bounds check
+            if ((ulong)i < (ulong)items.Length) return ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetReference(items), (nint)i);
+            return ref xs.__at_slow(i);
+        }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static ref T __at_slow<T>(this List<T> xs, long i)
+        {
+            if (i < 0 && i + xs.Count >= 0) return ref System.Runtime.InteropServices.CollectionsMarshal.AsSpan(xs)[(int)(i + xs.Count)];
+            throw new ArgumentOutOfRangeException(nameof(i), "list index out of range");
+        }
+        public static ref T __at<T>(List<T> xs, BigInteger i) => ref System.Runtime.InteropServices.CollectionsMarshal.AsSpan(xs)[__pos(i, xs.Count)];
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static ref T __at<T>(T[] xs, long i)
+        {
+            if ((ulong)i < (ulong)xs.Length) return ref Unsafe.Add(ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(xs), (nint)i);
+            return ref xs[__pos(i, xs.Length)];
+        }
+        public static ref T __at<T>(T[] xs, BigInteger i) => ref xs[__pos(i, xs.Length)];
+        public static string str_at(string s, Index i) => CharStr(s[i]);
+
+        /// <summary>Lists iterate by position (Python's list iterator): changing the list while enumerating it behaves like CPython.</summary>
+        public static IEnumerable<(long, T)> enumerate<T>(List<T> xs, long start = 0)
+        {
+            for (int i = 0; i < xs.Count; i++) yield return (start + i, xs[i]);
+        }
+        public static IEnumerable<(long, string)> enumerate(string s, long start = 0)
+        {
+            for (int i = 0; i < s.Length; i++) yield return (start + i, CharStr(s[i]));
+        }
+
+        public static IEnumerable<(long, T)> enumerate<T>(IEnumerable<T> xs, long start = 0)
+        {
+            long i = start;
+            foreach (var x in xs) yield return (checked(i++), x);
         }
 
         public static IEnumerable<(A, B)> zip<A, B>(IEnumerable<A> a, IEnumerable<B> b) => a.Zip(b, (x, y) => (x, y));
         public static IEnumerable<(A, B, C)> zip<A, B, C>(IEnumerable<A> a, IEnumerable<B> b, IEnumerable<C> c) => a.Zip(b, (x, y) => (x, y)).Zip(c, (xy, z) => (xy.Item1, xy.Item2, z));
 
-        public static int sum(IEnumerable<int> xs) { int s = 0; foreach (var x in xs) s += x; return s; }
-        public static long sum(IEnumerable<long> xs) { long s = 0; foreach (var x in xs) s += x; return s; }
+        public static long sum(IEnumerable<int> xs) { long s = 0; foreach (var x in xs) s = checked(s + x); return s; }
+        public static long sum(IEnumerable<long> xs) { long s = 0; foreach (var x in xs) s = checked(s + x); return s; }
         public static double sum(IEnumerable<double> xs) { double s = 0; foreach (var x in xs) s += x; return s; }
+        public static long sum(IEnumerable<bool> xs) { long s = 0; foreach (var x in xs) if (x) s++; return s; }
+        public static long sum(IEnumerable<long> xs, long start) => checked(start + sum(xs));
+        public static double sum(IEnumerable<double> xs, double start) => start + sum(xs);
         public static float sum(IEnumerable<float> xs) { float s = 0; foreach (var x in xs) s += x; return s; }
         public static decimal sum(IEnumerable<decimal> xs) { decimal s = 0; foreach (var x in xs) s += x; return s; }
         public static dynamic sum(IEnumerable<object> xs) { dynamic s = 0; foreach (dynamic x in xs) s += x; return s; }
@@ -593,7 +1028,15 @@ namespace Typhon.Runtime
         public static T max<T, K>(IEnumerable<T> xs, Func<T, K> key) => xs.MaxBy(key, PyComparer<K>()) ?? throw new ArgumentException("max() arg is an empty sequence");
 
         /// <summary>Python orders strings by code point, .NET's default comparer is culture-aware: use ordinal.</summary>
-        static IComparer<T> PyComparer<T>() => typeof(T) == typeof(string) ? (IComparer<T>)(object)StringComparer.Ordinal : Comparer<T>.Default;
+        static IComparer<T> PyComparer<T>() => typeof(T) == typeof(string) ? (IComparer<T>)(object)StringComparer.Ordinal
+            : typeof(T) == typeof(object) ? (IComparer<T>)(object)PyObjectComparer.Instance : Comparer<T>.Default;
+
+        /// <summary>Late-bound values (List&lt;dynamic&gt;) order by Python's rules: strs by code point, numbers by value, sequences lexicographically.</summary>
+        sealed class PyObjectComparer : IComparer<object?>
+        {
+            public static readonly PyObjectComparer Instance = new PyObjectComparer();
+            public int Compare(object? a, object? b) => compare(a, b);
+        }
         /// <summary>Equal values of these types are indistinguishable, so an unstable (faster) sort gives Python's result.</summary>
         static bool StabilityIrrelevant<T>() => typeof(T).IsPrimitive || typeof(T) == typeof(string) || typeof(T) == typeof(decimal);
 
@@ -622,66 +1065,71 @@ namespace Typhon.Runtime
         public static IEnumerable<T> filter<T>(Func<T, bool> f, IEnumerable<T> xs) => xs.Where(f);
 
         public static List<T> list<T>(IEnumerable<T> xs) => new List<T>(xs);
+        public static PyTuple<T> tuple<T>(IEnumerable<T> xs) => xs as PyTuple<T> ?? new PyTuple<T>(xs);
+        public static PyTuple<string> tuple(string s) => new PyTuple<string>(s.Select(c => c.ToString()));
+        public static PyTuple<object?> tuple() => PyTuple<object?>.Empty;
+        public static long len<T>(PyTuple<T> t) => t.Count;
+        public static PyTuple<T> slice<T>(PyTuple<T> t, long? start, long? stop, long step = 1) => new PyTuple<T>(slice((IList<T>)t.ToArray(), start, stop, step));
         public static List<string> list(string s) => s.Select(c => c.ToString()).ToList();
         public static HashSet<T> set<T>(IEnumerable<T> xs) => new HashSet<T>(xs);
-        public static Dictionary<K, V> dict<K, V>(IEnumerable<(K, V)> xs) where K : notnull { var d = new Dictionary<K, V>(); foreach (var (k, v) in xs) d[k] = v; return d; }
-        public static Dictionary<K, V> dict<K, V>(IDictionary<K, V> src) where K : notnull => new Dictionary<K, V>(src);
+        public static OrderedDictionary<K, V> dict<K, V>(IEnumerable<(K, V)> xs) where K : notnull { var d = new OrderedDictionary<K, V>(); foreach (var (k, v) in xs) d[k] = v; return d; }
+        public static OrderedDictionary<K, V> dict<K, V>(IDictionary<K, V> src) where K : notnull { var d = new OrderedDictionary<K, V>(); foreach (var kv in src) d[kv.Key] = kv.Value; return d; }
+        public static OrderedDictionary<K, V> __to_dict<K, V>(IEnumerable<(K, V)> items) where K : notnull { var d = new OrderedDictionary<K, V>(); foreach (var (k, v) in items) d[k] = v; return d; }
 
         // literal helpers used by the compiler: [a, b] / {k: v} / {a, b} without a target type
         public static List<T> __list<T>(params T[] items) => new List<T>(items);
-        public static Dictionary<K, V> __dict<K, V>(params (K, V)[] items) where K : notnull { var d = new Dictionary<K, V>(items.Length); foreach (var (k, v) in items) d[k] = v; return d; }
+        public static OrderedDictionary<K, V> __dict<K, V>(params (K, V)[] items) where K : notnull { var d = new OrderedDictionary<K, V>(items.Length); foreach (var (k, v) in items) d[k] = v; return d; }
         public static HashSet<T> __set<T>(params T[] items) => new HashSet<T>(items);
 
         // ───────────── slicing with Python semantics (clamping, negative indices, steps) ─────────────
 
-        static List<int> SliceIndices(int len, int? start, int? stop, int step)
+        static List<int> SliceIndices(int len, long? start, long? stop, long step)
         {
             if (step == 0) throw new ArgumentException("slice step cannot be zero");
-            int Norm(int? v, int dflt, int lo, int hi)
+            long Norm(long? v, long dflt, long lo, long hi)
             {
                 if (v == null) return dflt;
-                int x = v.Value < 0 ? v.Value + len : v.Value;
+                long x = v.Value < 0 ? v.Value + len : v.Value;
                 return Math.Clamp(x, lo, hi);
             }
             var r = new List<int>();
             if (step > 0)
             {
-                int s = Norm(start, 0, 0, len), e = Norm(stop, len, 0, len);
-                for (int i = s; i < e; i += step) r.Add(i);
+                long s = Norm(start, 0, 0, len), e = Norm(stop, len, 0, len);
+                for (long i = s; i < e; i += step) r.Add((int)i);
             }
             else
             {
-                int s = Norm(start, len - 1, -1, len - 1), e = Norm(stop, -1, -1, len - 1);
-                for (int i = s; i > e; i += step) r.Add(i);
+                long s = Norm(start, len - 1, -1, len - 1), e = Norm(stop, -1, -1, len - 1);
+                for (long i = s; i > e; i += step) r.Add((int)i);
             }
             return r;
         }
 
-        public static string slice(string s, int? start, int? stop, int step = 1)
+        public static string slice(string s, long? start, long? stop, long step = 1)
         {
             if (step == 1)
             {
-                int a = start == null ? 0 : Math.Clamp(start.Value < 0 ? start.Value + s.Length : start.Value, 0, s.Length);
-                int b = stop == null ? s.Length : Math.Clamp(stop.Value < 0 ? stop.Value + s.Length : stop.Value, 0, s.Length);
+                var (a, b) = SliceBounds(s.Length, start, stop);
                 return b > a ? s.Substring(a, b - a) : "";
             }
             var sb = new StringBuilder();
             foreach (var i in SliceIndices(s.Length, start, stop, step)) sb.Append(s[i]);
             return sb.ToString();
         }
-        static (int, int) SliceBounds(int len, int? start, int? stop)
+        static (int, int) SliceBounds(int len, long? start, long? stop)
         {
-            int a = start == null ? 0 : Math.Clamp(start.Value < 0 ? start.Value + len : start.Value, 0, len);
-            int b = stop == null ? len : Math.Clamp(stop.Value < 0 ? stop.Value + len : stop.Value, 0, len);
+            int a = start == null ? 0 : (int)Math.Clamp(start.Value < 0 ? start.Value + len : start.Value, 0, len);
+            int b = stop == null ? len : (int)Math.Clamp(stop.Value < 0 ? stop.Value + len : stop.Value, 0, len);
             return (a, Math.Max(a, b));
         }
-        public static T[] slice<T>(T[] arr, int? start, int? stop, int step = 1)
+        public static T[] slice<T>(T[] arr, long? start, long? stop, long step = 1)
         {
             if (step != 1) return SliceIndices(arr.Length, start, stop, step).Select(i => arr[i]).ToArray();
             var (a, b) = SliceBounds(arr.Length, start, stop);
             return arr.AsSpan(a, b - a).ToArray();
         }
-        public static List<T> slice<T>(IList<T> l, int? start, int? stop, int step = 1)
+        public static List<T> slice<T>(IList<T> l, long? start, long? stop, long step = 1)
         {
             if (step != 1) return SliceIndices(l.Count, start, stop, step).Select(i => l[i]).ToList();
             var (a, b) = SliceBounds(l.Count, start, stop);
@@ -690,12 +1138,221 @@ namespace Typhon.Runtime
             for (int i = a; i < b; i++) r.Add(l[i]);
             return r;
         }
-        public static dynamic slice(object o, int? start, int? stop, int step = 1)
+        public static dynamic slice(object o, long? start, long? stop, long step = 1)
         {
+            // a late-bound str, list or array: the slice of its run-time type (steps included)
+            if (o is string str0) return slice(str0, start, stop, step);
+            if (o is System.Collections.IList && (o.GetType().IsArray || o.GetType().IsGenericType)) return slice((dynamic)o, start, stop, step);
             if (step != 1) throw new NotSupportedException("stepped slices are only supported on str, list and arrays");
-            Index s = start == null ? Index.Start : start.Value < 0 ? Index.FromEnd(-start.Value) : Index.FromStart(start.Value);
-            Index e = stop == null ? Index.End : stop.Value < 0 ? Index.FromEnd(-stop.Value) : Index.FromStart(stop.Value);
+            Index s = start == null ? Index.Start : start.Value < 0 ? Index.FromEnd(checked((int)-start.Value)) : Index.FromStart(checked((int)start.Value));
+            Index e = stop == null ? Index.End : stop.Value < 0 ? Index.FromEnd(checked((int)-stop.Value)) : Index.FromStart(checked((int)stop.Value));
             return ((dynamic)o)[new Range(s, e)];
+        }
+
+        // ───────────── Python equality (==): lists, tuples, dicts and sets compare by contents ─────────────
+
+        /// <summary>Python's ==: numbers by value (1 == 1.0 == True), str by characters, containers element by element.</summary>
+        public static bool eq(object? a, object? b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a is null || b is null) return false;
+            if (IntLike(a, out var x) && IntLike(b, out var y)) return x == y;
+            if (IsNumber(a) && IsNumber(b)) return Convert.ToDouble(a, Inv) == Convert.ToDouble(b, Inv);
+            if (a is string sa) return b is string sb && sa == sb;
+            if (a is char ca) return b is char cb ? ca == cb : b is string sc && sc.Length == 1 && sc[0] == ca;
+            if (b is char) return eq(b, a);
+            if (a is ITuple || a is IPyTuple)
+            {
+                // a tuple equals a tuple of equal items, whether its shape is fixed (ValueTuple) or computed (PyTuple)
+                var ia = TupleItems(a); var ib = TupleItems(b);
+                if (ib == null || ia!.Count != ib.Count) return false;
+                for (int i = 0; i < ia.Count; i++) if (!eq(ia[i], ib[i])) return false;
+                return true;
+            }
+            if (a is IDictionary da)
+            {
+                if (!(b is IDictionary db) || da.Count != db.Count) return false;
+                foreach (DictionaryEntry e in da) if (!db.Contains(e.Key) || !eq(e.Value, db[e.Key])) return false;
+                return true;
+            }
+            if (IsSet(a))
+            {
+                if (!IsSet(b)) return false;
+                var sa2 = new HashSet<object?>(((IEnumerable)a).Cast<object?>(), PyEqualityComparer.Instance);
+                var sb2 = ((IEnumerable)b).Cast<object?>().ToList();
+                return sa2.Count == new HashSet<object?>(sb2, PyEqualityComparer.Instance).Count && sb2.All(sa2.Contains);
+            }
+            if (a is IList la)
+            {
+                if (!(b is IList lb) || la.Count != lb.Count || IsSet(b)) return false;
+                for (int i = 0; i < la.Count; i++) if (!eq(la[i], lb[i])) return false;
+                return true;
+            }
+            return a.Equals(b);
+        }
+        // typed overloads: C# picks them whenever the operands really are numbers/str/bool, so eq() costs nothing there
+        public static bool eq(long a, long b) => a == b;
+        public static bool eq(double a, double b) => a == b;
+        public static bool eq(long a, double b) => a == b;
+        public static bool eq(double a, long b) => a == b;
+        public static bool eq(bool a, bool b) => a == b;
+        public static bool eq(char a, char b) => a == b;
+        public static bool eq(string? a, string? b) => a == b;
+
+        static IReadOnlyList<object?>? TupleItems(object? o) => o switch
+        {
+            ITuple t => Enumerable.Range(0, t.Length).Select(i => t[i]).ToList(),
+            IPyTuple p => Enumerable.Range(0, p.Count).Select(i => p[i]).ToList(),
+            _ => null,
+        };
+
+        // bool is an int in Python (True == 1)
+        static bool IntLike(object o, out long v) { if (o is bool b) { v = b ? 1 : 0; return true; } return AsInt(o, out v); }
+        static bool IsNumber(object o) => o is double || o is float || o is decimal || o is bool || AsInt(o, out _);
+
+        /// <summary>Hashing and equality like Python's for values of mixed static types (1, 1.0 and True are one key).</summary>
+        internal sealed class PyEqualityComparer : IEqualityComparer<object?>
+        {
+            public static readonly PyEqualityComparer Instance = new PyEqualityComparer();
+            public new bool Equals(object? a, object? b) => eq(a, b);
+            public int GetHashCode(object? o) => o switch
+            {
+                null => 0,
+                bool b => b ? 1 : 0,
+                double d when d == Math.Floor(d) && d >= long.MinValue && d <= long.MaxValue => ((long)d).GetHashCode(),
+                float f when f == Math.Floor(f) => ((long)f).GetHashCode(),
+                _ when AsInt(o, out var v) => v.GetHashCode(),
+                char c => c.ToString().GetHashCode(),
+                _ => o.GetHashCode(),
+            };
+        }
+
+        // ───────────── ordering comparisons (<, <=, >, >=) for values without a C# operator ─────────────
+
+        /// <summary>Python's order of two values: numbers, str (by code point), sequences and tuples (lexicographic).</summary>
+        public static int compare(object? a, object? b)
+        {
+            if (IntLike(a!, out var x) && IntLike(b!, out var y)) return x.CompareTo(y);
+            if (a != null && b != null && IsNumber(a) && IsNumber(b)) return Convert.ToDouble(a, Inv).CompareTo(Convert.ToDouble(b, Inv));
+            if (a is string sa && b is string sb) return string.CompareOrdinal(sa, sb);
+            var la = TupleItems(a) ?? (a is IList l1 && !(a is IDictionary) && !IsSet(a) ? l1.Cast<object?>().ToList() : null);
+            var lb = TupleItems(b) ?? (b is IList l2 && !(b is IDictionary) && !IsSet(b) ? l2.Cast<object?>().ToList() : null);
+            if (la != null && lb != null)
+            {
+                for (int i = 0; i < Math.Min(la.Count, lb.Count); i++) { if (eq(la[i], lb[i])) continue; return compare(la[i], lb[i]); }
+                return la.Count.CompareTo(lb.Count);
+            }
+            if (a is IComparable c) return c.CompareTo(b);
+            // elements with their own operators (Typhon classes with __lt__)
+            try { return (bool)((dynamic)a! < (dynamic)b!) ? -1 : (bool)((dynamic)b! < (dynamic)a!) ? 1 : 0; }
+            catch (Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+            { throw new InvalidCastException($"'<' not supported between instances of '{a?.GetType().Name}' and '{b?.GetType().Name}'"); }
+        }
+        /// <summary>Values Python orders itself: str, sequences, tuples (lexicographic) and sets (inclusion).</summary>
+        static bool PyOrdered(object? o) => o is string || o is ITuple || o is IPyTuple || o is IList && !(o is IDictionary) || o != null && IsSet(o);
+        // Python's containers compare by Python's rules; any other value uses its own operator (late-bound: an ndarray
+        // compares element-wise and returns an array, a Typhon class uses its __lt__)
+        public static bool lt(long a, long b) => a < b;
+        public static bool le(long a, long b) => a <= b;
+        public static bool gt(long a, long b) => a > b;
+        public static bool ge(long a, long b) => a >= b;
+        public static bool lt(double a, double b) => a < b;
+        public static bool le(double a, double b) => a <= b;
+        public static bool gt(double a, double b) => a > b;
+        public static bool ge(double a, double b) => a >= b;
+        public static bool lt(string a, string b) => string.CompareOrdinal(a, b) < 0;
+        public static bool le(string a, string b) => string.CompareOrdinal(a, b) <= 0;
+        public static bool gt(string a, string b) => string.CompareOrdinal(a, b) > 0;
+        public static bool ge(string a, string b) => string.CompareOrdinal(a, b) >= 0;
+        public static dynamic lt(object? a, object? b) => PyOrdered(a) || PyOrdered(b) ? (IsSet(a!) ? SetLe(a, b) && !eq(a, b) : compare(a, b) < 0) : (dynamic)a! < (dynamic)b!;
+        public static dynamic le(object? a, object? b) => PyOrdered(a) || PyOrdered(b) ? (IsSet(a!) ? SetLe(a, b) : compare(a, b) <= 0) : (dynamic)a! <= (dynamic)b!;
+        public static dynamic gt(object? a, object? b) => PyOrdered(a) || PyOrdered(b) ? (IsSet(a!) ? SetLe(b, a) && !eq(a, b) : compare(a, b) > 0) : (dynamic)a! > (dynamic)b!;
+        public static dynamic ge(object? a, object? b) => PyOrdered(a) || PyOrdered(b) ? (IsSet(a!) ? SetLe(b, a) : compare(a, b) >= 0) : (dynamic)a! >= (dynamic)b!;
+        static bool SetLe(object? a, object? b) => ((IEnumerable)a!).Cast<object?>().All(x => SetHas(b!, x));
+        static bool SetHas(object set, object? x) => ((IEnumerable)set).Cast<object?>().Any(y => eq(x, y));
+
+        // ───────────── set and dict operators ─────────────
+
+        public static HashSet<T> set_sub<T>(IEnumerable<T> a, IEnumerable<T> b) { var r = new HashSet<T>(a); r.ExceptWith(b); return r; }
+        public static HashSet<T> set_or<T>(IEnumerable<T> a, IEnumerable<T> b) { var r = new HashSet<T>(a); r.UnionWith(b); return r; }
+        public static HashSet<T> set_and<T>(IEnumerable<T> a, IEnumerable<T> b) { var r = new HashSet<T>(a); r.IntersectWith(b); return r; }
+        public static HashSet<T> set_xor<T>(IEnumerable<T> a, IEnumerable<T> b) { var r = new HashSet<T>(a); r.SymmetricExceptWith(b); return r; }
+        public static OrderedDictionary<K, V> dict_or<K, V>(IDictionary<K, V> a, IDictionary<K, V> b) where K : notnull { var r = dict(a); foreach (var kv in b) r[kv.Key] = kv.Value; return r; }
+        // late-bound operands: sets use set algebra, everything else binds normally
+        public static dynamic sub(dynamic a, dynamic b) => IsSet((object)a) ? set_sub((dynamic)a, (dynamic)b) : checked(a - b);
+        public static dynamic or_(dynamic a, dynamic b) => IsSet((object)a) ? set_or((dynamic)a, (dynamic)b) : a is IDictionary ? dict_or((dynamic)a, (dynamic)b) : a | b;
+        public static dynamic and_(dynamic a, dynamic b) => IsSet((object)a) ? set_and((dynamic)a, (dynamic)b) : a & b;
+        public static dynamic xor_(dynamic a, dynamic b) => IsSet((object)a) ? set_xor((dynamic)a, (dynamic)b) : a ^ b;
+
+        // ───────────── match statements (PEP 634) ─────────────
+
+        /// <summary>Binds a match capture inside the case condition.</summary>
+        public static bool __bind<T>(out T target, T value) { target = value; return true; }
+
+        /// <summary>A sequence pattern on a value of unknown type: lists, tuples and other sequences match, str does not.</summary>
+        public static bool __match_seq(object? o, out IList<object?> items)
+        {
+            switch (o)
+            {
+                case string _: case IDictionary _: items = Array.Empty<object?>(); return false;
+                case IList l: items = l.Cast<object?>().ToList(); return true;
+                case ITuple t: items = Enumerable.Range(0, t.Length).Select(i => t[i]).ToList(); return true;
+                default: items = Array.Empty<object?>(); return false;
+            }
+        }
+
+        public static bool __match_map(object? o, out IDictionary map)
+        {
+            if (o is IDictionary d) { map = d; return true; }
+            map = new Dictionary<object, object?>();
+            return false;
+        }
+
+        // ───────────── slice assignment and deletion: xs[a:b] = ys, del xs[a:b] ─────────────
+
+        public static void setslice<T>(List<T> l, long? start, long? stop, long step, IEnumerable<T> values)
+        {
+            var vals = ReferenceEquals(values, l) ? new List<T>(l) : values as IList<T> ?? values.ToList();
+            if (step == 1)
+            {
+                var (a, b) = SliceBounds(l.Count, start, stop);
+                l.RemoveRange(a, b - a);
+                l.InsertRange(a, vals);
+                return;
+            }
+            var idx = SliceIndices(l.Count, start, stop, step);
+            if (idx.Count != vals.Count) throw new ArgumentException($"attempt to assign sequence of size {vals.Count} to extended slice of size {idx.Count}");
+            for (int i = 0; i < idx.Count; i++) l[idx[i]] = vals[i];
+        }
+        public static void setslice(object l, long? start, long? stop, long step, object values) => setslice((dynamic)l, start, stop, step, (dynamic)values);
+
+        public static void delslice<T>(List<T> l, long? start, long? stop, long step = 1)
+        {
+            if (step == 1) { var (a, b) = SliceBounds(l.Count, start, stop); l.RemoveRange(a, b - a); return; }
+            var idx = SliceIndices(l.Count, start, stop, step);
+            idx.Sort();
+            for (int i = idx.Count - 1; i >= 0; i--) l.RemoveAt(idx[i]);
+        }
+
+        // ───────────── unpacking: f(*xs), a, *rest = xs, {**a, **b} ─────────────
+
+        /// <summary>Element i of a sequence passed as f(*xs) to n fixed parameters (Python checks the count).</summary>
+        public static T __unpack<T>(IList<T> xs, int i, int n) =>
+            xs.Count == n ? xs[i] : throw new InvalidCastException($"expected {n} positional arguments from *args, got {xs.Count}");
+        public static dynamic __unpack(object xs, int i, int n) => __unpack(((IEnumerable)xs).Cast<object?>().ToList(), i, n)!;
+
+        public static OrderedDictionary<K, V> __dict_merge<K, V>(params IEnumerable<KeyValuePair<K, V>>[] parts) where K : notnull
+        {
+            var d = new OrderedDictionary<K, V>();
+            foreach (var part in parts) foreach (var kv in part) d[kv.Key] = kv.Value;
+            return d;
+        }
+        /// <summary>{**a, **b} of dicts with different key/value types: the result has the unified types.</summary>
+        public static OrderedDictionary<K, V> __dict_merge_as<K, V>(params IDictionary[] parts) where K : notnull
+        {
+            var d = new OrderedDictionary<K, V>();
+            foreach (var part in parts) foreach (DictionaryEntry e in part) d[(K)e.Key] = (V)e.Value!;
+            return d;
         }
 
         // ───────────── unpacking: a, b = some_list ─────────────
@@ -713,7 +1370,7 @@ namespace Typhon.Runtime
         // Color.RED.value / Color.RED.name (Typhon enums are CLR enums with int values)
         extension<TEnum>(TEnum e) where TEnum : struct, Enum
         {
-            public int value => Convert.ToInt32(e, Inv);
+            public long value => Convert.ToInt64(e, Inv);
             public string name => e.ToString();
         }
 
@@ -722,25 +1379,123 @@ namespace Typhon.Runtime
         public static string strip(this string s, string? chars = null) => chars == null ? s.Trim() : s.Trim(chars.ToCharArray());
         public static string lstrip(this string s, string? chars = null) => chars == null ? s.TrimStart() : s.TrimStart(chars.ToCharArray());
         public static string rstrip(this string s, string? chars = null) => chars == null ? s.TrimEnd() : s.TrimEnd(chars.ToCharArray());
-        public static List<string> split(this string s, string? sep = null, int maxsplit = -1)
+        public static List<string> split(this string s, string? sep = null, long maxsplit = -1)
         {
+            int parts1 = maxsplit < 0 ? -1 : (int)Math.Min(maxsplit + 1, int.MaxValue);
             if (sep == null)
             {
                 var parts = s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-                if (maxsplit < 0 || parts.Length <= maxsplit + 1) return parts.ToList();
-                return s.TrimStart().Split((char[]?)null, maxsplit + 1, StringSplitOptions.RemoveEmptyEntries).ToList();
+                if (parts1 < 0 || parts.Length <= parts1) return parts.ToList();
+                return s.TrimStart().Split((char[]?)null, parts1, StringSplitOptions.RemoveEmptyEntries).ToList();
             }
-            return (maxsplit < 0 ? s.Split(sep) : s.Split(sep, maxsplit + 1)).ToList();
+            return (parts1 < 0 ? s.Split(sep) : s.Split(sep, parts1)).ToList();
         }
         public static List<string> splitlines(this string s) => s.Replace("\r\n", "\n").Split('\n').ToList() is var l && l.Count > 0 && l[^1] == "" ? l.Take(l.Count - 1).ToList() : s.Replace("\r\n", "\n").Split('\n').ToList();
         public static string join<T>(this string sep, IEnumerable<T> items) => string.Join(sep, items.Select(x => str(x)));
         public static bool startswith(this string s, string prefix) => s.StartsWith(prefix, StringComparison.Ordinal);
         public static bool endswith(this string s, string suffix) => s.EndsWith(suffix, StringComparison.Ordinal);
+        public static bool startswith(this string s, ITuple prefixes) => Enumerable.Range(0, prefixes.Length).Any(i => s.StartsWith((string)prefixes[i]!, StringComparison.Ordinal));
+        public static bool endswith(this string s, ITuple suffixes) => Enumerable.Range(0, suffixes.Length).Any(i => s.EndsWith((string)suffixes[i]!, StringComparison.Ordinal));
+        public static bool startswith(this string s, string prefix, long start, long? end = null) => slice(s, start, end).StartsWith(prefix, StringComparison.Ordinal);
+        public static bool endswith(this string s, string suffix, long start, long? end = null) => slice(s, start, end).EndsWith(suffix, StringComparison.Ordinal);
         public static string replace(this string s, string old, string @new) => s.Replace(old, @new, StringComparison.Ordinal);
-        public static int find(this string s, string sub) => s.IndexOf(sub, StringComparison.Ordinal);
-        public static int rfind(this string s, string sub) => s.LastIndexOf(sub, StringComparison.Ordinal);
-        public static int index(this string s, string sub) { int i = s.IndexOf(sub, StringComparison.Ordinal); return i >= 0 ? i : throw new ArgumentException("substring not found"); }
-        public static int count(this string s, string sub) { int n = 0, i = 0; while (sub.Length > 0 && (i = s.IndexOf(sub, i, StringComparison.Ordinal)) >= 0) { n++; i += sub.Length; } return n; }
+        public static string replace(this string s, string old, string @new, long count)
+        {
+            if (count < 0) return s.Replace(old, @new, StringComparison.Ordinal);
+            var sb = new StringBuilder(); int i = 0;
+            for (long n = 0; n < count; n++)
+            {
+                int j = old.Length == 0 ? (i <= s.Length ? i : -1) : s.IndexOf(old, i, StringComparison.Ordinal);
+                if (j < 0) break;
+                sb.Append(s, i, j - i).Append(@new);
+                if (old.Length == 0) { if (j < s.Length) sb.Append(s[j]); i = j + 1; } else i = j + old.Length;
+            }
+            if (i < s.Length) sb.Append(s, i, s.Length - i);
+            return sb.ToString();
+        }
+        public static long find(this string s, string sub) => s.IndexOf(sub, StringComparison.Ordinal);
+        public static long find(this string s, string sub, long start, long? end = null) { var (a, b) = SliceBounds(s.Length, start, end); int i = s.IndexOf(sub, a, b - a, StringComparison.Ordinal); return i; }
+        public static long rindex(this string s, string sub) { int i = s.LastIndexOf(sub, StringComparison.Ordinal); return i >= 0 ? i : throw new ArgumentException("substring not found"); }
+        public static long index(this string s, string sub, long start, long? end = null) { long i = s.find(sub, start, end); return i >= 0 ? i : throw new ArgumentException("substring not found"); }
+        public static long count(this string s, string sub, long start, long? end = null) => slice(s, start, end).count(sub);
+        public static (string, string, string) partition(this string s, string sep) { int i = s.IndexOf(sep, StringComparison.Ordinal); return i < 0 ? (s, "", "") : (s.Substring(0, i), sep, s.Substring(i + sep.Length)); }
+        public static (string, string, string) rpartition(this string s, string sep) { int i = s.LastIndexOf(sep, StringComparison.Ordinal); return i < 0 ? ("", "", s) : (s.Substring(0, i), sep, s.Substring(i + sep.Length)); }
+        public static List<string> rsplit(this string s, string? sep = null, long maxsplit = -1)
+        {
+            if (maxsplit < 0) return s.split(sep);
+            var parts = new List<string>();
+            string rest = sep == null ? s.TrimEnd() : s;
+            while (parts.Count < maxsplit)
+            {
+                int i = sep == null ? rest.LastIndexOfAny(new[] { ' ', '\t', '\n', '\r', '\f', '\v' }) : rest.LastIndexOf(sep, StringComparison.Ordinal);
+                if (i < 0) break;
+                parts.Insert(0, rest.Substring(i + (sep?.Length ?? 1)));
+                rest = sep == null ? rest.Substring(0, i).TrimEnd() : rest.Substring(0, i);
+            }
+            parts.Insert(0, rest);
+            return parts;
+        }
+        public static string removeprefix(this string s, string prefix) => s.StartsWith(prefix, StringComparison.Ordinal) ? s.Substring(prefix.Length) : s;
+        public static string removesuffix(this string s, string suffix) => suffix.Length > 0 && s.EndsWith(suffix, StringComparison.Ordinal) ? s.Substring(0, s.Length - suffix.Length) : s;
+        public static string swapcase(this string s) => new string(s.Select(c => char.IsUpper(c) ? char.ToLowerInvariant(c) : char.IsLower(c) ? char.ToUpperInvariant(c) : c).ToArray());
+        public static string casefold(this string s) => s.ToLowerInvariant();
+        public static string expandtabs(this string s, long tabsize = 8)
+        {
+            var sb = new StringBuilder(); int col = 0;
+            foreach (char c in s)
+            {
+                if (c == '\t') { int n = tabsize > 0 ? (int)(tabsize - col % tabsize) : 0; sb.Append(' ', n); col += n; }
+                else { sb.Append(c); col = c == '\n' || c == '\r' ? 0 : col + 1; }
+            }
+            return sb.ToString();
+        }
+        public static bool isascii(this string s) => s.All(c => c < 128);
+        public static bool isdecimal(this string s) => s.Length > 0 && s.All(c => char.GetUnicodeCategory(c) == UnicodeCategory.DecimalDigitNumber);
+        public static bool isnumeric(this string s) => s.Length > 0 && s.All(char.IsNumber);
+        public static bool isidentifier(this string s) => s.Length > 0 && (char.IsLetter(s[0]) || s[0] == '_') && s.All(c => char.IsLetterOrDigit(c) || c == '_');
+        public static bool isprintable(this string s) => s.All(c => !char.IsControl(c));
+        public static bool istitle(this string s)
+        {
+            bool cased = false, prevCased = false;
+            foreach (char c in s)
+            {
+                if (char.IsUpper(c)) { if (prevCased) return false; prevCased = cased = true; }
+                else if (char.IsLower(c)) { if (!prevCased) return false; prevCased = cased = true; }
+                else prevCased = false;
+            }
+            return cased;
+        }
+        public static List<string> splitlines(this string s, bool keepends)
+        {
+            if (!keepends) return s.splitlines();
+            var r = new List<string>(); int start = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (s[i] == '\n' || s[i] == '\r')
+                {
+                    int end = s[i] == '\r' && i + 1 < s.Length && s[i + 1] == '\n' ? i + 2 : i + 1;
+                    r.Add(s.Substring(start, end - start)); start = end; i = end - 1;
+                }
+            }
+            if (start < s.Length) r.Add(s.Substring(start));
+            return r;
+        }
+        public static Dictionary<long, string?> maketrans(string from, string to, string? delete = null)
+        {
+            var d = new Dictionary<long, string?>();
+            for (int i = 0; i < from.Length; i++) d[from[i]] = to[i].ToString();
+            if (delete != null) foreach (char c in delete) d[c] = null;
+            return d;
+        }
+        public static string translate(this string s, IDictionary<long, string?> table)
+        {
+            var sb = new StringBuilder();
+            foreach (char c in s) { if (table.TryGetValue(c, out var r)) { if (r != null) sb.Append(r); } else sb.Append(c); }
+            return sb.ToString();
+        }
+        public static long rfind(this string s, string sub) => s.LastIndexOf(sub, StringComparison.Ordinal);
+        public static long index(this string s, string sub) { int i = s.IndexOf(sub, StringComparison.Ordinal); return i >= 0 ? i : throw new ArgumentException("substring not found"); }
+        public static long count(this string s, string sub) { long n = 0; int i = 0; while (sub.Length > 0 && (i = s.IndexOf(sub, i, StringComparison.Ordinal)) >= 0) { n++; i += sub.Length; } return n; }
         public static bool isdigit(this string s) => s.Length > 0 && s.All(char.IsDigit);
         public static bool isalpha(this string s) => s.Length > 0 && s.All(char.IsLetter);
         public static bool isalnum(this string s) => s.Length > 0 && s.All(char.IsLetterOrDigit);
@@ -749,10 +1504,11 @@ namespace Typhon.Runtime
         public static bool islower(this string s) => s.Any(char.IsLetter) && !s.Any(char.IsUpper);
         public static string title(this string s) => CultureInfo.InvariantCulture.TextInfo.ToTitleCase(s.ToLowerInvariant());
         public static string capitalize(this string s) => s.Length == 0 ? s : char.ToUpperInvariant(s[0]) + s.Substring(1).ToLowerInvariant();
-        public static string zfill(this string s, int width) => s.StartsWith("-") ? "-" + s.Substring(1).PadLeft(width - 1, '0') : s.PadLeft(width, '0');
-        public static string center(this string s, int width, string fill = " ") => format(s, fill + "^" + width);
-        public static string ljust(this string s, int width, string fill = " ") => s.PadRight(width, fill[0]);
-        public static string rjust(this string s, int width, string fill = " ") => s.PadLeft(width, fill[0]);
+        public static string zfill(this string s, long width) => s.StartsWith("-") ? "-" + s.Substring(1).PadLeft(Width(width - 1), '0') : s.PadLeft(Width(width), '0');
+        public static string center(this string s, long width, string fill = " ") => format(s, fill + "^" + Width(width));
+        public static string ljust(this string s, long width, string fill = " ") => s.PadRight(Width(width), fill[0]);
+        public static string rjust(this string s, long width, string fill = " ") => s.PadLeft(Width(width), fill[0]);
+        static int Width(long w) => w <= 0 ? 0 : checked((int)w);
 
         // iterating a str yields .NET chars; give them the Python str API too
         public static string upper(this char c) => char.ToUpperInvariant(c).ToString();
@@ -768,11 +1524,34 @@ namespace Typhon.Runtime
 
         public static void append<T>(this List<T> l, T x) => l.Add(x);
         public static void extend<T>(this List<T> l, IEnumerable<T> xs) => l.AddRange(xs);
-        public static void insert<T>(this List<T> l, int i, T x) => l.Insert(i < 0 ? Math.Max(0, l.Count + i) : Math.Min(i, l.Count), x);
-        public static T pop<T>(this List<T> l, int i = -1) { if (i < 0) i += l.Count; var x = l[i]; l.RemoveAt(i); return x; }
+        /// <summary>A list of late-bound (or wider) items extended with typed ones: List&lt;dynamic&gt; += List&lt;long&gt;.</summary>
+        public static void __extend_cast<T, U>(List<T> l, IEnumerable<U> xs) { foreach (var x in xs) l.Add((T)(dynamic)x!); }
+        /// <summary>Is a late-bound value one of Python's built-in values (str, list, dict, set, tuple, number), whose methods are the runtime's static ones?</summary>
+        public static bool __is_pyvalue(object? o) => o is string || o is System.Collections.IList || o is System.Collections.IDictionary || o is IConvertible ||
+            o is BigInteger || o is ITuple || o != null && o.GetType().IsGenericType && o.GetType().GetGenericTypeDefinition() == typeof(HashSet<>);
+
+        /// <summary>a += b on late-bound values: a list extends in place (Python's list.__iadd__), anything else adds.</summary>
+        public static dynamic __iadd(dynamic a, dynamic b)
+        {
+            if (a is System.Collections.IList list && !(b is string)) { foreach (var x in (IEnumerable)b) list.Add(x); return a; }
+            return a + b;
+        }
+        public static void insert<T>(this List<T> l, long i, T x) => l.Insert((int)(i < 0 ? Math.Max(0, l.Count + i) : Math.Min(i, l.Count)), x);
+        public static T pop<T>(this List<T> l, long i = -1)
+        {
+            if (i < 0) i += l.Count;
+            if ((ulong)i >= (ulong)l.Count) throw new ArgumentOutOfRangeException(nameof(i), l.Count == 0 ? "pop from empty list" : "pop index out of range");
+            var x = l[(int)i]; l.RemoveAt((int)i); return x;
+        }
         public static void remove<T>(this List<T> l, T x) { if (!l.Remove(x)) throw new ArgumentException("list.remove(x): x not in list"); }
-        public static int index<T>(this IList<T> l, T x) { int i = l.IndexOf(x); return i >= 0 ? i : throw new ArgumentException("value is not in list"); }
-        public static int count<T>(this IEnumerable<T> l, T x) => l.Count(y => Equals(y, x));
+        public static long index<T>(this IList<T> l, T x) { int i = l.IndexOf(x); return i >= 0 ? i : throw new ArgumentException("value is not in list"); }
+        public static long index<T>(this IList<T> l, T x, long start, long? stop = null)
+        {
+            var (a, b) = SliceBounds(l.Count, start, stop);
+            for (int i = a; i < b; i++) if (EqualityComparer<T>.Default.Equals(l[i], x)) return i;
+            throw new ArgumentException("value is not in list");
+        }
+        public static long count<T>(this IEnumerable<T> l, T x) => l.LongCount(y => Equals(y, x));
         public static void sort<T>(this List<T> l, bool reverse = false)
         {
             if (StabilityIrrelevant<T>()) { l.Sort(PyComparer<T>()); if (reverse) l.Reverse(); return; }
@@ -787,15 +1566,67 @@ namespace Typhon.Runtime
         // ───────────── dict / set methods ─────────────
 
         public static IEnumerable<(K, V)> items<K, V>(this IDictionary<K, V> d) => d.Select(kv => (kv.Key, kv.Value));
+        // Mapping[K, V] (IReadOnlyDictionary): plain methods, since an extension overload would make dict.items() ambiguous
+        public static IEnumerable<(K, V)> __ro_items<K, V>(IReadOnlyDictionary<K, V> d) => d.Select(kv => (kv.Key, kv.Value));
+        public static IEnumerable<K> __ro_keys<K, V>(IReadOnlyDictionary<K, V> d) => d.Keys;
+        public static IEnumerable<V> __ro_values<K, V>(IReadOnlyDictionary<K, V> d) => d.Values;
+        public static V __ro_get<K, V>(IReadOnlyDictionary<K, V> d, K key, V dflt) => d.TryGetValue(key, out var v) ? v : dflt;
         public static ICollection<K> keys<K, V>(this IDictionary<K, V> d) => d.Keys;
         public static ICollection<V> values<K, V>(this IDictionary<K, V> d) => d.Values;
         public static V get<K, V>(this IDictionary<K, V> d, K key, V @default) => d.TryGetValue(key, out var v) ? v : @default;
         public static V setdefault<K, V>(this IDictionary<K, V> d, K key, V @default = default!) { if (!d.TryGetValue(key, out var v)) d[key] = v = @default; return v; }
         public static V pop<K, V>(this IDictionary<K, V> d, K key) { var v = d[key]; d.Remove(key); return v; }
+        public static V pop<K, V>(this IDictionary<K, V> d, K key, V @default) { if (!d.TryGetValue(key, out var v)) return @default; d.Remove(key); return v; }
+        public static (K, V) popitem<K, V>(this IDictionary<K, V> d)
+        {
+            if (d.Count == 0) throw new KeyNotFoundException("popitem(): dictionary is empty");
+            var last = d.Last(); d.Remove(last.Key); return (last.Key, last.Value);
+        }
         public static void update<K, V>(this IDictionary<K, V> d, IDictionary<K, V> other) { foreach (var kv in other) d[kv.Key] = kv.Value; }
+        public static void update<K, V>(this IDictionary<K, V> d, IEnumerable<(K, V)> pairs) { foreach (var (k, v) in pairs) d[k] = v; }
+        public static OrderedDictionary<K, V> fromkeys<K, V>(IEnumerable<K> keys, V value) where K : notnull { var d = new OrderedDictionary<K, V>(); foreach (var k in keys) d[k] = value; return d; }
+        public static OrderedDictionary<K, object?> fromkeys<K>(IEnumerable<K> keys) where K : notnull => fromkeys<K, object?>(keys, null);
         public static Dictionary<K, V> copy<K, V>(this Dictionary<K, V> d) where K : notnull => new Dictionary<K, V>(d);
+        public static OrderedDictionary<K, V> copy<K, V>(this OrderedDictionary<K, V> d) where K : notnull => dict(d);
+        public static (K, V) popitem<K, V>(this OrderedDictionary<K, V> d) where K : notnull
+        {
+            if (d.Count == 0) throw new KeyNotFoundException("popitem(): dictionary is empty");
+            var last = d.GetAt(d.Count - 1); d.RemoveAt(d.Count - 1); return (last.Key, last.Value);
+        }
         public static void add<T>(this HashSet<T> s, T x) => s.Add(x);
         public static void discard<T>(this HashSet<T> s, T x) => s.Remove(x);
+        public static void remove<T>(this HashSet<T> s, T x) { if (!s.Remove(x)) throw new KeyNotFoundException(repr(x)); }
+        public static T pop<T>(this HashSet<T> s) { if (s.Count == 0) throw new KeyNotFoundException("pop from an empty set"); var x = s.First(); s.Remove(x); return x; }
+        public static HashSet<T> copy<T>(this HashSet<T> s) => new HashSet<T>(s);
+        public static void update<T>(this HashSet<T> s, params IEnumerable<T>[] others) { foreach (var o in others) s.UnionWith(o); }
+        public static void difference_update<T>(this HashSet<T> s, params IEnumerable<T>[] others) { foreach (var o in others) s.ExceptWith(o); }
+        public static void intersection_update<T>(this HashSet<T> s, params IEnumerable<T>[] others) { foreach (var o in others) s.IntersectWith(o); }
+        public static void symmetric_difference_update<T>(this HashSet<T> s, IEnumerable<T> other) => s.SymmetricExceptWith(other);
+        public static HashSet<T> union<T>(this HashSet<T> s, params IEnumerable<T>[] others) { var r = new HashSet<T>(s); foreach (var o in others) r.UnionWith(o); return r; }
+        public static HashSet<T> difference<T>(this HashSet<T> s, params IEnumerable<T>[] others) { var r = new HashSet<T>(s); foreach (var o in others) r.ExceptWith(o); return r; }
+        public static HashSet<T> intersection<T>(this HashSet<T> s, params IEnumerable<T>[] others) { var r = new HashSet<T>(s); foreach (var o in others) r.IntersectWith(o); return r; }
+        public static HashSet<T> symmetric_difference<T>(this HashSet<T> s, IEnumerable<T> other) { var r = new HashSet<T>(s); r.SymmetricExceptWith(other); return r; }
+        public static bool issubset<T>(this HashSet<T> s, IEnumerable<T> other) => s.IsSubsetOf(other);
+        public static bool issuperset<T>(this HashSet<T> s, IEnumerable<T> other) => s.IsSupersetOf(other);
+        public static bool isdisjoint<T>(this HashSet<T> s, IEnumerable<T> other) => !s.Overlaps(other);
+
+        // ───────────── int and float methods ─────────────
+
+        public static long bit_length(this long x) => x == 0 ? 0 : 64 - BitOperations.LeadingZeroCount((ulong)(x < 0 ? -(x + 1) + 1 : x));
+        public static long bit_length(this int x) => ((long)x).bit_length();
+        public static long bit_count(this long x) => BitOperations.PopCount((ulong)Math.Abs(x));
+        public static long bit_count(this int x) => ((long)x).bit_count();
+        public static bool is_integer(this double d) => !double.IsInfinity(d) && d == Math.Floor(d);
+        public static bool is_integer(this long x) => true;
+        public static (long, long) as_integer_ratio(this long x) => (x, 1);
+        public static (long, long) as_integer_ratio(this double d)
+        {
+            if (double.IsNaN(d) || double.IsInfinity(d)) throw new OverflowException("cannot convert to an integer ratio");
+            long den = 1; while (d != Math.Floor(d)) { d *= 2; den = checked(den * 2); }
+            return (checked((long)d), den);
+        }
+        public static long conjugate(this long x) => x;
+        public static double conjugate(this double x) => x;
     }
 }
 
@@ -807,6 +1638,8 @@ namespace Typhon.Runtime
     internal static class DictGetStruct
     {
         public static V? get<K, V>(this IDictionary<K, V> d, K key) where V : struct => d.TryGetValue(key, out var v) ? v : null;
+        /// <summary>d.pop(k, None) of a dict of value types: the value, or None (null).</summary>
+        public static V? pop<K, V>(this IDictionary<K, V> d, K key, V? none) where V : struct => d.Remove(key, out var v) ? v : none;
     }
 
     internal static class DictGetClass
@@ -842,17 +1675,62 @@ namespace Typhon.Stdlib
         public static double pow(double x, double y) => Math.Pow(x, y);
         public static double fabs(double x) => Math.Abs(x);
         public static double hypot(double x, double y) => Math.Sqrt(x * x + y * y);
-        public static int floor(double x) => (int)Math.Floor(x);
-        public static int ceil(double x) => (int)Math.Ceiling(x);
-        public static int trunc(double x) => (int)Math.Truncate(x);
+        public static long floor(double x) => Builtins.@int(Math.Floor(x));
+        public static long ceil(double x) => Builtins.@int(Math.Ceiling(x));
+        public static long trunc(double x) => Builtins.@int(Math.Truncate(x));
+        public static long floor(long x) => x;
+        public static long ceil(long x) => x;
+        public static long trunc(long x) => x;
         public static double degrees(double x) => x * 180.0 / Math.PI;
         public static double radians(double x) => x * Math.PI / 180.0;
         public static bool isnan(double x) => double.IsNaN(x);
         public static bool isinf(double x) => double.IsInfinity(x);
         public static bool isfinite(double x) => double.IsFinite(x);
         public static bool isclose(double a, double b, double rel_tol = 1e-09, double abs_tol = 0.0) => Math.Abs(a - b) <= Math.Max(rel_tol * Math.Max(Math.Abs(a), Math.Abs(b)), abs_tol);
-        public static int gcd(int a, int b) { a = Math.Abs(a); b = Math.Abs(b); while (b != 0) (a, b) = (b, a % b); return a; }
-        public static long factorial(int n) { long r = 1; for (int i = 2; i <= n; i++) r = checked(r * i); return r; }
+        public static long gcd(long a, long b) { a = Math.Abs(a); b = Math.Abs(b); while (b != 0) (a, b) = (b, a % b); return a; }
+        // big-int mode: the same functions on BigIntegers (exact, no 64-bit limit)
+        public static BigInteger gcd(BigInteger a, BigInteger b) => BigInteger.GreatestCommonDivisor(a, b);
+        public static BigInteger lcm(BigInteger a, BigInteger b) => a.IsZero || b.IsZero ? 0 : BigInteger.Abs(a / BigInteger.GreatestCommonDivisor(a, b) * b);
+        public static BigInteger factorial(BigInteger n) { if (n.Sign < 0) throw new ArgumentException("factorial() not defined for negative values"); BigInteger r = 1; for (BigInteger i = 2; i <= n; i++) r *= i; return r; }
+        public static BigInteger comb(BigInteger n, BigInteger k) { if (n.Sign < 0 || k.Sign < 0) throw new ArgumentException("n and k must be non-negative integers"); if (k > n) return 0; if (k > n - k) k = n - k; BigInteger r = 1; for (BigInteger i = 1; i <= k; i++) r = r * (n - k + i) / i; return r; }
+        public static BigInteger perm(BigInteger n, BigInteger k) { if (k > n) return 0; BigInteger r = 1; for (BigInteger i = n - k + 1; i <= n; i++) r *= i; return r; }
+        public static BigInteger isqrt(BigInteger n)
+        {
+            if (n.Sign < 0) throw new ArgumentException("isqrt() argument must be nonnegative");
+            if (n < 2) return n;
+            var x = (BigInteger)Math.Sqrt((double)n);
+            while (x * x > n) x--;
+            while ((x + 1) * (x + 1) <= n) x++;
+            return x;
+        }
+        public static long lcm(long a, long b) => a == 0 || b == 0 ? 0 : checked(Math.Abs(a / gcd(a, b) * b));
+        public static long isqrt(long n)
+        {
+            if (n < 0) throw new ArgumentException("isqrt() argument must be nonnegative");
+            if (n < 2) return n;
+            long r = (long)Math.Sqrt(n);
+            while (r > n / r) r--;
+            while (r + 1 <= n / (r + 1)) r++;
+            return r;
+        }
+        public static long factorial(long n)
+        {
+            if (n < 0) throw new ArgumentException("factorial() not defined for negative values");
+            long r = 1; for (long i = 2; i <= n; i++) r = checked(r * i); return r;
+        }
+        public static long comb(long n, long k)
+        {
+            if (n < 0 || k < 0) throw new ArgumentException("n and k must be non-negative integers");
+            if (k > n) return 0;
+            k = Math.Min(k, n - k);
+            long r = 1; for (long i = 1; i <= k; i++) r = checked(r * (n - k + i)) / i; return r;
+        }
+        public static long perm(long n, long k)
+        {
+            if (n < 0 || k < 0) throw new ArgumentException("n and k must be non-negative integers");
+            if (k > n) return 0;
+            long r = 1; for (long i = n - k + 1; i <= n; i++) r = checked(r * i); return r;
+        }
         public static double fsum(IEnumerable<double> xs) => xs.Sum();
     }
 
@@ -869,11 +1747,11 @@ namespace Typhon.Stdlib
     internal static class random_
     {
         static Random _rng = new Random();
-        public static void seed(int s) => _rng = new Random(s);
+        public static void seed(long s) => _rng = new Random(unchecked((int)(s ^ (s >> 32))));
         public static double random() => _rng.NextDouble();
-        public static int randint(int a, int b) => _rng.Next(a, b + 1);
-        public static int randrange(int stop) => _rng.Next(stop);
-        public static int randrange(int start, int stop) => _rng.Next(start, stop);
+        public static long randint(long a, long b) => _rng.NextInt64(a, checked(b + 1));
+        public static long randrange(long stop) => _rng.NextInt64(stop);
+        public static long randrange(long start, long stop) => _rng.NextInt64(start, stop);
         public static double uniform(double a, double b) => a + (b - a) * _rng.NextDouble();
         public static double gauss(double mu = 0, double sigma = 1)
         {
@@ -897,7 +1775,12 @@ namespace Typhon.Stdlib
             argv = new List<string> { Environment.GetCommandLineArgs().FirstOrDefault() ?? "" };
             argv.AddRange(args);
         }
-        public static void exit(int code = 0) => Environment.Exit(code);
+        public static void exit(long code = 0) => Environment.Exit(checked((int)code));
+        // CPython limits: digits of int→str conversions, recursion depth (the .NET stack decides here)
+        public static void set_int_max_str_digits(long maxdigits) { }
+        public static long get_int_max_str_digits() => 0;
+        public static void setrecursionlimit(long limit) { }
+        public static long getrecursionlimit() => 1000;
     }
 
     internal static class asyncio_
@@ -915,6 +1798,15 @@ namespace Typhon.Stdlib
         public static string? getenv(string name, string? @default = null) => Environment.GetEnvironmentVariable(name) ?? @default;
         public static List<string> listdir(string path = ".") => System.IO.Directory.EnumerateFileSystemEntries(path).Select(System.IO.Path.GetFileName).Select(x => x!).ToList();
         public static readonly string sep = System.IO.Path.DirectorySeparatorChar.ToString();
+        public static readonly string linesep = Environment.NewLine;
+        public static void remove(string path) { if (!System.IO.File.Exists(path)) throw new System.IO.FileNotFoundException($"No such file or directory: '{path}'"); System.IO.File.Delete(path); }
+        public static void unlink(string path) => remove(path);
+        public static void rename(string src, string dst) => System.IO.File.Move(src, dst);
+        public static void mkdir(string path) { if (System.IO.Directory.Exists(path)) throw new System.IO.IOException($"File exists: '{path}'"); System.IO.Directory.CreateDirectory(path); }
+        public static void makedirs(string path, bool exist_ok = false) { if (System.IO.Directory.Exists(path) && !exist_ok) throw new System.IO.IOException($"File exists: '{path}'"); System.IO.Directory.CreateDirectory(path); }
+        public static void rmdir(string path) => System.IO.Directory.Delete(path);
+        public static void chdir(string path) => Environment.CurrentDirectory = path;
+        public static long cpu_count() => Environment.ProcessorCount;
 
         public static class path
         {
@@ -926,6 +1818,13 @@ namespace Typhon.Stdlib
             public static string dirname(string p) => System.IO.Path.GetDirectoryName(p) ?? "";
             public static string abspath(string p) => System.IO.Path.GetFullPath(p);
             public static (string, string) splitext(string p) { var ext = System.IO.Path.GetExtension(p); return (p.Substring(0, p.Length - ext.Length), ext); }
+            public static string realpath(string p) => System.IO.Path.GetFullPath(new System.IO.FileInfo(p).LinkTarget is string t ? System.IO.Path.Combine(System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(p)) ?? "", t) : p);
+            public static string normpath(string p) => System.IO.Path.GetFullPath(p).StartsWith(System.IO.Path.GetFullPath(".")) && !System.IO.Path.IsPathRooted(p) ? System.IO.Path.GetRelativePath(".", System.IO.Path.GetFullPath(p)) : System.IO.Path.GetFullPath(p);
+            public static (string, string) split(string p) => (System.IO.Path.GetDirectoryName(p) ?? "", System.IO.Path.GetFileName(p));
+            public static long getsize(string p) => new System.IO.FileInfo(p).Length;
+            public static string expanduser(string p) => p.StartsWith("~") ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + p.Substring(1) : p;
+            public static string relpath(string p, string? start = null) => System.IO.Path.GetRelativePath(start ?? ".", p);
+            public static bool isabs(string p) => System.IO.Path.IsPathRooted(p);
         }
     }
 }

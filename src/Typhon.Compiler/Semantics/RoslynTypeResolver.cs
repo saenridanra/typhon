@@ -66,6 +66,152 @@ namespace Typhon.Compiler.Semantics
             return false;
         }
 
+        readonly Dictionary<string, IReadOnlyList<MemberSig>> _members = new Dictionary<string, IReadOnlyList<MemberSig>>();
+
+        public IReadOnlyList<MemberSig> GetMembers(string metadataName, string memberName)
+        {
+            string key = metadataName + "::" + memberName;
+            if (_members.TryGetValue(key, out var cached)) return cached;
+            var result = new List<MemberSig>();
+            var start = Find(metadataName);
+            if (start != null)
+            {
+                IEnumerable<ISymbol> symbols;
+                if (memberName == ".ctor") symbols = start.InstanceConstructors;
+                else
+                {
+                    var types = new List<ITypeSymbol>();
+                    for (ITypeSymbol t = start; t != null; t = t.BaseType) types.Add(t);
+                    if (start.TypeKind == TypeKind.Interface) types.AddRange(start.AllInterfaces);
+                    symbols = types.SelectMany(t => t.GetMembers(memberName));
+                }
+                foreach (var sym in symbols)
+                {
+                    if (sym.DeclaredAccessibility != Accessibility.Public) continue;
+                    switch (sym)
+                    {
+                        case IMethodSymbol m when m.MethodKind == MethodKind.Ordinary || m.MethodKind == MethodKind.Constructor:
+                        {
+                            var sig = new MemberSig { IsMethod = true, IsStatic = m.IsStatic, Type = Display(m.ReturnType) };
+                            foreach (var p in m.Parameters)
+                            {
+                                var t = p.IsParams && p.Type is IArrayTypeSymbol arr ? arr.ElementType : p.Type;
+                                var fit = Fit(t, out var narrowTo);
+                                bool bigAccepts = BigFit(t, out var bigNarrow, out bool isBig);
+                                if (p.RefKind != RefKind.None) { fit = LongFit.Other; bigAccepts = false; bigNarrow = null; isBig = false; }
+                                sig.Parameters.Add(new ParamSig { Name = p.Name, Fit = fit, NarrowTo = narrowTo, IsParams = p.IsParams, IsOptional = p.IsOptional,
+                                                                  BigAccepts = bigAccepts, BigNarrowTo = bigNarrow, IsBigInteger = isBig });
+                            }
+                            result.Add(sig);
+                            break;
+                        }
+                        case IPropertySymbol prop when !prop.IsIndexer:
+                            BigFit(prop.Type, out var pbn, out _);
+                            result.Add(new MemberSig { IsStatic = prop.IsStatic, Type = Display(prop.Type), ValueFit = Fit(prop.Type, out var pn), ValueNarrowTo = pn, ValueBigNarrowTo = pbn });
+                            break;
+                        case IFieldSymbol field:
+                            BigFit(field.Type, out var fbn, out _);
+                            result.Add(new MemberSig { IsStatic = field.IsStatic, Type = Display(field.Type), ValueFit = Fit(field.Type, out var fn), ValueNarrowTo = fn, ValueBigNarrowTo = fbn });
+                            break;
+                    }
+                }
+            }
+            return _members[key] = result;
+        }
+
+        /// <summary>
+        /// The type as C# code usable anywhere in generated code (keywords, else fully qualified; System.Collections.Generic
+        /// short, as Typhon spells it), or null when Typhon should not adopt it: void, object/dynamic, open generic types,
+        /// ref structs, pointers.
+        /// </summary>
+        static string Display(ITypeSymbol t)
+        {
+            if (t == null || t.SpecialType == SpecialType.System_Void || t.SpecialType == SpecialType.System_Object || t.TypeKind == TypeKind.Dynamic) return null;
+            if (Keyword(t) is string k) return k;
+            if (t.IsRefLikeType || t.TypeKind == TypeKind.Pointer || t.TypeKind == TypeKind.FunctionPointer || t.TypeKind == TypeKind.Error || HasTypeParameter(t)) return null;
+            return t.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::System.Collections.Generic.", "");
+        }
+
+        static bool HasTypeParameter(ITypeSymbol t)
+        {
+            switch (t)
+            {
+                case ITypeParameterSymbol _: return true;
+                case IArrayTypeSymbol a: return HasTypeParameter(a.ElementType);
+                case INamedTypeSymbol n: return n.TypeArguments.Any(HasTypeParameter) || (n.ContainingType != null && HasTypeParameter(n.ContainingType));
+                default: return false;
+            }
+        }
+
+        static string Keyword(ITypeSymbol t)
+        {
+            switch (t.SpecialType)
+            {
+                case SpecialType.System_String: return "string";
+                case SpecialType.System_Boolean: return "bool";
+                case SpecialType.System_Char: return "char";
+                case SpecialType.System_Int32: return "int";
+                case SpecialType.System_Int64: return "long";
+                case SpecialType.System_Int16: return "short";
+                case SpecialType.System_Byte: return "byte";
+                case SpecialType.System_SByte: return "sbyte";
+                case SpecialType.System_UInt16: return "ushort";
+                case SpecialType.System_UInt32: return "uint";
+                case SpecialType.System_UInt64: return "ulong";
+                case SpecialType.System_Double: return "double";
+                case SpecialType.System_Single: return "float";
+                case SpecialType.System_Decimal: return "decimal";
+                default: return null;
+            }
+        }
+
+        /// <summary>How a value of type long fits a parameter of type <paramref name="t"/> (and what to narrow it to).</summary>
+        LongFit Fit(ITypeSymbol t, out string narrowTo)
+        {
+            narrowTo = null;
+            if (t == null) return LongFit.Other;
+            if (t.TypeKind == TypeKind.TypeParameter || t.TypeKind == TypeKind.Dynamic) return LongFit.Accepts;
+            var int64 = _compilation.GetSpecialType(SpecialType.System_Int64);
+            var int32 = _compilation.GetSpecialType(SpecialType.System_Int32);
+            var toLong = _compilation.ClassifyCommonConversion(int64, t);
+            if (toLong.Exists && toLong.IsImplicit) return LongFit.Accepts;
+            var u = t is INamedTypeSymbol n && n.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T ? n.TypeArguments[0] : t;
+            switch (u.SpecialType)
+            {
+                case SpecialType.System_Int32: narrowTo = "int"; return LongFit.Narrow;
+                case SpecialType.System_Int16: narrowTo = "short"; return LongFit.Narrow;
+                case SpecialType.System_UInt16: narrowTo = "ushort"; return LongFit.Narrow;
+                case SpecialType.System_Byte: narrowTo = "byte"; return LongFit.Narrow;
+                case SpecialType.System_SByte: narrowTo = "sbyte"; return LongFit.Narrow;
+                case SpecialType.System_UInt32: narrowTo = "uint"; return LongFit.Narrow;
+                case SpecialType.System_UInt64: narrowTo = "ulong"; return LongFit.Narrow;
+                case SpecialType.System_IntPtr: narrowTo = "nint"; return LongFit.Narrow;
+            }
+            // e.g. System.Index: an int converts implicitly, a long does not
+            var fromInt = _compilation.ClassifyCommonConversion(int32, t);
+            if (fromInt.Exists && fromInt.IsImplicit) { narrowTo = "int"; return LongFit.Narrow; }
+            return LongFit.Other;
+        }
+
+        /// <summary>
+        /// Big-int mode: does a BigInteger convert implicitly to <paramref name="t"/>? If not, the numeric type it converts to
+        /// explicitly (long, int, double, ...; null for non-numeric types).
+        /// </summary>
+        bool BigFit(ITypeSymbol t, out string narrowTo, out bool isBig)
+        {
+            narrowTo = null; isBig = false;
+            if (t == null) return false;
+            if (t.TypeKind == TypeKind.TypeParameter || t.TypeKind == TypeKind.Dynamic) return true;
+            var big = _compilation.GetTypeByMetadataName("System.Numerics.BigInteger");
+            if (big == null) return false;
+            var u = t is INamedTypeSymbol n && n.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T ? n.TypeArguments[0] : t;
+            isBig = SymbolEqualityComparer.Default.Equals(u, big);
+            var conv = _compilation.ClassifyCommonConversion(big, t);
+            if (conv.Exists && conv.IsImplicit) return true;
+            if (conv.Exists && Keyword(u) is string k && k != "string" && k != "bool") narrowTo = k;
+            return false;
+        }
+
         public IReadOnlyList<CtorSignature> GetConstructors(string metadataName)
         {
             var result = new List<CtorSignature>();

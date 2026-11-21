@@ -1,0 +1,11 @@
+40 10 20 30 40 30 o
+anonymous [3] None yes [] x
+[1, 2, 3, 4, 5] True
+range(2, 20, 3) 2 17 6 True False [5, 8] 5
+1221 abba 6 None
+found 2
+missing
+3 [2.0, 5.0] 5 0 1
+42 4.0 1024 3
+[['a', 'b'], ['c', 'd']]
+(5, 2, [6, 7], '5 6 7') ('a', 2, 'c', 'A B C')

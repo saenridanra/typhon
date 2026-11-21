@@ -16,7 +16,7 @@ internal static class LocalCommand
         if (startServer) CompileServer.StartInBackground();
 
         var target = command is "run" or "check" ? CompileTarget.Script : CompileTarget.Build;
-        var output = CliCompiler.Compile(entryPath, (TypeMode)mode, target, csharpOnly: command == "emit");
+        var output = CliCompiler.Compile(entryPath, CliCompiler.TypeModeOf(mode), target, csharpOnly: command == "emit", bigInts: CliCompiler.BigIntsOf(mode));
         if (command == "emit")
         {
             Console.WriteLine(output.EntryCode);

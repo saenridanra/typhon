@@ -19,6 +19,12 @@ namespace Typhon.Compiler.Emit
         public readonly Dictionary<Node, HashSet<string>> InlineDecl = new Dictionary<Node, HashSet<string>>();
         public readonly List<KeyValuePair<string, Expr>> Hoisted = new List<KeyValuePair<string, Expr>>(); // name → annotation (may be null)
         public readonly Dictionary<string, Expr> HoistedFirstValue = new Dictionary<string, Expr>();
+        /// <summary>Hoisted names bound only by for-loops (used after the loop, e.g. in its else block): the loops binding them.</summary>
+        public readonly Dictionary<string, List<ForStmt>> HoistedLoops = new Dictionary<string, List<ForStmt>>();
+        /// <summary>Every value assigned to a hoisted variable (when they disagree on the type, the variable is late-bound).</summary>
+        public readonly Dictionary<string, List<Expr>> HoistedValues = new Dictionary<string, List<Expr>>();
+        /// <summary>Hoisted variables bound inside expressions or patterns (walrus, match captures): their values, null when unknown.</summary>
+        public readonly Dictionary<string, List<Expr>> HoistedCaptures = new Dictionary<string, List<Expr>>();
         public readonly Dictionary<string, Expr> Annotations = new Dictionary<string, Expr>();
         public readonly HashSet<string> AllLocals = new HashSet<string>();
         public readonly HashSet<string> Globals = new HashSet<string>();
@@ -32,7 +38,8 @@ namespace Typhon.Compiler.Emit
 
     internal sealed class LocalsAnalyzer
     {
-        enum Kind { Load, DeclStore, AnnDecl, LoopTarget, WithTarget, OtherStore }
+        /// <summary>ExprStore: assigned inside an expression or a match pattern (walrus, case capture): never declares inline, but its value types a hoisted variable.</summary>
+        enum Kind { Load, DeclStore, AnnDecl, LoopTarget, WithTarget, OtherStore, ExprStore }
 
         sealed class Occ
         {
@@ -153,6 +160,17 @@ namespace Typhon.Compiler.Emit
                     Walk(t.OrElse, Sub(path, t.OrElse));
                     Walk(t.FinalBody, Sub(path, t.FinalBody));
                     break;
+                case MatchStmt m:
+                    Loads(m.Subject, path);
+                    foreach (var c in m.Cases)
+                    {
+                        var casePath = Sub(path, c.Body);
+                        foreach (var cap in PatternCaptures(c.Pattern, m.Subject)) Add(cap.Key, casePath, Kind.ExprStore, m, cap.Value);
+                        AstWalker.VisitAll(PatternExprs(c.Pattern), n => { if (n is NameExpr ne) Add(ne.Id, path, Kind.Load, null); });
+                        Loads(c.Guard, casePath);
+                        Walk(c.Body, casePath);
+                    }
+                    break;
                 case FunctionDef fd:
                     _r.LocalFunctions.Add(fd.Name);
                     foreach (var p in fd.Params) Loads(p.Default, path);
@@ -173,6 +191,72 @@ namespace Typhon.Compiler.Emit
                 case ClassDef _:
                     break;
             }
+        }
+
+        /// <summary>The names a pattern binds, each with an expression for its value (for typing; null when unknown).</summary>
+        internal static List<KeyValuePair<string, Expr>> PatternCaptures(Pattern p, Expr subject)
+        {
+            var result = new List<KeyValuePair<string, Expr>>();
+            void Visit(Pattern q, Expr value)
+            {
+                switch (q)
+                {
+                    case CapturePattern c: if (c.Name != null) result.Add(new KeyValuePair<string, Expr>(c.Name, value)); break;
+                    case AsPattern a: Visit(a.Inner, value); result.Add(new KeyValuePair<string, Expr>(a.Name, value)); break;
+                    case OrPattern o: foreach (var alt in o.Alternatives) Visit(alt, value); break;
+                    case SequencePattern s:
+                        for (int i = 0; i < s.Items.Count; i++)
+                        {
+                            Expr item = value == null || s.StarIndex >= 0 && i >= s.StarIndex ? null
+                                : new SubscriptExpr { Target = value, Index = new ConstExpr { Kind = ConstKind.Int, Raw = i.ToString() }, Line = q.Line, Col = q.Col };
+                            Visit(s.Items[i], item);
+                        }
+                        if (s.StarName != null) result.Add(new KeyValuePair<string, Expr>(s.StarName, null));
+                        break;
+                    case MappingPattern m:
+                        foreach (var v in m.Values) Visit(v, null);
+                        if (m.Rest != null) result.Add(new KeyValuePair<string, Expr>(m.Rest, null));
+                        break;
+                    case ClassPattern c:
+                    {
+                        // the subject as an instance of the class (for typing only: int(n) → n is an int, Point(x=a) → a has x's type)
+                        Expr asCls = new CallExpr { Func = c.Cls, Line = q.Line, Col = q.Col };
+                        if (IsBuiltinTypeName(c.Cls) && value != null) asCls = new CallExpr { Func = c.Cls, Args = { new Arg { Value = value } }, Line = q.Line, Col = q.Col };
+                        for (int i = 0; i < c.Positional.Count; i++)
+                            Visit(c.Positional[i], IsBuiltinTypeName(c.Cls) ? asCls : new AttributeExpr { Target = asCls, Name = MatchPositionPrefix + i, Line = q.Line, Col = q.Col });
+                        for (int i = 0; i < c.KeywordPatterns.Count; i++)
+                            Visit(c.KeywordPatterns[i], new AttributeExpr { Target = asCls, Name = c.KeywordNames[i], Line = q.Line, Col = q.Col });
+                        break;
+                    }
+                }
+            }
+            Visit(p, subject);
+            return result;
+        }
+
+        /// <summary>Attribute name standing for "positional sub-pattern i" of a class pattern (resolved through __match_args__ when typing).</summary>
+        internal const string MatchPositionPrefix = "__match_pos_";
+
+        static bool IsBuiltinTypeName(Expr e) => e is NameExpr n && (n.Id == "int" || n.Id == "float" || n.Id == "str" || n.Id == "bool" || n.Id == "list" || n.Id == "dict" || n.Id == "tuple" || n.Id == "set");
+
+        /// <summary>The expressions a pattern reads (values like Color.RED, class names, mapping keys).</summary>
+        internal static List<Expr> PatternExprs(Pattern p)
+        {
+            var result = new List<Expr>();
+            void Visit(Pattern q)
+            {
+                switch (q)
+                {
+                    case ValuePattern v: result.Add(v.Value); break;
+                    case AsPattern a: Visit(a.Inner); break;
+                    case OrPattern o: foreach (var alt in o.Alternatives) Visit(alt); break;
+                    case SequencePattern s: foreach (var i in s.Items) Visit(i); break;
+                    case MappingPattern m: result.AddRange(m.Keys); foreach (var v in m.Values) Visit(v); break;
+                    case ClassPattern c: result.Add(c.Cls); foreach (var v in c.Positional) Visit(v); foreach (var v in c.KeywordPatterns) Visit(v); break;
+                }
+            }
+            Visit(p);
+            return result;
         }
 
         static IEnumerable<string> FreeNames(List<Stmt> body)
@@ -224,6 +308,14 @@ namespace Typhon.Compiler.Emit
                     _shadow.Pop();
                     return;
                 case AwaitExpr a: _r.HasAwait = true; Loads(a.Value, path); return;
+                case NamedExpr ne:
+                    Loads(ne.Value, path);
+                    // the target of ':=' belongs to the enclosing function, also inside a comprehension
+                    var shadowed = _shadow.ToArray();
+                    _shadow.Clear();
+                    Add(ne.Target.Id, path, Kind.ExprStore, null, ne.Value);
+                    for (int si = shadowed.Length - 1; si >= 0; si--) _shadow.Push(shadowed[si]);
+                    return;
                 case YieldExpr y: _r.HasYield = true; Loads(y.Value, path); return;
             }
             foreach (var child in AstWalker.Children(e)) Loads(child as Expr, path);
@@ -263,8 +355,13 @@ namespace Typhon.Compiler.Emit
                 {
                     _r.Annotations.TryGetValue(name, out var ann);
                     _r.Hoisted.Add(new KeyValuePair<string, Expr>(name, ann));
-                    var firstStore = occs.Where(o => o.Kind == Kind.DeclStore && o.Value != null).OrderBy(o => o.Order).FirstOrDefault();
+                    var firstStore = occs.Where(o => (o.Kind == Kind.DeclStore || o.Kind == Kind.ExprStore) && o.Value != null).OrderBy(o => o.Order).FirstOrDefault();
                     if (firstStore != null) _r.HoistedFirstValue[name] = firstStore.Value;
+                    else if (ann == null && occs.All(o => o.Kind == Kind.Load || o.Kind == Kind.LoopTarget || o.Kind == Kind.OtherStore))
+                        _r.HoistedLoops[name] = occs.Where(o => o.Kind == Kind.LoopTarget && o.Stmt is ForStmt fs && fs.Target is NameExpr)
+                                                    .Select(o => (ForStmt)o.Stmt).Distinct().ToList();
+                    _r.HoistedValues[name] = occs.Where(o => (o.Kind == Kind.DeclStore || o.Kind == Kind.ExprStore) && o.Value != null).Select(o => o.Value).ToList();
+                    if (occs.Any(o => o.Kind == Kind.ExprStore)) _r.HoistedCaptures[name] = occs.Where(o => o.Kind == Kind.ExprStore).Select(o => o.Value).ToList();
                 }
             }
         }
@@ -342,7 +439,7 @@ namespace Typhon.Compiler.Emit
                 case TupleExpr t: foreach (var v in t.Elts) yield return v; break;
                 case ListExpr t: foreach (var v in t.Elts) yield return v; break;
                 case SetExpr t: foreach (var v in t.Elts) yield return v; break;
-                case DictExpr d: foreach (var v in d.Keys) yield return v; foreach (var v in d.Values) yield return v; break;
+                case DictExpr d: foreach (var v in d.Keys) if (v != null) yield return v; foreach (var v in d.Values) yield return v; break;
                 case ComprehensionExpr c:
                     yield return c.Elt; yield return c.ValueElt;
                     foreach (var g in c.Generators) { yield return g.Target; yield return g.Iter; foreach (var i in g.Ifs) yield return i; }
@@ -350,6 +447,11 @@ namespace Typhon.Compiler.Emit
                 case AwaitExpr a: yield return a.Value; break;
                 case YieldExpr y: yield return y.Value; break;
                 case StarredExpr s: yield return s.Value; break;
+                case NamedExpr ne: yield return ne.Target; yield return ne.Value; break;
+                case MatchStmt m:
+                    yield return m.Subject;
+                    foreach (var c in m.Cases) { yield return LocalsAnalyzer.PatternExprs(c.Pattern); yield return c.Guard; yield return c.Body; }
+                    break;
                 case FStringExpr f: foreach (var p in f.Parts) if (p.Expr != null) yield return p.Expr; break;
 
                 case ExprStmt e: yield return e.Value; break;

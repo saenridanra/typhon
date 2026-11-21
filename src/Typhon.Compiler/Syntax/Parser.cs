@@ -115,7 +115,7 @@ namespace Typhon.Compiler.Syntax
                 if (IsKw("with")) return new List<Stmt> { ParseWith(true) };
                 throw Err("expected 'def', 'for' or 'with' after 'async'");
             }
-            if (IsKw("match") && Peek().Kind != TokenKind.Op) throw Err("the 'match' statement is not supported in Typhon yet");
+            if (IsKw("match") && StartsMatchStatement()) return new List<Stmt> { ParseMatch() };
             return ParseSimpleStatements();
         }
 
@@ -410,7 +410,20 @@ namespace Typhon.Compiler.Syntax
                 var h = At(new ExceptHandler(), htok);
                 if (!IsOp(":"))
                 {
+                    var typeTok = Cur;
                     h.Type = ParseTest();
+                    if (IsOp(","))
+                    {
+                        // Python 3.14 (PEP 758): `except A, B:` catches A or B, like `except (A, B):`
+                        var types = At(new TupleExpr(), typeTok);
+                        types.Elts.Add(h.Type);
+                        while (AcceptOp(","))
+                        {
+                            if (IsOp(":") || IsKw("as")) break;
+                            types.Elts.Add(ParseTest());
+                        }
+                        h.Type = types;
+                    }
                     if (AcceptKw("as")) h.Name = ExpectName();
                 }
                 h.Body = ParseBlock();
@@ -438,11 +451,27 @@ namespace Typhon.Compiler.Syntax
 
         // ───────────────────────────── expressions ─────────────────────────────
 
+        /// <summary>namedexpr_test: an assignment expression `name := value`, or a test.</summary>
         Expr ParseNamedExprTest()
         {
+            var tok = Cur;
+            if (Cur.Kind == TokenKind.Name && !Keywords.Contains(Cur.Text) && Peek().Kind == TokenKind.Op && Peek().Text == ":=")
+            {
+                var target = At(new NameExpr { Id = ExpectName() }, tok);
+                _i++; // ':='
+                return At(new NamedExpr { Target = target, Value = ParseTest() }, tok);
+            }
             var e = ParseTest();
-            if (IsOp(":=")) throw Err("the walrus operator ':=' is not supported in Typhon yet");
+            if (IsOp(":=")) throw Err("the target of ':=' must be a name");
             return e;
+        }
+
+        /// <summary>star_named_expression: `*x` or a named expression (list/set displays, parenthesized tuples).</summary>
+        Expr ParseNamedExprOrStar()
+        {
+            var tok = Cur;
+            if (AcceptOp("*")) return At(new StarredExpr { Value = ParseOrExpr() }, tok);
+            return ParseNamedExprTest();
         }
 
         /// <summary>testlist_star_expr: comma separated tests, producing a tuple when there is a comma.</summary>
@@ -670,7 +699,7 @@ namespace Typhon.Compiler.Syntax
                 else
                 {
                     var tok = Cur;
-                    var v = ParseTest();
+                    var v = ParseNamedExprTest();
                     if (IsKw("for") || IsKw("async"))
                         v = ParseComprehensionTail(ComprehensionKind.Generator, v, null, tok);
                     arg.Value = v;
@@ -749,7 +778,7 @@ namespace Typhon.Compiler.Syntax
                 ExpectOp(")");
                 return y;
             }
-            var first = ParseTestOrStar();
+            var first = ParseNamedExprOrStar();
             if (IsKw("for") || IsKw("async"))
             {
                 var g = ParseComprehensionTail(ComprehensionKind.Generator, first, null, tok);
@@ -762,7 +791,7 @@ namespace Typhon.Compiler.Syntax
             while (AcceptOp(","))
             {
                 if (IsOp(")")) break;
-                tuple.Elts.Add(ParseTestOrStar());
+                tuple.Elts.Add(ParseNamedExprOrStar());
             }
             ExpectOp(")");
             return tuple;
@@ -773,7 +802,7 @@ namespace Typhon.Compiler.Syntax
             var tok = ExpectOp("[");
             var list = At(new ListExpr(), tok);
             if (AcceptOp("]")) return list;
-            var first = ParseTestOrStar();
+            var first = ParseNamedExprOrStar();
             if (IsKw("for") || IsKw("async"))
             {
                 var c = ParseComprehensionTail(ComprehensionKind.List, first, null, tok);
@@ -784,7 +813,7 @@ namespace Typhon.Compiler.Syntax
             while (AcceptOp(","))
             {
                 if (IsOp("]")) break;
-                list.Elts.Add(ParseTestOrStar());
+                list.Elts.Add(ParseNamedExprOrStar());
             }
             ExpectOp("]");
             return list;
@@ -794,8 +823,9 @@ namespace Typhon.Compiler.Syntax
         {
             var tok = ExpectOp("{");
             if (AcceptOp("}")) return At(new DictExpr(), tok);
-            var first = ParseTest();
-            if (AcceptOp(":"))
+            if (IsOp("**")) return ParseDictDisplay(tok, null, null);
+            var first = ParseNamedExprOrStar();
+            if (!(first is StarredExpr) && AcceptOp(":"))
             {
                 var value = ParseTest();
                 if (IsKw("for") || IsKw("async"))
@@ -804,17 +834,7 @@ namespace Typhon.Compiler.Syntax
                     ExpectOp("}");
                     return c;
                 }
-                var dict = At(new DictExpr(), tok);
-                dict.Keys.Add(first); dict.Values.Add(value);
-                while (AcceptOp(","))
-                {
-                    if (IsOp("}")) break;
-                    dict.Keys.Add(ParseTest());
-                    ExpectOp(":");
-                    dict.Values.Add(ParseTest());
-                }
-                ExpectOp("}");
-                return dict;
+                return ParseDictDisplay(tok, first, value);
             }
             if (IsKw("for") || IsKw("async"))
             {
@@ -827,10 +847,226 @@ namespace Typhon.Compiler.Syntax
             while (AcceptOp(","))
             {
                 if (IsOp("}")) break;
-                set.Elts.Add(ParseTest());
+                set.Elts.Add(ParseNamedExprOrStar());
             }
             ExpectOp("}");
             return set;
+        }
+
+        /// <summary>The rest of a dict display after its first item; `**mapping` items are stored with a null key.</summary>
+        Expr ParseDictDisplay(Token tok, Expr firstKey, Expr firstValue)
+        {
+            var dict = At(new DictExpr(), tok);
+            if (firstKey != null) { dict.Keys.Add(firstKey); dict.Values.Add(firstValue); }
+            else { ExpectOp("**"); dict.Keys.Add(null); dict.Values.Add(ParseOrExpr()); }
+            while (AcceptOp(","))
+            {
+                if (IsOp("}")) break;
+                if (AcceptOp("**")) { dict.Keys.Add(null); dict.Values.Add(ParseOrExpr()); continue; }
+                dict.Keys.Add(ParseTest());
+                ExpectOp(":");
+                dict.Values.Add(ParseTest());
+            }
+            ExpectOp("}");
+            return dict;
+        }
+
+        // ───────────────────────────── match (PEP 634) ─────────────────────────────
+
+        /// <summary>'match' is a soft keyword: a statement when the logical line ends with ':' and an indented 'case' follows.</summary>
+        bool StartsMatchStatement()
+        {
+            if (Peek().Kind == TokenKind.Newline || (Peek().Kind == TokenKind.Op && (Peek().Text == "=" || Peek().Text == "." || Peek().Text.EndsWith("=") && Peek().Text != "==")))
+                return false;
+            int j = _i + 1;
+            while (j < _t.Count && _t[j].Kind != TokenKind.Newline && _t[j].Kind != TokenKind.EndOfFile) j++;
+            if (j + 2 >= _t.Count || j == _i + 1) return false;
+            return _t[j - 1].Kind == TokenKind.Op && _t[j - 1].Text == ":" && _t[j + 1].Kind == TokenKind.Indent &&
+                   _t[j + 2].Kind == TokenKind.Name && _t[j + 2].Text == "case";
+        }
+
+        MatchStmt ParseMatch()
+        {
+            var tok = Cur;
+            _i++; // 'match'
+            var m = At(new MatchStmt { Subject = ParseTestListOrStar() }, tok);
+            ExpectOp(":");
+            if (Cur.Kind != TokenKind.Newline) throw Err("expected a new line after 'match ...:'");
+            _i++;
+            if (Cur.Kind != TokenKind.Indent) throw Err("expected an indented block of 'case' clauses");
+            _i++;
+            while (Cur.Kind != TokenKind.Dedent && Cur.Kind != TokenKind.EndOfFile)
+            {
+                if (Cur.Kind == TokenKind.Newline) { _i++; continue; }
+                if (!IsKw("case")) throw Err("expected 'case' but found " + Describe(Cur));
+                var ctok = Cur;
+                _i++;
+                var c = At(new MatchCase { Pattern = ParseOpenSequencePattern() }, ctok);
+                if (AcceptKw("if")) c.Guard = ParseNamedExprTest();
+                c.Body = ParseBlock();
+                m.Cases.Add(c);
+            }
+            if (Cur.Kind == TokenKind.Dedent) _i++;
+            if (m.Cases.Count == 0) throw Err("a 'match' statement needs at least one 'case'");
+            return m;
+        }
+
+        /// <summary>A '*name' item of a sequence pattern while it is being parsed.</summary>
+        sealed class StarPattern : Pattern { public string Name; }
+
+        /// <summary>case a, b, *rest: (a sequence pattern without brackets) or a single pattern.</summary>
+        Pattern ParseOpenSequencePattern()
+        {
+            var tok = Cur;
+            var first = ParseMaybeStarPattern();
+            if (!IsOp(","))
+            {
+                if (first is StarPattern) throw Err("a star pattern must be inside a sequence pattern");
+                return first;
+            }
+            var seq = At(new SequencePattern(), tok);
+            AddSequenceItem(seq, first);
+            while (AcceptOp(","))
+            {
+                if (IsOp(":") || IsKw("if")) break;
+                AddSequenceItem(seq, ParseMaybeStarPattern());
+            }
+            return seq;
+        }
+
+        void AddSequenceItem(SequencePattern seq, Pattern p)
+        {
+            if (p is StarPattern star)
+            {
+                if (seq.StarIndex >= 0) throw new SyntaxError("multiple starred names in a sequence pattern", p.Line, p.Col);
+                seq.StarIndex = seq.Items.Count;
+                seq.StarName = star.Name;
+            }
+            else seq.Items.Add(p);
+        }
+
+        Pattern ParseMaybeStarPattern()
+        {
+            var tok = Cur;
+            if (AcceptOp("*"))
+            {
+                string name = ExpectName();
+                return At(new StarPattern { Name = name == "_" ? null : name }, tok);
+            }
+            return ParsePattern();
+        }
+
+        Pattern ParsePattern()
+        {
+            var tok = Cur;
+            var p = ParseOrPattern();
+            if (AcceptKw("as")) return At(new AsPattern { Inner = p, Name = ExpectName() }, tok);
+            return p;
+        }
+
+        Pattern ParseOrPattern()
+        {
+            var tok = Cur;
+            var first = ParseClosedPattern();
+            if (!IsOp("|")) return first;
+            var or = At(new OrPattern(), tok);
+            or.Alternatives.Add(first);
+            while (AcceptOp("|")) or.Alternatives.Add(ParseClosedPattern());
+            return or;
+        }
+
+        Pattern ParseClosedPattern()
+        {
+            var tok = Cur;
+            if (Cur.Kind == TokenKind.Number || Cur.Kind == TokenKind.String || IsKw("None") || IsKw("True") || IsKw("False"))
+                return At(new ValuePattern { Value = ParseAtom() }, tok);
+            if (IsOp("-") && Peek().Kind == TokenKind.Number)
+            {
+                _i++;
+                return At(new ValuePattern { Value = At(new UnaryExpr { Op = "-", Operand = ParseAtom() }, tok) }, tok);
+            }
+            if (AcceptOp("("))
+            {
+                if (AcceptOp(")")) return At(new SequencePattern(), tok);
+                var first = ParseMaybeStarPattern();
+                if (AcceptOp(")"))
+                {
+                    if (first is StarPattern) { var one = At(new SequencePattern(), tok); AddSequenceItem(one, first); return one; }
+                    return first; // group
+                }
+                var seq = At(new SequencePattern(), tok);
+                AddSequenceItem(seq, first);
+                while (AcceptOp(","))
+                {
+                    if (IsOp(")")) break;
+                    AddSequenceItem(seq, ParseMaybeStarPattern());
+                }
+                ExpectOp(")");
+                return seq;
+            }
+            if (AcceptOp("["))
+            {
+                var seq = At(new SequencePattern(), tok);
+                while (!IsOp("]"))
+                {
+                    AddSequenceItem(seq, ParseMaybeStarPattern());
+                    if (!AcceptOp(",")) break;
+                }
+                ExpectOp("]");
+                return seq;
+            }
+            if (AcceptOp("{"))
+            {
+                var map = At(new MappingPattern(), tok);
+                while (!IsOp("}"))
+                {
+                    if (AcceptOp("**")) { map.Rest = ExpectName(); AcceptOp(","); break; }
+                    var keyTok = Cur;
+                    Expr key = Cur.Kind == TokenKind.Name && !IsKw("None") && !IsKw("True") && !IsKw("False") ? ParseDottedValue() : ((ValuePattern)ParseClosedPattern()).Value;
+                    ExpectOp(":");
+                    map.Keys.Add(key);
+                    map.Values.Add(ParsePattern());
+                    if (!AcceptOp(",")) break;
+                }
+                ExpectOp("}");
+                return map;
+            }
+            if (Cur.Kind == TokenKind.Name && !Keywords.Contains(Cur.Text))
+            {
+                var value = ParseDottedValue();
+                if (AcceptOp("("))
+                {
+                    var cls = At(new ClassPattern { Cls = value }, tok);
+                    while (!IsOp(")"))
+                    {
+                        if (Cur.Kind == TokenKind.Name && Peek().Kind == TokenKind.Op && Peek().Text == "=")
+                        {
+                            cls.KeywordNames.Add(Cur.Text);
+                            _i += 2;
+                            cls.KeywordPatterns.Add(ParsePattern());
+                        }
+                        else
+                        {
+                            if (cls.KeywordNames.Count > 0) throw Err("positional patterns follow keyword patterns");
+                            cls.Positional.Add(ParsePattern());
+                        }
+                        if (!AcceptOp(",")) break;
+                    }
+                    ExpectOp(")");
+                    return cls;
+                }
+                if (value is NameExpr n) return At(new CapturePattern { Name = n.Id == "_" ? null : n.Id }, tok);
+                return At(new ValuePattern { Value = value }, tok); // a dotted name is a value (Color.RED)
+            }
+            throw Err("unsupported pattern starting with " + Describe(Cur));
+        }
+
+        Expr ParseDottedValue()
+        {
+            var tok = Cur;
+            Expr e = At(new NameExpr { Id = ExpectName() }, tok);
+            while (IsOp(".") && Peek().Kind == TokenKind.Name) { _i++; e = At(new AttributeExpr { Target = e, Name = ExpectNameOrKeyword() }, tok); }
+            return e;
         }
 
         ComprehensionExpr ParseComprehensionTail(ComprehensionKind kind, Expr elt, Expr valueElt, Token tok)
@@ -917,10 +1153,18 @@ namespace Typhon.Compiler.Syntax
                 if (exprEnd < 0) exprEnd = j;
                 string exprText = s.Substring(i + 1, exprEnd - i - 1);
                 var part = new FStringPart();
-                if (exprText.TrimEnd().EndsWith("=")) throw new SyntaxError("f-string '=' debugging specifier is not supported in Typhon yet", tok.Line, tok.Col);
+                string trimmed = exprText.TrimEnd();
+                bool selfDocumenting = trimmed.EndsWith("=") && !(trimmed.Length >= 2 && "=!<>".IndexOf(trimmed[trimmed.Length - 2]) >= 0);
+                if (selfDocumenting)
+                {
+                    // f"{expr = }" prints the expression text as written, then the value: repr() unless a conversion or spec is given
+                    parts.Add(new FStringPart { Literal = exprText });
+                    exprText = trimmed.Substring(0, trimmed.Length - 1);
+                }
                 part.Expr = ParseExpression(exprText, tok.Line, tok.Col);
                 if (convPos >= 0) part.Conversion = s[convPos + 1];
                 if (specPos >= 0) part.FormatSpec = s.Substring(specPos + 1, j - specPos - 1);
+                if (selfDocumenting && convPos < 0 && specPos < 0) part.Conversion = 'r';
                 parts.Add(part);
                 i = j + 1;
             }

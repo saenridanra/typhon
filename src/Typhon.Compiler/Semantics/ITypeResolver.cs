@@ -21,6 +21,53 @@ namespace Typhon.Compiler.Semantics
         bool IsOverridable(string metadataName, string memberName);
         /// <summary>Public and protected instance constructors of a non-generic class (empty when unknown).</summary>
         IReadOnlyList<CtorSignature> GetConstructors(string metadataName);
+        /// <summary>
+        /// Public methods, properties and fields named <paramref name="memberName"/> of the type and its base types
+        /// (".ctor": its public constructors), described as far as passing Python ints (64-bit) needs: which parameters
+        /// accept a long, which need a narrowing conversion, and the C# keyword of a special result type.
+        /// </summary>
+        IReadOnlyList<MemberSig> GetMembers(string metadataName, string memberName);
+    }
+
+    /// <summary>How a parameter (or property) takes a value of C# type long.</summary>
+    public enum LongFit
+    {
+        /// <summary>Not an integer-like parameter (string, a class, ...).</summary>
+        Other,
+        /// <summary>long converts implicitly (long, double, decimal, object, a type parameter, ...).</summary>
+        Accepts,
+        /// <summary>Takes a narrower integer (int, short, ...): a long needs a checked narrowing conversion.</summary>
+        Narrow,
+    }
+
+    public sealed class ParamSig
+    {
+        public string Name;
+        public LongFit Fit;
+        /// <summary>The C# type to narrow to when <see cref="Fit"/> is <see cref="LongFit.Narrow"/> ("int", "short", ...).</summary>
+        public string NarrowTo;
+        public bool IsParams;
+        public bool IsOptional;
+        /// <summary>Big-int mode: a System.Numerics.BigInteger converts implicitly (BigInteger, object, a type parameter, ...).</summary>
+        public bool BigAccepts;
+        /// <summary>Big-int mode: the parameter is exactly BigInteger (an overload that keeps Python ints exact).</summary>
+        public bool IsBigInteger;
+        /// <summary>Big-int mode: the numeric type a BigInteger is converted to explicitly ("long", "int", "double", ...), or null.</summary>
+        public string BigNarrowTo;
+    }
+
+    public sealed class MemberSig
+    {
+        public bool IsMethod;
+        public bool IsStatic;
+        /// <summary>The result type (method return, property or field type) as C# code, or null when Typhon should not adopt it.</summary>
+        public string Type;
+        /// <summary>For properties and fields: how a long assigned to it fits.</summary>
+        public LongFit ValueFit;
+        public string ValueNarrowTo;
+        /// <summary>Big-int mode: for properties and fields of a numeric type, what a BigInteger is converted to.</summary>
+        public string ValueBigNarrowTo;
+        public List<ParamSig> Parameters = new List<ParamSig>();
     }
 
     /// <summary>A constructor as the emitter needs it: fully qualified C# parameter types and names.</summary>
@@ -39,5 +86,6 @@ namespace Typhon.Compiler.Semantics
         public bool HasMember(string metadataName, string memberName) => false;
         public bool IsOverridable(string metadataName, string memberName) => false;
         public IReadOnlyList<CtorSignature> GetConstructors(string metadataName) => new CtorSignature[0];
+        public IReadOnlyList<MemberSig> GetMembers(string metadataName, string memberName) => new MemberSig[0];
     }
 }

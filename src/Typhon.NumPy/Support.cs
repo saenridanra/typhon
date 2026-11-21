@@ -28,6 +28,13 @@ public readonly struct NumPyShape
     public static implicit operator NumPyShape((int, int, int, int) t) => new(new[] { t.Item1, t.Item2, t.Item3, t.Item4 });
     public static implicit operator NumPyShape(int[] dims) => new((int[])(dims ?? Array.Empty<int>()).Clone());
     public static implicit operator NumPyShape(List<int> dims) => new((dims ?? new List<int>()).ToArray());
+    // Typhon's int is a 64-bit long: shapes written as Python ints/tuples arrive as longs
+    public static implicit operator NumPyShape(ValueTuple<long> t) => new(new[] { checked((int)t.Item1) });
+    public static implicit operator NumPyShape((long, long) t) => new(new[] { checked((int)t.Item1), checked((int)t.Item2) });
+    public static implicit operator NumPyShape((long, long, long) t) => new(new[] { checked((int)t.Item1), checked((int)t.Item2), checked((int)t.Item3) });
+    public static implicit operator NumPyShape((long, long, long, long) t) => new(new[] { checked((int)t.Item1), checked((int)t.Item2), checked((int)t.Item3), checked((int)t.Item4) });
+    public static implicit operator NumPyShape(long[] dims) => new(Array.ConvertAll(dims ?? Array.Empty<long>(), d => checked((int)d)));
+    public static implicit operator NumPyShape(List<long> dims) => new((dims ?? new List<long>()).ConvertAll(d => checked((int)d)).ToArray());
 
     public override string ToString() => Err.ShapeStr(Dims);
 }

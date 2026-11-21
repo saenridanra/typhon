@@ -46,7 +46,11 @@ namespace Typhon.Compiler
         public readonly Dictionary<string, ClassDef> Classes = new Dictionary<string, ClassDef>();
         public readonly HashSet<string> Functions = new HashSet<string>();
         public readonly HashSet<string> Globals = new HashSet<string>();
+        /// <summary>Module-level type aliases: EdgeT = tuple[int, int], Matrix = list[list[float]], X: TypeAlias = ...</summary>
+        public readonly Dictionary<string, Expr> TypeAliases = new Dictionary<string, Expr>();
         public readonly List<TyDiagnostic> ParseDiagnostics = new List<TyDiagnostic>();
+        /// <summary>The module asks for big-int mode with a "# typhon: int=bigint" comment (it applies to the whole program).</summary>
+        public bool BigIntPragma;
 
         public string QualifiedClassName => "global::" + (string.IsNullOrEmpty(Namespace) ? "" : Namespace + ".") + ClassName;
         public bool IsMainModule => Name == "__main__" || Name.EndsWith(".__main__");
@@ -56,6 +60,11 @@ namespace Typhon.Compiler
     {
         public string RootNamespace = "";
         public TypeMode TypeMode = TypeMode.Warn;
+        /// <summary>
+        /// Big-int mode (typhon --bigint, TyphonIntMode=bigint, or a "# typhon: int=bigint" comment in any module): Python's int
+        /// is System.Numerics.BigInteger (unbounded, like Python) instead of a checked 64-bit long.
+        /// </summary>
+        public bool BigInts;
         public ITypeResolver Resolver = NullTypeResolver.Instance;
         /// <summary>If set, only this module's `if __name__ == "__main__":` block becomes the program entry point.</summary>
         public string MainModule;
@@ -113,6 +122,7 @@ namespace Typhon.Compiler
             info.ClassName = lastDot < 0 ? moduleName : moduleName.Substring(lastDot + 1);
             string pkg = lastDot < 0 ? "" : moduleName.Substring(0, lastDot);
             info.Namespace = string.Join(".", new[] { rootNamespace, pkg }.Where(s => !string.IsNullOrEmpty(s)));
+            info.BigIntPragma = System.Text.RegularExpressions.Regex.IsMatch(source, @"^[ \t]*#[ \t]*typhon:[ \t]*int[ \t]*=[ \t]*bigint\b", System.Text.RegularExpressions.RegexOptions.Multiline);
             try
             {
                 info.Ast = Parser.ParseModule(source, path);
@@ -124,6 +134,10 @@ namespace Typhon.Compiler
             }
             foreach (var s in info.Ast.Body)
             {
+                if (s is AssignStmt alias && alias.Targets.Count == 1 && alias.Targets[0] is NameExpr an0 && IsTypeAliasValue(alias.Value))
+                    info.TypeAliases[an0.Id] = alias.Value;
+                if (s is AnnAssignStmt ta && ta.Target is NameExpr tn0 && ta.Value != null && (ta.Annotation is NameExpr tan && tan.Id == "TypeAlias" || ta.Annotation is AttributeExpr taa && taa.Name == "TypeAlias"))
+                    info.TypeAliases[tn0.Id] = ta.Value;
                 switch (s)
                 {
                     case ClassDef c: info.Classes[c.Name] = c; break;
@@ -135,9 +149,36 @@ namespace Typhon.Compiler
             return info;
         }
 
+        static readonly HashSet<string> AliasGenerics = new HashSet<string>
+        {
+            "list", "dict", "set", "frozenset", "tuple", "List", "Dict", "Set", "FrozenSet", "Tuple", "Optional", "Union", "Callable",
+            "Iterable", "Iterator", "Sequence", "Mapping", "MutableMapping", "MutableSequence", "Generator", "Type", "type",
+        };
+
+        /// <summary>Is the right-hand side of a module-level assignment a type (list[int], int | None, Callable[[int], str])?</summary>
+        static bool IsTypeAliasValue(Expr e)
+        {
+            switch (e)
+            {
+                case SubscriptExpr s:
+                    string b = s.Target is NameExpr n ? n.Id : s.Target is AttributeExpr a && a.Target is NameExpr an && (an.Id == "typing" || an.Id == "t") ? a.Name : null;
+                    return b != null && AliasGenerics.Contains(b);
+                case BinOpExpr bin when bin.Op == "|":
+                    return IsTypeLeaf(bin.Left) && IsTypeLeaf(bin.Right);
+                default: return false;
+            }
+        }
+
+        static bool IsTypeLeaf(Expr e) => IsTypeAliasValue(e) || e is ConstExpr c && c.Kind == ConstKind.None ||
+            e is NameExpr n && (n.Id == "int" || n.Id == "float" || n.Id == "str" || n.Id == "bool" || n.Id == "None" || char.IsUpper(n.Id[0]));
+
         public static string Emit(ModuleInfo module, ProjectContext project, List<TyDiagnostic> diagnostics)
         {
-            if (project.Inference == null) TypeInference.Run(project);
+            if (project.Inference == null)
+            {
+                if (project.Modules.Values.Any(m => m.BigIntPragma)) project.BigInts = true;
+                TypeInference.Run(project);
+            }
             var emitter = new ModuleEmitter(module, project, diagnostics);
             return emitter.Emit();
         }
@@ -147,11 +188,18 @@ namespace Typhon.Compiler
         {
             get
             {
+                // Builtins.cs (builtins, runtime helpers, small modules) + Stdlib.cs (itertools, collections, functools, ...)
                 var asm = typeof(TyphonCompiler).Assembly;
-                using (var s = asm.GetManifestResourceStream("Typhon.Compiler.Runtime.Builtins.cs"))
-                using (var r = new StreamReader(s)) return r.ReadToEnd();
+                var sb = new StringBuilder();
+                foreach (var name in new[] { "Typhon.Compiler.Runtime.Builtins.cs", "Typhon.Compiler.Runtime.Stdlib.cs" })
+                    using (var s = asm.GetManifestResourceStream(name))
+                    using (var r = new StreamReader(s)) sb.Append(r.ReadToEnd()).Append('\n');
+                return sb.ToString();
             }
         }
+
+        /// <summary>TyphonIntMode: "bigint" → big-int mode; anything else (int64, empty) → 64-bit ints.</summary>
+        public static bool ParseIntMode(string value) => (value ?? "").Trim().ToLowerInvariant() == "bigint";
 
         public static TypeMode ParseTypeMode(string value)
         {

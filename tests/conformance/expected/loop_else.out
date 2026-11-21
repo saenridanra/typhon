@@ -1,0 +1,10 @@
+[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+1 -1
+row 1, column 1 none
+bad: x
+all numbers stopped
+[3, 2, 1, 0]
+for finished, i = 2
+empty loop runs else
+while finished, n = 1
+outer break at 2 20

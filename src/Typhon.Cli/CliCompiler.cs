@@ -69,7 +69,12 @@ internal static class CliCompiler
     public const string ScriptAssemblyName = "typhon_script"; // must match Typhon.Runtime's InternalsVisibleTo
     static readonly CSharpParseOptions ParseOptions = new(LanguageVersion.Preview);
 
-    public static CompileOutput Compile(string entryPath, TypeMode mode, CompileTarget target, ReferenceSet? refs = null, bool csharpOnly = false)
+    /// <summary>The CLI passes the type mode (0 strict, 1 warn, 2 permissive) and big-int mode (BigIntFlag) as one int.</summary>
+    public const int BigIntFlag = 0x10;
+    public static TypeMode TypeModeOf(int modeBits) => (TypeMode)(modeBits & 0xF);
+    public static bool BigIntsOf(int modeBits) => (modeBits & BigIntFlag) != 0;
+
+    public static CompileOutput Compile(string entryPath, TypeMode mode, CompileTarget target, ReferenceSet? refs = null, bool csharpOnly = false, bool bigInts = false)
     {
         var output = new CompileOutput();
         var sw = Stopwatch.StartNew();
@@ -89,7 +94,7 @@ internal static class CliCompiler
         // The entry file is the __main__ module; sibling .ty files it imports (transitively) are compiled with it.
         // Every path probed is recorded, so a cached build can tell when any of them changes or appears.
         sw.Restart();
-        var project = new ProjectContext { TypeMode = mode, Resolver = new RoslynTypeResolver(compilation), MainModule = "__main__" };
+        var project = new ProjectContext { TypeMode = mode, BigInts = bigInts, Resolver = new RoslynTypeResolver(compilation), MainModule = "__main__" };
         string dir = Path.GetDirectoryName(entryPath)!;
         var modules = new List<ModuleInfo>();
         var pending = new Queue<(string Path, string Name)>();

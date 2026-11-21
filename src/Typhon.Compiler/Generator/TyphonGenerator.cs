@@ -20,7 +20,7 @@ namespace Typhon.Compiler.Generator
     {
         sealed class Options
         {
-            public string RootNamespace = "", ProjectDir = "", TypeMode = "warn", MainModule = "";
+            public string RootNamespace = "", ProjectDir = "", TypeMode = "warn", MainModule = "", IntMode = "";
         }
 
         public void Initialize(IncrementalGeneratorInitializationContext context)
@@ -36,6 +36,7 @@ namespace Typhon.Compiler.Generator
                 else if (p.GlobalOptions.TryGetValue("build_property.ProjectDir", out var pd)) o.ProjectDir = pd;
                 if (p.GlobalOptions.TryGetValue("build_property.TyphonTypeMode", out var mode)) o.TypeMode = mode;
                 if (p.GlobalOptions.TryGetValue("build_property.TyphonMainModule", out var main)) o.MainModule = main;
+                if (p.GlobalOptions.TryGetValue("build_property.TyphonIntMode", out var intMode)) o.IntMode = intMode;
                 return o;
             });
 
@@ -54,6 +55,7 @@ namespace Typhon.Compiler.Generator
             {
                 RootNamespace = opt.RootNamespace,
                 TypeMode = TyphonCompiler.ParseTypeMode(opt.TypeMode),
+                BigInts = TyphonCompiler.ParseIntMode(opt.IntMode),
                 Resolver = new RoslynTypeResolver(compilation),
                 MainModule = string.IsNullOrWhiteSpace(opt.MainModule) ? null : opt.MainModule.Trim(),
             };
